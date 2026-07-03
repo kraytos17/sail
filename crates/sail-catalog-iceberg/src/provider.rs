@@ -29,6 +29,7 @@ use sail_catalog::provider::{
     PartitionTransform,
 };
 use sail_catalog::utils::{get_property, quote_name_if_needed, quote_namespace_if_needed};
+use sail_common::config::IcebergRestAccessDelegation;
 use sail_common::http::SAIL_USER_AGENT;
 use sail_common_datafusion::catalog::managed::METADATA_LOCATION_KEY;
 use sail_common_datafusion::catalog::{
@@ -123,6 +124,7 @@ impl CatalogConfig<'_> {
 pub struct IcebergRestCatalogOptions {
     pub credentials: Arc<dyn CatalogCredentials>,
     pub properties: HashMap<String, String>,
+    pub access_delegation: IcebergRestAccessDelegation,
 }
 
 /// Provider for Apache Iceberg REST Catalog.
@@ -1301,12 +1303,14 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             purpose: _,
         } = request;
         let catalog_config = self.resolved_catalog_config().await?;
+        let access_delegation = match self.options.access_delegation {
+            IcebergRestAccessDelegation::VendedCredentials => {
+                Some(REST_ACCESS_DELEGATION_VENDED_CREDENTIALS)
+            }
+            IcebergRestAccessDelegation::None => None,
+        };
         let result = self
-            .load_table_result(
-                database,
-                table,
-                Some(REST_ACCESS_DELEGATION_VENDED_CREDENTIALS),
-            )
+            .load_table_result(database, table, access_delegation)
             .await?;
         // TODO: Convert preserved REST table-session credentials into operation-scoped
         // FileIO/object-store access instead of only fingerprinting the session.
@@ -2045,6 +2049,7 @@ mod tests {
         IcebergRestCatalogOptions {
             credentials: Arc::new(EmptyCatalogCredentials),
             properties,
+            access_delegation: IcebergRestAccessDelegation::default(),
         }
     }
 

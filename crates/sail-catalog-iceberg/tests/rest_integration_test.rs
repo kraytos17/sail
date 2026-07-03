@@ -117,6 +117,7 @@ async fn setup_catalog(
                 IcebergRestCatalogOptions {
                     credentials: Arc::new(EmptyCatalogCredentials),
                     properties: props,
+                    access_delegation: Default::default(),
                 },
             );
             Ok(provider)
