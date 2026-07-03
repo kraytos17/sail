@@ -1,4 +1,3 @@
-ARG RELEASE_TAG
 ARG RUST_VERSION=1.95.0
 ARG RUST_PROFILE=release
 ARG RUSTFLAGS=""
@@ -6,7 +5,6 @@ ARG PYSPARK_VERSION=4.1.1
 
 FROM python:3.14-slim AS builder
 
-ARG RELEASE_TAG
 ARG RUST_VERSION
 ARG RUST_PROFILE
 ARG RUSTFLAGS
@@ -32,7 +30,7 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /app
 
-RUN git clone --depth 1 --branch "${RELEASE_TAG}" https://github.com/lakehq/sail.git .
+COPY . .
 
 RUN --mount=type=cache,target=/root/.cargo/registry/ \
     --mount=type=cache,target=/root/.cargo/git/ \
