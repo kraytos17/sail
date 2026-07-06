@@ -234,6 +234,7 @@ pub struct TableFormatCreateTableInfo {
     pub columns: Vec<TableFormatCreateTableColumn>,
     pub comment: Option<String>,
     pub partition_by: Vec<CatalogPartitionField>,
+    pub bucket_by: Option<BucketBy>,
     pub properties: Vec<(String, String)>,
     pub replace: bool,
     pub lakehouse_table: Option<LakehouseExecutionContext>,

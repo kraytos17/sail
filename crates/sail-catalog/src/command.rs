@@ -3,7 +3,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use sail_common_datafusion::array::serde::ArrowSerializer;
 use sail_common_datafusion::catalog::{FunctionStatus, LakehouseOperation};
 use sail_common_datafusion::datasource::{
-    is_lakehouse_format, TableFormatAlterTableOperation, TableFormatCreateTableColumn,
+    is_lakehouse_format, BucketBy, TableFormatAlterTableOperation, TableFormatCreateTableColumn,
     TableFormatCreateTableInfo, TableFormatRegistry,
 };
 use sail_common_datafusion::extension::SessionExtensionAccessor;
@@ -785,6 +785,7 @@ async fn prepare_create_table_storage_metadata<C: SessionExtensionAccessor>(
         &options.columns,
         options.comment.clone(),
         options.partition_by.clone(),
+        options.bucket_by.clone().map(Into::into),
         options.properties.clone(),
         options.mode.is_replace(),
         context.as_deref().cloned(),
@@ -848,6 +849,7 @@ async fn prepare_created_table_storage_metadata<C: SessionExtensionAccessor>(
         columns,
         comment.clone(),
         partition_by.clone(),
+        None, // bucket_by not available in this code path
         properties.clone(),
         false,
         lakehouse_table,
@@ -864,6 +866,7 @@ async fn materialize_table_format_create_metadata<C: SessionExtensionAccessor>(
     columns: &[impl CreateTableColumnView],
     comment: Option<String>,
     partition_by: Vec<sail_common_datafusion::catalog::CatalogPartitionField>,
+    bucket_by: Option<BucketBy>,
     properties: Vec<(String, String)>,
     replace: bool,
     lakehouse_table: Option<sail_common_datafusion::catalog::LakehouseExecutionContext>,
@@ -897,6 +900,7 @@ async fn materialize_table_format_create_metadata<C: SessionExtensionAccessor>(
                     .collect(),
                 comment,
                 partition_by,
+                bucket_by,
                 properties,
                 replace,
                 lakehouse_table,

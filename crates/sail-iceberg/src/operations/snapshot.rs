@@ -16,7 +16,7 @@ use object_store::ObjectStoreExt;
 use super::{ActionCommit, Transaction};
 use crate::io::StoreContext;
 use crate::spec::manifest::ManifestWriterBuilder;
-use crate::spec::manifest_list::ManifestListWriter;
+use crate::spec::manifest_list::{ManifestFile, ManifestListWriter};
 use crate::spec::{
     DataFile, FormatVersion, ManifestContentType, Operation, PartitionSpec, Schema,
     SnapshotBuilder, SnapshotReference, SnapshotRetention, TableRequirement, TableUpdate,
@@ -37,6 +37,10 @@ pub struct SnapshotProducer<'a> {
     /// If true, create a snapshot with no parent (for bootstrap scenarios)
     pub is_bootstrap: bool,
     pub row_lineage_start_row_id: Option<i64>,
+    /// Pre-filtered parent manifest entries for predicate overwrite.
+    /// When set, these entries are used instead of loading from the parent snapshot's manifest list.
+    /// The filtering (e.g., by partition predicate) is done before passing to the producer.
+    pub parent_manifest_entries: Option<Vec<ManifestFile>>,
 }
 
 impl<'a> SnapshotProducer<'a> {
@@ -54,6 +58,7 @@ impl<'a> SnapshotProducer<'a> {
             write_path_mode: crate::utils::WritePathMode::Absolute,
             is_bootstrap: false,
             row_lineage_start_row_id: None,
+            parent_manifest_entries: None,
         }
     }
 
@@ -71,6 +76,13 @@ impl<'a> SnapshotProducer<'a> {
 
     pub fn with_row_lineage_start_row_id(mut self, start_row_id: Option<i64>) -> Self {
         self.row_lineage_start_row_id = start_row_id;
+        self
+    }
+
+    /// Set pre-filtered parent manifest entries for predicate overwrite.
+    /// When set, these entries are used instead of loading from the parent snapshot.
+    pub fn with_parent_manifest_entries(mut self, entries: Option<Vec<ManifestFile>>) -> Self {
+        self.parent_manifest_entries = entries;
         self
     }
 
@@ -127,7 +139,10 @@ impl<'a> SnapshotProducer<'a> {
         let parent_manifest_list_path_str = parent_snapshot.manifest_list();
         let mut parent_manifest_entries = Vec::new();
 
-        if !self.is_bootstrap && !is_overwrite && !parent_manifest_list_path_str.is_empty() {
+        if let Some(ref kept_entries) = self.parent_manifest_entries {
+            // Predicate overwrite: use pre-filtered entries (partition-pruned existing files)
+            parent_manifest_entries.extend(kept_entries.iter().cloned());
+        } else if !self.is_bootstrap && !is_overwrite && !parent_manifest_list_path_str.is_empty() {
             let (store_ref, manifest_list_path) = store_ctx
                 .resolve(parent_manifest_list_path_str)
                 .map_err(|e| format!("{}", e))?;

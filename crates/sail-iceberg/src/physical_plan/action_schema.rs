@@ -40,6 +40,7 @@ pub struct CommitMeta {
     pub lakehouse_table: Option<LakehouseExecutionContext>,
     pub schema: Option<IcebergSchema>,
     pub partition_spec: Option<PartitionSpec>,
+    pub overwrite_predicate: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +57,8 @@ pub struct CommitMetaAction {
     pub schema_json: Option<String>,
     /// Optional PartitionSpec JSON (rare) to avoid huge Arrow schema.
     pub partition_spec_json: Option<String>,
+    /// Optional overwrite predicate JSON for predicate-based overwrite.
+    pub overwrite_predicate_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,6 +412,7 @@ pub fn encode_commit_meta(meta: CommitMeta) -> Result<RecordBatch> {
         .map(serde_json::to_string)
         .transpose()
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let overwrite_predicate_json = meta.overwrite_predicate;
 
     let rows = vec![ActionRow {
         action: ExecAction::CommitMeta(CommitMetaAction {
@@ -420,6 +424,7 @@ pub fn encode_commit_meta(meta: CommitMeta) -> Result<RecordBatch> {
             lakehouse_table_json,
             schema_json,
             partition_spec_json,
+            overwrite_predicate_json,
         }),
     }];
     encode_actions(rows)
@@ -469,6 +474,7 @@ pub fn decode_actions_and_meta_from_batch(
                     .map(serde_json::from_str::<PartitionSpec>)
                     .transpose()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let overwrite_predicate: Option<String> = m.overwrite_predicate_json;
                 meta = Some(CommitMeta {
                     table_uri: m.table_uri,
                     row_count: m.row_count,
@@ -478,6 +484,7 @@ pub fn decode_actions_and_meta_from_batch(
                     lakehouse_table,
                     schema,
                     partition_spec,
+                    overwrite_predicate,
                 });
             }
         }
@@ -530,6 +537,7 @@ mod tests {
             lakehouse_table: None,
             schema: None,
             partition_spec: None,
+            overwrite_predicate: None,
         };
 
         let schema = iceberg_action_schema()?;

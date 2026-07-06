@@ -203,7 +203,10 @@ impl IcebergWriterExec {
             )),
             (true, false) => Ok(Some(SchemaMode::Merge)),
             (false, true) => {
-                if matches!(sink_mode, PhysicalSinkMode::Overwrite) {
+                if matches!(
+                    sink_mode,
+                    PhysicalSinkMode::Overwrite | PhysicalSinkMode::OverwriteIf { .. }
+                ) {
                     Ok(Some(SchemaMode::Overwrite))
                 } else {
                     Err(DataFusionError::Plan(
@@ -367,9 +370,10 @@ impl ExecutionPlan for IcebergWriterExec {
                 }
                 PhysicalSinkMode::Append => {}
                 PhysicalSinkMode::Overwrite => {}
-                PhysicalSinkMode::OverwriteIf { .. } | PhysicalSinkMode::OverwritePartitions => {
+                PhysicalSinkMode::OverwriteIf { .. } => {}
+                PhysicalSinkMode::OverwritePartitions => {
                     return Err(DataFusionError::NotImplemented(
-                        "predicate or partition overwrite not implemented for Iceberg".to_string(),
+                        "partition overwrite not implemented for Iceberg".to_string(),
                     ));
                 }
             }
@@ -596,7 +600,10 @@ impl ExecutionPlan for IcebergWriterExec {
             let commit_meta = CommitMeta {
                 table_uri: table_url.to_string(),
                 row_count: total_rows,
-                operation: if matches!(sink_mode, PhysicalSinkMode::Overwrite) {
+                operation: if matches!(
+                    sink_mode,
+                    PhysicalSinkMode::Overwrite | PhysicalSinkMode::OverwriteIf { .. }
+                ) {
                     crate::spec::Operation::Overwrite
                 } else {
                     crate::spec::Operation::Append
@@ -612,6 +619,7 @@ impl ExecutionPlan for IcebergWriterExec {
                 } else {
                     None
                 },
+                overwrite_predicate: options.overwrite_predicate,
             };
 
             let schema = iceberg_action_schema()?;

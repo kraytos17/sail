@@ -29,7 +29,8 @@ use object_store::ObjectStoreExt;
 use sail_common_datafusion::catalog::iceberg::is_iceberg_table_marker;
 use sail_common_datafusion::catalog::managed::metadata_location_value;
 use sail_common_datafusion::catalog::{
-    CatalogPartitionField, CommitAuthority, LakehouseExecutionContext, ScanAuthority,
+    CatalogPartitionField, CommitAuthority, LakehouseExecutionContext, PartitionTransform,
+    ScanAuthority,
 };
 use sail_common_datafusion::datasource::{
     create_sort_order, find_path_in_options, BucketBy, OptionLayer, PhysicalSinkMode, SinkInfo,
@@ -124,9 +125,15 @@ impl TableFormat for IcebergTableFormat {
             options,
             lakehouse_table,
         } = info;
-        if bucket_by.is_some() {
-            return not_impl_err!("bucketing for Iceberg format");
-        }
+
+        let partition_by = match bucket_by {
+            Some(bucket_by) => {
+                let mut fields = partition_by;
+                fields.extend(partition_fields_from_bucket_by(bucket_by));
+                fields
+            }
+            None => partition_by,
+        };
 
         Ok(LogicalPlan::Extension(Extension {
             node: Arc::new(IcebergWriteNode::new(
@@ -135,7 +142,6 @@ impl TableFormat for IcebergTableFormat {
                     path,
                     mode,
                     partition_by,
-                    bucket_by,
                     sort_order,
                     options,
                     lakehouse_table,
@@ -154,10 +160,20 @@ impl TableFormat for IcebergTableFormat {
             columns,
             comment: _,
             partition_by,
+            bucket_by,
             properties,
             replace,
             lakehouse_table,
         } = info;
+
+        let partition_by = match bucket_by {
+            Some(bucket_by) => {
+                let mut fields = partition_by;
+                fields.extend(partition_fields_from_bucket_by(bucket_by));
+                fields
+            }
+            None => partition_by,
+        };
         let catalog_table = lakehouse_table
             .as_ref()
             .map(|context| context.catalog_table().to_vec());
@@ -300,7 +316,6 @@ pub struct IcebergWriteNodeOptions {
     pub path: String,
     pub mode: SinkMode,
     pub partition_by: Vec<CatalogPartitionField>,
-    pub bucket_by: Option<BucketBy>,
     pub sort_order: Vec<Sort>,
     pub options: Vec<OptionLayer>,
     pub lakehouse_table: Option<LakehouseExecutionContext>,
@@ -372,7 +387,6 @@ pub(crate) async fn plan_iceberg_write(
         path,
         mode,
         partition_by,
-        bucket_by: _,
         sort_order,
         options,
         lakehouse_table,
@@ -383,8 +397,15 @@ pub(crate) async fn plan_iceberg_write(
         SinkMode::IgnoreIfExists => PhysicalSinkMode::IgnoreIfExists,
         SinkMode::Append => PhysicalSinkMode::Append,
         SinkMode::Overwrite => PhysicalSinkMode::Overwrite,
-        SinkMode::OverwriteIf { .. } | SinkMode::OverwritePartitions => {
-            return not_impl_err!("predicate or partition overwrite for Iceberg");
+        SinkMode::OverwriteIf { condition } => {
+            let source = condition.source.clone();
+            PhysicalSinkMode::OverwriteIf {
+                condition: Some(condition),
+                source,
+            }
+        }
+        SinkMode::OverwritePartitions => {
+            return not_impl_err!("partition overwrite for Iceberg");
         }
     };
     validate_iceberg_lakehouse_storage_access(lakehouse_table.as_ref())?;
@@ -428,8 +449,9 @@ pub(crate) async fn plan_iceberg_write(
         PhysicalSinkMode::IgnoreIfExists if table_exists => {
             return Ok(Arc::new(EmptyExec::new(physical_input.schema())));
         }
-        PhysicalSinkMode::OverwriteIf { .. } | PhysicalSinkMode::OverwritePartitions => {
-            return not_impl_err!("predicate or partition overwrite for Iceberg");
+        PhysicalSinkMode::OverwriteIf { .. } => {}
+        PhysicalSinkMode::OverwritePartitions => {
+            return not_impl_err!("partition overwrite for Iceberg");
         }
         _ => {}
     }
@@ -442,6 +464,31 @@ pub(crate) async fn plan_iceberg_write(
     } else {
         None
     };
+
+    // Validate overwrite predicate only references partition columns (v1 constraint)
+    if let PhysicalSinkMode::OverwriteIf {
+        condition: Some(condition),
+        ..
+    } = &mode
+    {
+        let partition_columns = existing_partition_columns.as_deref().ok_or_else(|| {
+            DataFusionError::Plan("Predicate overwrite requires an existing table".to_string())
+        })?;
+        let predicate_columns: Vec<&str> = condition
+            .expr
+            .column_refs()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        for col_name in &predicate_columns {
+            if !partition_columns.iter().any(|p| p.column == *col_name) {
+                return not_impl_err!(
+                    "Predicate overwrite on non-partition column '{}' is not yet supported",
+                    col_name
+                );
+            }
+        }
+    }
 
     if let Some(existing_partitions) = &existing_partition_columns {
         if !partition_by.is_empty() && partition_by != *existing_partitions {
@@ -477,6 +524,16 @@ pub(crate) async fn plan_iceberg_write(
     options.apply_variant_shredding_option_presence(variant_shredding_option_presence);
     options.table_properties = table_properties;
     options.lakehouse_table = lakehouse_table;
+    // Extract overwrite predicate from sink mode as JSON partition key-value pairs
+    if let PhysicalSinkMode::OverwriteIf {
+        condition: Some(condition),
+        ..
+    } = &mode
+    {
+        let partition_predicate = extract_partition_predicate_from_expr(&condition.expr);
+        options.overwrite_predicate = partition_predicate
+            .map(|map| serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string()));
+    }
     let table_config = IcebergTableConfig {
         table_url,
         partition_columns: resolved_partition_columns,
@@ -1070,13 +1127,69 @@ fn alter_table_properties_conflict_error() -> DataFusionError {
     ))
 }
 
+/// Extract partition column equality conditions from an expression.
+/// Only supports equality predicates on partition columns (e.g., `col = 'value'`).
+/// Returns a JSON-serializable vector of (column, value) pairs.
+pub(crate) fn extract_partition_predicate_from_expr(expr: &Expr) -> Option<Vec<(String, String)>> {
+    match expr {
+        Expr::BinaryExpr(binary_expr) => {
+            use datafusion_expr::Operator;
+            match binary_expr.op {
+                Operator::Eq => {
+                    let left = binary_expr.left.as_ref();
+                    let right = binary_expr.right.as_ref();
+                    match (left, right) {
+                        (Expr::Column(col), Expr::Literal(scalar, _)) => {
+                            Some(vec![(col.name.clone(), scalar.to_string())])
+                        }
+                        (Expr::Literal(scalar, _), Expr::Column(col)) => {
+                            Some(vec![(col.name.clone(), scalar.to_string())])
+                        }
+                        _ => None,
+                    }
+                }
+                Operator::And => {
+                    let left = extract_partition_predicate_from_expr(binary_expr.left.as_ref());
+                    let right = extract_partition_predicate_from_expr(binary_expr.right.as_ref());
+                    match (left, right) {
+                        (Some(mut l), Some(r)) => {
+                            l.extend(r);
+                            Some(l)
+                        }
+                        (Some(l), None) => Some(l),
+                        (None, Some(r)) => Some(r),
+                        (None, None) => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Convert a [`BucketBy`] into its partition fields representation.
+/// Each column becomes a `CatalogPartitionField` with a `Bucket(n)` transform.
+pub(crate) fn partition_fields_from_bucket_by(bucket_by: BucketBy) -> Vec<CatalogPartitionField> {
+    let num_buckets = bucket_by.num_buckets as u32;
+    bucket_by
+        .columns
+        .into_iter()
+        .map(|col| CatalogPartitionField {
+            column: col,
+            transform: Some(PartitionTransform::Bucket(num_buckets)),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use sail_common_datafusion::catalog::{
         CatalogProviderId, CatalogTableIdentity, CommitAuthority, IcebergRestTableSessionRef,
         LakehouseAuthority, LakehouseFormat, LakehouseOperation, MetadataPointerAuthority,
-        TableLifecycle,
+        PartitionTransform, TableLifecycle,
     };
+    use sail_common_datafusion::datasource::BucketBy;
 
     use super::*;
 
@@ -1313,5 +1426,60 @@ mod tests {
 
         let result = validate_iceberg_lakehouse_storage_access(Some(&context));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn partition_fields_from_bucket_by_single_column() {
+        let bucket_by = BucketBy {
+            columns: vec!["user_id".to_string()],
+            num_buckets: 16,
+        };
+        let fields = partition_fields_from_bucket_by(bucket_by);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].column, "user_id");
+        assert_eq!(fields[0].transform, Some(PartitionTransform::Bucket(16)));
+    }
+
+    #[test]
+    fn partition_fields_from_bucket_by_multiple_columns() {
+        let bucket_by = BucketBy {
+            columns: vec!["user_id".to_string(), "org_id".to_string()],
+            num_buckets: 8,
+        };
+        let fields = partition_fields_from_bucket_by(bucket_by);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].column, "user_id");
+        assert_eq!(fields[0].transform, Some(PartitionTransform::Bucket(8)));
+        assert_eq!(fields[1].column, "org_id");
+        assert_eq!(fields[1].transform, Some(PartitionTransform::Bucket(8)));
+    }
+
+    #[test]
+    fn partition_fields_from_bucket_by_empty_columns() {
+        let bucket_by = BucketBy {
+            columns: vec![],
+            num_buckets: 4,
+        };
+        let fields = partition_fields_from_bucket_by(bucket_by);
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn partition_fields_from_bucket_by_merges_with_existing() {
+        let bucket_by = BucketBy {
+            columns: vec!["user_id".to_string()],
+            num_buckets: 16,
+        };
+        let existing = vec![CatalogPartitionField {
+            column: "event_date".to_string(),
+            transform: Some(PartitionTransform::Day),
+        }];
+        let bucket_fields = partition_fields_from_bucket_by(bucket_by);
+        let merged: Vec<_> = existing.into_iter().chain(bucket_fields).collect();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].column, "event_date");
+        assert_eq!(merged[0].transform, Some(PartitionTransform::Day));
+        assert_eq!(merged[1].column, "user_id");
+        assert_eq!(merged[1].transform, Some(PartitionTransform::Bucket(16)));
     }
 }

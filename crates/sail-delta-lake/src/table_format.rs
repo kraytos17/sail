@@ -159,6 +159,7 @@ impl TableFormat for DeltaTableFormat {
             properties,
             replace,
             lakehouse_table,
+            bucket_by: _,
         } = info;
         let catalog_table = lakehouse_table
             .as_ref()

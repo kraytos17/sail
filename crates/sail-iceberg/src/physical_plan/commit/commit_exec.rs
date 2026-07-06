@@ -46,10 +46,13 @@ use crate::operations::{SnapshotProduceOperation, Transaction, TransactionAction
 use crate::physical_plan::action_schema::decode_actions_and_meta_from_batch;
 use crate::physical_plan::commit::IcebergCommitInfo;
 use crate::spec::catalog::TableUpdate;
+use crate::spec::manifest_list::ManifestFile;
 use crate::spec::metadata::table_metadata::SnapshotLog;
 use crate::spec::partition::{UnboundPartitionField, UnboundPartitionSpec};
 use crate::spec::snapshots::MAIN_BRANCH;
-use crate::spec::{PartitionSpec, Schema as IcebergSchema, TableMetadata, TableRequirement};
+use crate::spec::{
+    ManifestList, PartitionSpec, Schema as IcebergSchema, TableMetadata, TableRequirement,
+};
 use crate::table::metadata_loader::{
     encode_metadata_file, load_metadata_file_bytes, metadata_file_extension_from_properties,
     metadata_file_version_from_path, metadata_location_to_object_path_string,
@@ -441,6 +444,7 @@ impl ExecutionPlan for IcebergCommitExec {
                 operation: commit_meta.operation,
                 schema: commit_meta.schema,
                 partition_spec: commit_meta.partition_spec,
+                overwrite_predicate: commit_meta.overwrite_predicate,
             };
 
             let catalog_table = commit_info
@@ -816,13 +820,27 @@ impl ExecutionPlan for IcebergCommitExec {
                             .map_err(DataFusionError::Execution)?
                     }
                     crate::spec::Operation::Overwrite => {
-                        let producer = crate::operations::SnapshotProducer::new(
+                        let mut producer = crate::operations::SnapshotProducer::new(
                             &tx,
                             commit_info.data_files.clone(),
                             Some(store_ctx.clone()),
                             Some(manifest_meta),
                         )
                         .with_row_lineage_start_row_id(row_lineage_start_row_id);
+
+                        // Handle predicate overwrite: keep non-matching parent entries
+                        if let Some(ref predicate_json) = commit_info.overwrite_predicate {
+                            let kept_entries = Self::filter_parent_manifest_entries(
+                                &store_ctx,
+                                tx.snapshot(),
+                                table_meta.format_version,
+                                predicate_json,
+                                &partition_spec_for_commit,
+                            )
+                            .await?;
+                            producer = producer.with_parent_manifest_entries(Some(kept_entries));
+                        }
+
                         struct LocalOverwriteOperation;
                         impl SnapshotProduceOperation for LocalOverwriteOperation {
                             fn operation(&self) -> &'static str {
@@ -1067,6 +1085,111 @@ impl ExecutionPlan for IcebergCommitExec {
             self.schema(),
             stream,
         )))
+    }
+}
+
+impl IcebergCommitExec {
+    /// Load the parent snapshot's manifest list and filter entries by the overwrite predicate.
+    /// Returns only manifest entries whose partition values do NOT match the predicate.
+    pub(crate) async fn filter_parent_manifest_entries(
+        store_ctx: &StoreContext,
+        snapshot: &crate::spec::Snapshot,
+        format_version: crate::spec::FormatVersion,
+        predicate_json: &str,
+        partition_spec: &PartitionSpec,
+    ) -> Result<Vec<ManifestFile>> {
+        // Deserialize predicate: Vec<[column, value]>
+        let predicate_pairs: Vec<(String, String)> = serde_json::from_str(predicate_json)
+            .map_err(|e| DataFusionError::Plan(format!("Invalid overwrite predicate JSON: {e}")))?;
+
+        // Build a lookup: partition field name -> predicate value
+        use std::collections::HashMap;
+        let pred_by_field: HashMap<String, String> = predicate_pairs.into_iter().collect();
+
+        // Determine which partition spec fields have predicate values
+        let mut field_predicate: Vec<(usize, String)> = Vec::new();
+        for (idx, field) in partition_spec.fields().iter().enumerate() {
+            if let Some(pred_val) = pred_by_field.get(&field.name) {
+                field_predicate.push((idx, pred_val.clone()));
+            }
+        }
+
+        if field_predicate.is_empty() {
+            // No matching partition fields — keep all parent entries (full overwrite fallback)
+            return Ok(Vec::new());
+        }
+
+        // Load parent manifest list
+        let parent_manifest_list_path_str = snapshot.manifest_list();
+        if parent_manifest_list_path_str.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (store_ref, manifest_list_path) = store_ctx
+            .resolve(parent_manifest_list_path_str)
+            .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
+
+        let manifest_list_data = store_ref
+            .get(&manifest_list_path)
+            .await
+            .map_err(|e| {
+                DataFusionError::Execution(format!("Failed to get parent manifest list: {e}"))
+            })?
+            .bytes()
+            .await
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to read parent manifest list bytes: {e}"
+                ))
+            })?;
+
+        let parent_manifest_list =
+            ManifestList::parse_with_version(&manifest_list_data, format_version).map_err(|e| {
+                DataFusionError::Execution(format!("Failed to parse manifest list: {e}"))
+            })?;
+
+        // Filter manifest files: keep those whose partition bounds do NOT overlap with the predicate
+        let mut kept = Vec::new();
+        for entry in parent_manifest_list.entries() {
+            let partitions = match entry.partitions.as_ref() {
+                Some(p) => p,
+                None => {
+                    // No partition summary — conservatively keep the entry
+                    kept.push(entry.clone());
+                    continue;
+                }
+            };
+
+            let mut matches_predicate = false;
+            for &(field_idx, ref pred_val) in &field_predicate {
+                if field_idx >= partitions.len() {
+                    continue;
+                }
+                let summary = &partitions[field_idx];
+                // Check if the predicate value falls within the FieldSummary bounds
+                let lower = summary.lower_bound_bytes.as_deref();
+                let upper = summary.upper_bound_bytes.as_deref();
+                if let (Some(lb), Some(ub)) = (lower, upper) {
+                    let pred_bytes = pred_val.as_bytes();
+                    if pred_bytes >= lb && pred_bytes <= ub {
+                        matches_predicate = true;
+                        break;
+                    }
+                } else {
+                    // No bounds — conservatively assume match
+                    matches_predicate = true;
+                    break;
+                }
+            }
+
+            if !matches_predicate {
+                // No partition overlap — this manifest is safe to keep
+                kept.push(entry.clone());
+            }
+            // Entries matching the predicate are excluded (replaced by new data)
+        }
+
+        Ok(kept)
     }
 }
 
