@@ -1,54 +1,111 @@
 ARG RUST_VERSION=1.95.0
 ARG RUST_PROFILE=release
-ARG RUSTFLAGS=""
+ARG RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 ARG PYSPARK_VERSION=4.1.1
+ARG CARGO_BUILD_JOBS=0
+ARG SCCACHE_CACHE_SIZE="2G"
 
-FROM python:3.14-slim AS builder
+FROM debian:bookworm-slim AS rust-base
 
 ARG RUST_VERSION
-ARG RUST_PROFILE
-ARG RUSTFLAGS
 
-ENV RUSTFLAGS="${RUSTFLAGS}"
-
-RUN apt-get update && \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=apt-cache \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked,id=apt-lists \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates \
-        gcc \
-        libc6-dev \
-        protobuf-compiler \
-        libprotobuf-dev \
         curl \
-        git \
-        pkg-config
+        gcc \
+        libc6-dev
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > /tmp/rustup-init && \
-    chmod a+x /tmp/rustup-init && \
-    /tmp/rustup-init -y --no-modify-path --profile default --default-toolchain ${RUST_VERSION}
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --no-modify-path --profile default --default-toolchain ${RUST_VERSION}
 
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+RUN curl -L --proto '=https' --tlsv1.2 -sSf \
+        https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+        | bash && \
+    cargo binstall --no-confirm cargo-chef sccache
+
+FROM rust-base AS planner
+
 WORKDIR /app
 
-COPY . .
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+RUN find crates -type f ! -name 'Cargo.toml' -delete && \
+    find crates -type d -empty -delete && \
+    find crates -name Cargo.toml -execdir sh -c \
+        'mkdir -p src && touch src/lib.rs src/main.rs' \;
 
-RUN --mount=type=cache,target=/root/.cargo/registry/ \
-    --mount=type=cache,target=/root/.cargo/git/ \
-    --mount=type=cache,target=/app/target/ \
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM rust-base AS builder
+
+ARG RUST_PROFILE
+ARG RUSTFLAGS
+ARG CARGO_BUILD_JOBS
+ARG SCCACHE_CACHE_SIZE
+
+ENV RUSTFLAGS="${RUSTFLAGS}"
+ENV RUSTC_WRAPPER=sccache
+ENV SCCACHE_DIR=/root/.cache/sccache
+ENV SCCACHE_CACHE_SIZE=${SCCACHE_CACHE_SIZE}
+ENV CARGO_NET_RETRY=3
+ENV CARGO_HTTP_TIMEOUT=30
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=apt-cache \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked,id=apt-lists \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        protobuf-compiler \
+        libprotobuf-dev \
+        git \
+        pkg-config \
+        python3 \
+        python3-dev \
+        mold
+
+WORKDIR /app
+
+COPY --link --from=planner /app/recipe.json recipe.json
+
+RUN --mount=type=cache,target=/root/.cache/sccache/,id=sccache \
+    --mount=type=cache,target=/root/.cargo/registry/,id=cargo-registry \
+    --mount=type=cache,target=/root/.cargo/git/,id=cargo-git \
+    --mount=type=cache,target=/app/target/,id=cargo-target \
+    JOBS="${CARGO_BUILD_JOBS}"; \
+    case "$JOBS" in ''|*[!0-9]*|0) JOBS=$(nproc) ;; esac; \
+    cargo chef cook --profile ${RUST_PROFILE} --recipe-path recipe.json --jobs "$JOBS" \
+        -p sail-cli --bins
+
+RUN --mount=type=bind,source=.,target=/app,rw \
+    --mount=type=cache,target=/root/.cache/sccache/,id=sccache \
+    --mount=type=cache,target=/root/.cargo/registry/,id=cargo-registry \
+    --mount=type=cache,target=/root/.cargo/git/,id=cargo-git \
+    --mount=type=cache,target=/app/target/,id=cargo-target \
+    JOBS="${CARGO_BUILD_JOBS}"; \
+    case "$JOBS" in ''|*[!0-9]*|0) JOBS=$(nproc) ;; esac; \
     RUST_TARGET_SUBDIR=$(case "${RUST_PROFILE}" in \
         dev|test) echo "debug" ;; \
         release|bench) echo "release" ;; \
         *) echo "${RUST_PROFILE}" ;; \
     esac) && \
-    cargo build -p sail-cli --profile ${RUST_PROFILE} --bins && \
-    cp /app/target/${RUST_TARGET_SUBDIR}/sail /usr/local/bin
+    cargo build -p sail-cli --profile ${RUST_PROFILE} --bins --jobs "$JOBS" && \
+    cp /app/target/${RUST_TARGET_SUBDIR}/sail /usr/local/bin/sail
 
 FROM python:3.14-slim
 
 ARG PYSPARK_VERSION
 
+RUN groupadd --system sail && \
+    useradd --system --gid sail --no-create-home --shell /usr/sbin/nologin sail
+
 RUN python3 -m pip install --no-cache-dir "pyspark-client==${PYSPARK_VERSION}"
 
-COPY --from=builder /usr/local/bin/sail /usr/local/bin
+COPY --link --from=builder /usr/local/bin/sail /usr/local/bin/sail
+
+USER sail
 
 ENTRYPOINT ["/usr/local/bin/sail"]
