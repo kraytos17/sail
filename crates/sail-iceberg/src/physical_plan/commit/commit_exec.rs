@@ -42,7 +42,9 @@ use crate::operations::bootstrap::{
     NewTableMetadataStyle, PersistStrategy,
 };
 use crate::operations::helpers::format_version_for_schema;
-use crate::operations::{SnapshotProduceOperation, Transaction, TransactionAction};
+use crate::operations::{
+    SnapshotProduceOperation, SnapshotProducer, Transaction, TransactionAction,
+};
 use crate::physical_plan::action_schema::decode_actions_and_meta_from_batch;
 use crate::physical_plan::commit::IcebergCommitInfo;
 use crate::spec::catalog::TableUpdate;
@@ -51,8 +53,10 @@ use crate::spec::metadata::table_metadata::SnapshotLog;
 use crate::spec::partition::{UnboundPartitionField, UnboundPartitionSpec};
 use crate::spec::snapshots::MAIN_BRANCH;
 use crate::spec::{
-    ManifestList, PartitionSpec, Schema as IcebergSchema, TableMetadata, TableRequirement,
+    FormatVersion, ManifestList, MetadataLog, Operation, PartitionSpec, Schema as IcebergSchema,
+    Snapshot, TableMetadata, TableRequirement,
 };
+use crate::table::find_latest_metadata_file;
 use crate::table::metadata_loader::{
     encode_metadata_file, load_metadata_file_bytes, metadata_file_extension_from_properties,
     metadata_file_version_from_path, metadata_location_to_object_path_string,
@@ -60,6 +64,7 @@ use crate::table::metadata_loader::{
 use crate::table_format::metadata_location_from_properties;
 use crate::utils::get_object_store_from_context;
 use crate::utils::metadata::metadata_files_for_version;
+use crate::utils::timestamp::monotonic_timestamp_ms;
 const MAX_COMMIT_RETRIES: usize = 5;
 
 #[derive(Debug)]
@@ -445,6 +450,7 @@ impl ExecutionPlan for IcebergCommitExec {
                 schema: commit_meta.schema,
                 partition_spec: commit_meta.partition_spec,
                 overwrite_predicate: commit_meta.overwrite_predicate,
+                overwrite_partition_values: commit_meta.overwrite_partition_values,
             };
 
             let catalog_table = commit_info
@@ -482,7 +488,7 @@ impl ExecutionPlan for IcebergCommitExec {
             // their current state is discovered from the metadata directory and version hint.
             let latest_meta_res = match catalog_metadata_location.as_deref() {
                 Some(location) => Ok(metadata_location_to_object_path_string(location)?),
-                None => crate::table::find_latest_metadata_file(&object_store, &table_url).await,
+                None => find_latest_metadata_file(&object_store, &table_url).await,
             };
             let catalog_metadata_table = catalog_table
                 .as_ref()
@@ -504,8 +510,8 @@ impl ExecutionPlan for IcebergCommitExec {
             );
 
             if latest_meta_res.is_err()
-                && (matches!(commit_info.operation, crate::spec::Operation::Overwrite)
-                    || matches!(commit_info.operation, crate::spec::Operation::Append))
+                && (matches!(commit_info.operation, Operation::Overwrite)
+                    || matches!(commit_info.operation, Operation::Append))
             {
                 Self::validate_requirements(None, &commit_info.requirements)?;
                 if let Some(catalog_table) = catalog_metadata_update_table {
@@ -577,7 +583,7 @@ impl ExecutionPlan for IcebergCommitExec {
                 } else if let Some(location) = catalog_metadata_location.as_deref() {
                     metadata_location_to_object_path_string(location)?
                 } else {
-                    crate::table::find_latest_metadata_file(&object_store, &table_url).await?
+                    find_latest_metadata_file(&object_store, &table_url).await?
                 };
 
                 let bytes = load_metadata_file_bytes(&object_store, &latest_meta).await?;
@@ -650,8 +656,8 @@ impl ExecutionPlan for IcebergCommitExec {
                 // If metadata exists but there is no current snapshot (e.g. from a CREATE TABLE),
                 // bootstrap the first snapshot as a normal metadata version.
                 if maybe_snapshot.is_none()
-                    && (matches!(commit_info.operation, crate::spec::Operation::Overwrite)
-                        || matches!(commit_info.operation, crate::spec::Operation::Append))
+                    && (matches!(commit_info.operation, Operation::Overwrite)
+                        || matches!(commit_info.operation, Operation::Append))
                 {
                     let mut catalog_fallback_table = catalog_metadata_update_table;
                     if let Some(catalog_table) = catalog_commit_table {
@@ -805,7 +811,7 @@ impl ExecutionPlan for IcebergCommitExec {
                     table_meta.format_version,
                 );
                 let action_commit = match commit_info.operation {
-                    crate::spec::Operation::Append => {
+                    Operation::Append => {
                         let mut action = tx
                             .fast_append()
                             .with_store_context(store_ctx.clone())
@@ -819,8 +825,8 @@ impl ExecutionPlan for IcebergCommitExec {
                             .await
                             .map_err(DataFusionError::Execution)?
                     }
-                    crate::spec::Operation::Overwrite => {
-                        let mut producer = crate::operations::SnapshotProducer::new(
+                    Operation::Overwrite => {
+                        let mut producer = SnapshotProducer::new(
                             &tx,
                             commit_info.data_files.clone(),
                             Some(store_ctx.clone()),
@@ -835,6 +841,19 @@ impl ExecutionPlan for IcebergCommitExec {
                                 tx.snapshot(),
                                 table_meta.format_version,
                                 predicate_json,
+                                &partition_spec_for_commit,
+                            )
+                            .await?;
+                            producer = producer.with_parent_manifest_entries(Some(kept_entries));
+                        } else if let Some(ref partition_values_json) =
+                            commit_info.overwrite_partition_values
+                        {
+                            // Handle partition overwrite: keep entries not matching written partitions
+                            let kept_entries = Self::filter_parent_manifest_entries_by_values(
+                                &store_ctx,
+                                tx.snapshot(),
+                                table_meta.format_version,
+                                partition_values_json,
                                 &partition_spec_for_commit,
                             )
                             .await?;
@@ -920,7 +939,7 @@ impl ExecutionPlan for IcebergCommitExec {
                 log::trace!("commit_exec: applying updates: {:?}", &action_updates);
                 let mut newest_snapshot_seq: Option<i64> = None;
                 let mut newest_snapshot_added_rows: Option<i64> = None;
-                let timestamp_ms = crate::utils::timestamp::monotonic_timestamp_ms();
+                let timestamp_ms = monotonic_timestamp_ms();
                 for upd in action_updates {
                     match upd {
                         TableUpdate::AddSnapshot { snapshot } => {
@@ -953,14 +972,12 @@ impl ExecutionPlan for IcebergCommitExec {
                 }
 
                 // Add metadata_log entry referencing previous metadata file
-                table_meta
-                    .metadata_log
-                    .push(crate::spec::metadata::table_metadata::MetadataLog {
-                        timestamp_ms,
-                        metadata_file: catalog_metadata_location
-                            .clone()
-                            .unwrap_or_else(|| latest_meta.clone()),
-                    });
+                table_meta.metadata_log.push(MetadataLog {
+                    timestamp_ms,
+                    metadata_file: catalog_metadata_location
+                        .clone()
+                        .unwrap_or_else(|| latest_meta.clone()),
+                });
 
                 let new_meta_json = table_meta
                     .to_json()
@@ -1093,8 +1110,8 @@ impl IcebergCommitExec {
     /// Returns only manifest entries whose partition values do NOT match the predicate.
     pub(crate) async fn filter_parent_manifest_entries(
         store_ctx: &StoreContext,
-        snapshot: &crate::spec::Snapshot,
-        format_version: crate::spec::FormatVersion,
+        snapshot: &Snapshot,
+        format_version: FormatVersion,
         predicate_json: &str,
         partition_spec: &PartitionSpec,
     ) -> Result<Vec<ManifestFile>> {
@@ -1187,6 +1204,98 @@ impl IcebergCommitExec {
                 kept.push(entry.clone());
             }
             // Entries matching the predicate are excluded (replaced by new data)
+        }
+
+        Ok(kept)
+    }
+
+    /// Filter parent manifest entries by comparing against written partition values.
+    /// Keeps entries whose partition bounds do NOT overlap with any of the written partition values.
+    pub(crate) async fn filter_parent_manifest_entries_by_values(
+        store_ctx: &StoreContext,
+        snapshot: &Snapshot,
+        format_version: FormatVersion,
+        partition_values_json: &str,
+        _partition_spec: &PartitionSpec,
+    ) -> Result<Vec<ManifestFile>> {
+        let written_partitions: Vec<Vec<String>> = serde_json::from_str(partition_values_json)
+            .map_err(|e| DataFusionError::Plan(format!("Invalid partition values JSON: {e}")))?;
+
+        if written_partitions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let parent_manifest_list_path_str = snapshot.manifest_list();
+        if parent_manifest_list_path_str.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (store_ref, manifest_list_path) = store_ctx
+            .resolve(parent_manifest_list_path_str)
+            .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
+
+        let manifest_list_data = store_ref
+            .get(&manifest_list_path)
+            .await
+            .map_err(|e| {
+                DataFusionError::Execution(format!("Failed to get parent manifest list: {e}"))
+            })?
+            .bytes()
+            .await
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "Failed to read parent manifest list bytes: {e}"
+                ))
+            })?;
+
+        let parent_manifest_list =
+            ManifestList::parse_with_version(&manifest_list_data, format_version).map_err(|e| {
+                DataFusionError::Execution(format!("Failed to parse manifest list: {e}"))
+            })?;
+
+        let mut kept = Vec::new();
+        for entry in parent_manifest_list.entries() {
+            let partitions = match entry.partitions.as_ref() {
+                Some(p) => p,
+                None => {
+                    kept.push(entry.clone());
+                    continue;
+                }
+            };
+
+            let mut matches_any = false;
+            for written in &written_partitions {
+                let mut all_fields_match = true;
+                for (field_idx, pred_val) in written.iter().enumerate() {
+                    if field_idx >= partitions.len() {
+                        continue;
+                    }
+                    let summary = &partitions[field_idx];
+                    let lower = summary.lower_bound_bytes.as_deref();
+                    let upper = summary.upper_bound_bytes.as_deref();
+                    if let (Some(lb), Some(ub)) = (lower, upper) {
+                        let pred_bytes = pred_val.as_bytes();
+                        if pred_bytes >= lb && pred_bytes <= ub {
+                            // This field's partition value overlaps — check next field
+                            continue;
+                        } else {
+                            all_fields_match = false;
+                            break;
+                        }
+                    } else {
+                        // No bounds — conservatively assume match
+                        continue;
+                    }
+                }
+                if all_fields_match {
+                    matches_any = true;
+                    break;
+                }
+            }
+
+            if !matches_any {
+                kept.push(entry.clone());
+            }
         }
 
         Ok(kept)

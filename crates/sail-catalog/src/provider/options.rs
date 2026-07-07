@@ -137,6 +137,16 @@ pub struct DropTemporaryViewOptions {
 /// Options for altering a table in a catalog.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Serialize, Deserialize)]
 pub enum AlterTableOptions {
+    RenameTable {
+        new_name: Vec<String>,
+    },
+    AddColumns {
+        columns: Vec<AddColumn>,
+    },
+    DropColumns {
+        names: Vec<String>,
+        if_exists: bool,
+    },
     SetTableProperties {
         properties: Vec<(String, String)>,
     },
@@ -156,4 +166,14 @@ pub enum AlterTableOptions {
         name: String,
         expression: String,
     },
+}
+
+/// Definition of a column to add via ALTER TABLE ADD COLUMNS.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Serialize, Deserialize)]
+pub struct AddColumn {
+    pub name: Vec<String>,
+    pub data_type: DataType,
+    pub nullable: bool,
+    pub default: Option<String>,
+    pub comment: Option<String>,
 }

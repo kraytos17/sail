@@ -8,8 +8,10 @@ use datafusion::logical_expr::expr_rewriter::unnormalize_cols;
 use datafusion::logical_expr::{LogicalPlan, TableScan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
+use sail_logical_plan::merge::RowLevelWriteNode;
 
 use crate::logical::IcebergTableSource;
+use crate::physical::row_level_planner::plan_iceberg_row_level_write;
 use crate::table_format::{plan_iceberg_write, IcebergWriteNode};
 
 pub struct IcebergPhysicalPlanner;
@@ -24,22 +26,38 @@ impl ExtensionPlanner for IcebergPhysicalPlanner {
         physical_inputs: &[Arc<dyn ExecutionPlan>],
         session_state: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        let Some(node) = node.as_any().downcast_ref::<IcebergWriteNode>() else {
-            return Ok(None);
-        };
-        let [logical_input] = logical_inputs else {
-            return datafusion_common::internal_err!(
-                "IcebergWriteNode requires exactly one logical input"
-            );
-        };
-        let [physical_input] = physical_inputs else {
-            return datafusion_common::internal_err!(
-                "IcebergWriteNode requires exactly one physical input"
-            );
-        };
-        plan_iceberg_write(session_state, logical_input, physical_input.clone(), node)
+        // Handle IcebergWriteNode (INSERT / CTAS)
+        if let Some(write_node) = node.as_any().downcast_ref::<IcebergWriteNode>() {
+            let [logical_input] = logical_inputs else {
+                return datafusion_common::internal_err!(
+                    "IcebergWriteNode requires exactly one logical input"
+                );
+            };
+            let [physical_input] = physical_inputs else {
+                return datafusion_common::internal_err!(
+                    "IcebergWriteNode requires exactly one physical input"
+                );
+            };
+            return plan_iceberg_write(
+                session_state,
+                logical_input,
+                physical_input.clone(),
+                write_node,
+            )
             .await
-            .map(Some)
+            .map(Some);
+        }
+
+        // Handle RowLevelWriteNode (DELETE)
+        if let Some(delete_node) = node.as_any().downcast_ref::<RowLevelWriteNode>() {
+            if delete_node.target_format().eq_ignore_ascii_case("iceberg") {
+                return plan_iceberg_row_level_write(session_state, delete_node)
+                    .await
+                    .map(Some);
+            }
+        }
+
+        Ok(None)
     }
 
     async fn plan_table_scan(

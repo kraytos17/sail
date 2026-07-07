@@ -388,6 +388,57 @@ impl CatalogProvider for MemoryCatalogProvider {
                         ))
                     })
                 }
+                AlterTableOptions::RenameTable { new_name } => {
+                    let new_table_name = new_name.last().cloned().ok_or_else(|| {
+                        CatalogError::InvalidArgument(
+                            "RENAME TO requires a valid table name".to_string(),
+                        )
+                    })?;
+                    let old_entry = db.tables.remove(table).ok_or_else(|| {
+                        CatalogError::NotFound(CatalogObject::Table, table.to_string())
+                    })?;
+                    let entry = old_entry;
+                    db.tables.insert(new_table_name.clone(), entry);
+                    Ok(())
+                }
+                AlterTableOptions::AddColumns {
+                    columns: new_columns,
+                } => {
+                    for col in new_columns {
+                        columns.push(sail_common_datafusion::catalog::TableColumnStatus {
+                            name: col.name.join("."),
+                            data_type: col.data_type,
+                            nullable: col.nullable,
+                            comment: col.comment,
+                            default: col.default,
+                            generated_always_as: None,
+                            identity: None,
+                            is_partition: false,
+                            is_bucket: false,
+                            is_cluster: false,
+                        });
+                    }
+                    Ok(())
+                }
+                AlterTableOptions::DropColumns { names, if_exists } => {
+                    for name in &names {
+                        let pos = columns.iter().position(|c| c.name == name.as_str());
+                        match pos {
+                            Some(idx) => {
+                                columns.remove(idx);
+                            }
+                            None => {
+                                if !if_exists {
+                                    return Err(CatalogError::NotFound(
+                                        CatalogObject::Table,
+                                        format!("column '{name}' not found on table '{table}'"),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                }
                 AlterTableOptions::AddCheckConstraint { .. } => Err(CatalogError::NotSupported(
                     "CHECK constraints are handled by lakehouse table formats".to_string(),
                 )),

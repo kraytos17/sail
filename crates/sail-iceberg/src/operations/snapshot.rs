@@ -23,6 +23,8 @@ use crate::spec::{
     MAIN_BRANCH,
 };
 use crate::utils::join_table_uri;
+use crate::utils::snapshot_id::generate_snapshot_id;
+use crate::utils::timestamp::monotonic_timestamp_ms;
 
 pub trait SnapshotProduceOperation: Send + Sync {
     fn operation(&self) -> &'static str;
@@ -92,7 +94,7 @@ impl<'a> SnapshotProducer<'a> {
     }
 
     pub async fn commit(self, op: impl SnapshotProduceOperation) -> Result<ActionCommit, String> {
-        let timestamp_ms = crate::utils::timestamp::monotonic_timestamp_ms();
+        let timestamp_ms = monotonic_timestamp_ms();
         let is_overwrite = op.operation() == Operation::Overwrite.as_str();
         let summary = if is_overwrite {
             crate::spec::snapshots::Summary::new(Operation::Overwrite)
@@ -128,7 +130,7 @@ impl<'a> SnapshotProducer<'a> {
             .ok_or_else(|| "store context not available".to_string())?;
 
         // Generate new snapshot ID using UUID (not timestamp) and sequence number
-        let new_snapshot_id = crate::utils::snapshot_id::generate_snapshot_id();
+        let new_snapshot_id = generate_snapshot_id();
         let new_sequence_number = if self.is_bootstrap {
             1 // First snapshot starts at sequence 1
         } else {

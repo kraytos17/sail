@@ -35,6 +35,7 @@ use crate::spec::{FormatVersion, TableMetadata};
 use crate::table::metadata_loader::{
     encode_metadata_file, metadata_file_extension_from_properties, metadata_file_version_from_path,
 };
+use crate::utils::timestamp::monotonic_timestamp_ms;
 use crate::utils::WritePathMode;
 
 /// Strategy for persisting metadata during bootstrap
@@ -219,7 +220,7 @@ pub async fn bootstrap_new_table_with_style(
         .ok_or_else(|| DataFusionError::Plan("No snapshot in bootstrap commit".to_string()))?;
 
     // Build minimal TableMetadata, using v3 when the schema requires v3 types.
-    let commit_timestamp_ms = crate::utils::timestamp::monotonic_timestamp_ms();
+    let commit_timestamp_ms = monotonic_timestamp_ms();
     let table_meta = TableMetadata {
         format_version,
         table_uuid: None,
@@ -316,7 +317,7 @@ pub async fn bootstrap_empty_table_metadata(
     let (format_version, table_properties) =
         crate::properties::metadata_properties_from_table_properties(table_properties)?;
     let format_version = format_version.max(format_version_for_schema(&iceberg_schema));
-    let commit_timestamp_ms = crate::utils::timestamp::monotonic_timestamp_ms();
+    let commit_timestamp_ms = monotonic_timestamp_ms();
 
     let mut table_meta = TableMetadata {
         format_version,
@@ -400,7 +401,7 @@ pub async fn replace_empty_table_metadata(
         .format_version
         .max(requested_format_version)
         .max(format_version_for_schema(&iceberg_schema));
-    let commit_timestamp_ms = crate::utils::timestamp::monotonic_timestamp_ms();
+    let commit_timestamp_ms = monotonic_timestamp_ms();
 
     let mut metadata_log = previous_metadata.metadata_log.clone();
     metadata_log.push(crate::spec::metadata::table_metadata::MetadataLog {
@@ -528,7 +529,7 @@ pub async fn bootstrap_first_snapshot(
         .ok_or_else(|| DataFusionError::Plan("No snapshot in bootstrap commit".to_string()))?;
 
     // Update table metadata with the new snapshot
-    let commit_timestamp_ms = crate::utils::timestamp::monotonic_timestamp_ms();
+    let commit_timestamp_ms = monotonic_timestamp_ms();
     table_meta.current_snapshot_id = Some(snapshot.snapshot_id());
     table_meta.snapshots.push(snapshot.clone());
     table_meta.snapshot_log.push(SnapshotLog {

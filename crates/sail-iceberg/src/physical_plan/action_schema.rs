@@ -41,6 +41,9 @@ pub struct CommitMeta {
     pub schema: Option<IcebergSchema>,
     pub partition_spec: Option<PartitionSpec>,
     pub overwrite_predicate: Option<String>,
+    /// JSON-serialized partition values for partition overwrite.
+    /// Array of partition value combinations: `[["val1"], ["val2"]]`
+    pub overwrite_partition_values: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +62,8 @@ pub struct CommitMetaAction {
     pub partition_spec_json: Option<String>,
     /// Optional overwrite predicate JSON for predicate-based overwrite.
     pub overwrite_predicate_json: Option<String>,
+    /// Optional partition values JSON for partition overwrite.
+    pub overwrite_partition_values_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,6 +418,7 @@ pub fn encode_commit_meta(meta: CommitMeta) -> Result<RecordBatch> {
         .transpose()
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let overwrite_predicate_json = meta.overwrite_predicate;
+    let overwrite_partition_values_json = meta.overwrite_partition_values;
 
     let rows = vec![ActionRow {
         action: ExecAction::CommitMeta(CommitMetaAction {
@@ -425,6 +431,7 @@ pub fn encode_commit_meta(meta: CommitMeta) -> Result<RecordBatch> {
             schema_json,
             partition_spec_json,
             overwrite_predicate_json,
+            overwrite_partition_values_json,
         }),
     }];
     encode_actions(rows)
@@ -485,6 +492,7 @@ pub fn decode_actions_and_meta_from_batch(
                     schema,
                     partition_spec,
                     overwrite_predicate,
+                    overwrite_partition_values: m.overwrite_partition_values_json,
                 });
             }
         }
@@ -538,6 +546,7 @@ mod tests {
             schema: None,
             partition_spec: None,
             overwrite_predicate: None,
+            overwrite_partition_values: None,
         };
 
         let schema = iceberg_action_schema()?;
@@ -553,6 +562,111 @@ mod tests {
         assert_eq!(adds[0].file_path, df.file_path);
         assert_eq!(adds[0].record_count, df.record_count);
         assert!(meta.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn encode_commit_meta_with_overwrite_predicate_roundtrip() -> Result<()> {
+        let meta = CommitMeta {
+            table_uri: "s3://bucket/table".to_string(),
+            row_count: 5,
+            operation: Operation::Overwrite,
+            requirements: vec![TableRequirement::NotExist],
+            table_properties: vec![],
+            lakehouse_table: None,
+            schema: None,
+            partition_spec: None,
+            overwrite_predicate: Some(r#"[["event_date","2024-01-15"]]"#.to_string()),
+            overwrite_partition_values: None,
+        };
+
+        let batch = encode_commit_meta(meta)?;
+        let (_, _, decoded) = decode_actions_and_meta_from_batch(&batch)?;
+        assert!(decoded.is_some());
+        let decoded = decoded.unwrap();
+        assert_eq!(
+            decoded.overwrite_predicate,
+            Some(r#"[["event_date","2024-01-15"]]"#.to_string())
+        );
+        assert_eq!(decoded.operation, Operation::Overwrite);
+        Ok(())
+    }
+
+    #[test]
+    fn encode_commit_meta_with_partition_values_roundtrip() -> Result<()> {
+        let meta = CommitMeta {
+            table_uri: "s3://bucket/table".to_string(),
+            row_count: 3,
+            operation: Operation::Overwrite,
+            requirements: vec![TableRequirement::NotExist],
+            table_properties: vec![],
+            lakehouse_table: None,
+            schema: None,
+            partition_spec: None,
+            overwrite_predicate: None,
+            overwrite_partition_values: Some(r#"[["2024-01-15"],["2024-01-16"]]"#.to_string()),
+        };
+
+        let batch = encode_commit_meta(meta)?;
+        let (_, _, decoded) = decode_actions_and_meta_from_batch(&batch)?;
+        assert!(decoded.is_some());
+        let decoded = decoded.unwrap();
+        assert_eq!(
+            decoded.overwrite_partition_values,
+            Some(r#"[["2024-01-15"],["2024-01-16"]]"#.to_string())
+        );
+        assert_eq!(decoded.operation, Operation::Overwrite);
+        Ok(())
+    }
+
+    #[test]
+    fn encode_commit_meta_truncate_roundtrip() -> Result<()> {
+        let meta = CommitMeta {
+            table_uri: "s3://bucket/table".to_string(),
+            row_count: 0,
+            operation: Operation::Overwrite,
+            requirements: vec![TableRequirement::NotExist],
+            table_properties: vec![],
+            lakehouse_table: None,
+            schema: None,
+            partition_spec: None,
+            overwrite_predicate: None,
+            overwrite_partition_values: None,
+        };
+
+        let batch = encode_commit_meta(meta)?;
+        let (adds, _, decoded) = decode_actions_and_meta_from_batch(&batch)?;
+        assert!(adds.is_empty());
+        assert!(decoded.is_some());
+        let decoded = decoded.unwrap();
+        assert!(decoded.overwrite_predicate.is_none());
+        assert!(decoded.overwrite_partition_values.is_none());
+        assert_eq!(decoded.operation, Operation::Overwrite);
+        assert_eq!(decoded.row_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn encode_commit_meta_update_roundtrip() -> Result<()> {
+        let meta = CommitMeta {
+            table_uri: "s3://bucket/table".to_string(),
+            row_count: 5,
+            operation: Operation::Overwrite,
+            requirements: vec![TableRequirement::NotExist],
+            table_properties: vec![],
+            lakehouse_table: None,
+            schema: None,
+            partition_spec: None,
+            overwrite_predicate: None,
+            overwrite_partition_values: None,
+        };
+
+        let batch = encode_commit_meta(meta)?;
+        let (_, _, decoded) = decode_actions_and_meta_from_batch(&batch)?;
+        assert!(decoded.is_some());
+        let decoded = decoded.unwrap();
+        assert_eq!(decoded.operation, Operation::Overwrite);
+        assert_eq!(decoded.row_count, 5);
         Ok(())
     }
 }

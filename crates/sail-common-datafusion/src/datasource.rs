@@ -290,6 +290,19 @@ pub struct DeleteInfo {
     pub options: Vec<OptionLayer>,
 }
 
+/// Information required to create a logical UPDATE plan for a table format.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd)]
+pub struct UpdateInfo {
+    pub table_name: Vec<String>,
+    pub path: String,
+    pub condition: Option<ExprWithSource>,
+    /// Assignment expressions: (column_name, new_value_expr)
+    pub assignments: Vec<(String, ExprWithSource)>,
+    pub lakehouse_table: Option<LakehouseExecutionContext>,
+    /// The layers of options for the update operation.
+    pub options: Vec<OptionLayer>,
+}
+
 /// Information required to create a logical MERGE plan for a table format.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct MergeInfo {
@@ -441,6 +454,15 @@ pub enum RowLevelCommand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableFormatAlterTableOperation {
+    /// Rename the table. For Iceberg, this is a no-op at the storage level
+    /// (metadata path stays the same). The catalog handles the name change.
+    RenameTable,
+    /// Add columns to the table.
+    AddColumns {
+        columns: Vec<TableFormatCreateTableColumn>,
+    },
+    /// Drop columns from the table.
+    DropColumns { names: Vec<String>, if_exists: bool },
     /// Alters table properties (SET/UNSET TBLPROPERTIES).
     ///
     /// `changes` is a list of `(key, value)` pairs where `value` is `Some(v)` to set a property,
@@ -523,6 +545,12 @@ pub trait TableFormat: Send + Sync {
         not_impl_err!("MERGE is not yet implemented for {} format", self.name())
     }
 
+    /// Creates a logical plan for UPDATE.
+    async fn create_updater(&self, ctx: &dyn Session, info: UpdateInfo) -> Result<LogicalPlan> {
+        let _ = (ctx, info);
+        not_impl_err!("UPDATE is not yet implemented for {} format", self.name())
+    }
+
     /// Alters table-format storage metadata for an existing table.
     async fn alter_table(
         &self,
@@ -554,6 +582,16 @@ pub trait TableFormat: Send + Sync {
             TableFormatAlterTableOperation::AddCheckConstraint { .. } => {
                 not_impl_err!(
                     "CHECK constraint alteration not supported for {} format",
+                    self.name()
+                )
+            }
+            TableFormatAlterTableOperation::RenameTable => Ok(()),
+            TableFormatAlterTableOperation::AddColumns { .. } => {
+                not_impl_err!("ADD COLUMNS not yet implemented for {} format", self.name())
+            }
+            TableFormatAlterTableOperation::DropColumns { .. } => {
+                not_impl_err!(
+                    "DROP COLUMNS not yet implemented for {} format",
                     self.name()
                 )
             }

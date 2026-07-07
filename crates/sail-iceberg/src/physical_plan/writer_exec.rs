@@ -10,6 +10,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -44,7 +45,8 @@ use crate::spec::partition::{
     PartitionSpec as BoundPartitionSpec, UnboundPartitionField, UnboundPartitionSpec,
 };
 use crate::spec::schema::Schema as IcebergSchema;
-use crate::spec::{TableMetadata, TableRequirement};
+use crate::spec::{Operation, TableMetadata, TableRequirement};
+use crate::table::find_latest_metadata_file;
 use crate::table::metadata_loader::metadata_location_to_object_path_string;
 use crate::table_format::{
     catalog_managed_iceberg_from_properties, metadata_location_from_properties,
@@ -205,7 +207,9 @@ impl IcebergWriterExec {
             (false, true) => {
                 if matches!(
                     sink_mode,
-                    PhysicalSinkMode::Overwrite | PhysicalSinkMode::OverwriteIf { .. }
+                    PhysicalSinkMode::Overwrite
+                        | PhysicalSinkMode::OverwriteIf { .. }
+                        | PhysicalSinkMode::OverwritePartitions
                 ) {
                     Ok(Some(SchemaMode::Overwrite))
                 } else {
@@ -371,11 +375,7 @@ impl ExecutionPlan for IcebergWriterExec {
                 PhysicalSinkMode::Append => {}
                 PhysicalSinkMode::Overwrite => {}
                 PhysicalSinkMode::OverwriteIf { .. } => {}
-                PhysicalSinkMode::OverwritePartitions => {
-                    return Err(DataFusionError::NotImplemented(
-                        "partition overwrite not implemented for Iceberg".to_string(),
-                    ));
-                }
+                PhysicalSinkMode::OverwritePartitions => {}
             }
 
             let object_store = get_object_store_from_context(&context, &table_url)?;
@@ -395,13 +395,10 @@ impl ExecutionPlan for IcebergWriterExec {
                     if catalog_managed_iceberg_from_properties(&options.table_properties) {
                         match metadata_location_from_properties(&options.table_properties) {
                             Some(location) => metadata_location_to_object_path_string(&location)?,
-                            None => {
-                                crate::table::find_latest_metadata_file(&object_store, &table_url)
-                                    .await?
-                            }
+                            None => find_latest_metadata_file(&object_store, &table_url).await?,
                         }
                     } else {
-                        crate::table::find_latest_metadata_file(&object_store, &table_url).await?
+                        find_latest_metadata_file(&object_store, &table_url).await?
                     };
                 let bytes = crate::table::metadata_loader::load_metadata_file_bytes(
                     &object_store,
@@ -597,16 +594,41 @@ impl ExecutionPlan for IcebergWriterExec {
 
             let data_files = writer.close().await.map_err(DataFusionError::Execution)?;
 
+            // Extract partition values for partition overwrite mode
+            let overwrite_partition_values =
+                if matches!(sink_mode, PhysicalSinkMode::OverwritePartitions) {
+                    let mut unique_partitions: HashSet<Vec<String>> = HashSet::new();
+                    for df in &data_files {
+                        let parts: Vec<String> = df
+                            .partition
+                            .iter()
+                            .map(|opt| match opt {
+                                Some(lit) => format!("{lit:?}"),
+                                None => "__NULL__".to_string(),
+                            })
+                            .collect();
+                        unique_partitions.insert(parts);
+                    }
+                    Some(
+                        serde_json::to_string(&unique_partitions.into_iter().collect::<Vec<_>>())
+                            .unwrap_or_else(|_| "[]".to_string()),
+                    )
+                } else {
+                    None
+                };
+
             let commit_meta = CommitMeta {
                 table_uri: table_url.to_string(),
                 row_count: total_rows,
                 operation: if matches!(
                     sink_mode,
-                    PhysicalSinkMode::Overwrite | PhysicalSinkMode::OverwriteIf { .. }
+                    PhysicalSinkMode::Overwrite
+                        | PhysicalSinkMode::OverwriteIf { .. }
+                        | PhysicalSinkMode::OverwritePartitions
                 ) {
-                    crate::spec::Operation::Overwrite
+                    Operation::Overwrite
                 } else {
-                    crate::spec::Operation::Append
+                    Operation::Append
                 },
                 requirements: commit_requirements,
                 table_properties: options.table_properties,
@@ -620,6 +642,7 @@ impl ExecutionPlan for IcebergWriterExec {
                     None
                 },
                 overwrite_predicate: options.overwrite_predicate,
+                overwrite_partition_values,
             };
 
             let schema = iceberg_action_schema()?;

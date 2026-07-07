@@ -155,6 +155,9 @@ pub struct RowLevelWriteNode {
     /// Condition for DELETE/UPDATE (passed through to physical planner).
     #[educe(PartialOrd(ignore))]
     condition: Option<ExprWithSource>,
+    /// Assignment expressions for UPDATE: (column_name, new_value_expr).
+    #[educe(PartialOrd(ignore))]
+    assignments: Option<Vec<(String, ExprWithSource)>>,
     #[educe(PartialOrd(ignore))]
     merge_options: Option<MergeIntoOptions>,
     target_format: String,
@@ -196,6 +199,7 @@ impl RowLevelWriteNode {
             touched_files_plan: Some(touched_files_plan),
             deletion_vector_plan,
             condition: None,
+            assignments: None,
             merge_options: Some(options),
             schema,
         }
@@ -221,6 +225,41 @@ impl RowLevelWriteNode {
             touched_files_plan: None,
             deletion_vector_plan: None,
             condition,
+            assignments: None,
+            merge_options: None,
+            target_format: format,
+            target_location: location,
+            target_table_name: table_name,
+            target_partition_by: Vec::new(),
+            target_options: options,
+            target_lakehouse_table: lakehouse_table,
+            with_schema_evolution: false,
+            schema: Arc::new(DFSchema::empty()),
+        }
+    }
+
+    /// Create an UPDATE write node carrying the condition and assignments.
+    pub fn new_update(
+        raw_target: Arc<LogicalPlan>,
+        raw_input_schema: DFSchemaRef,
+        assignments: Vec<(String, ExprWithSource)>,
+        condition: Option<ExprWithSource>,
+        format: String,
+        location: String,
+        table_name: Vec<String>,
+        options: Vec<OptionLayer>,
+        lakehouse_table: Option<LakehouseExecutionContext>,
+    ) -> Self {
+        Self {
+            command: RowLevelCommand::Update,
+            raw_target,
+            raw_source: None,
+            raw_input_schema,
+            write_plan: None,
+            touched_files_plan: None,
+            deletion_vector_plan: None,
+            condition,
+            assignments: Some(assignments),
             merge_options: None,
             target_format: format,
             target_location: location,
@@ -267,6 +306,11 @@ impl RowLevelWriteNode {
 
     pub fn condition(&self) -> Option<&ExprWithSource> {
         self.condition.as_ref()
+    }
+
+    /// Returns the assignment expressions for UPDATE (column_name, new_value_expr).
+    pub fn assignments(&self) -> Option<&[(String, ExprWithSource)]> {
+        self.assignments.as_deref()
     }
 
     pub fn target_format(&self) -> &str {
@@ -353,7 +397,15 @@ impl UserDefinedLogicalNodeCore for RowLevelWriteNode {
                     )?;
                 }
             }
-            RowLevelCommand::Update => {}
+            RowLevelCommand::Update => {
+                if let Some(assignments) = &self.assignments {
+                    let cols: Vec<&str> = assignments.iter().map(|(c, _)| c.as_str()).collect();
+                    write!(f, ", set=[{}]", cols.join(", "))?;
+                }
+                if let Some(cond) = self.condition.as_ref().and_then(|c| c.source.as_deref()) {
+                    write!(f, ", condition={}", cond.trim())?;
+                }
+            }
         }
         Ok(())
     }
@@ -399,6 +451,7 @@ impl UserDefinedLogicalNodeCore for RowLevelWriteNode {
             touched_files_plan,
             deletion_vector_plan,
             condition: self.condition.clone(),
+            assignments: self.assignments.clone(),
             merge_options: self.merge_options.clone(),
             target_format: self.target_format.clone(),
             target_location: self.target_location.clone(),

@@ -497,6 +497,13 @@ impl TableFormat for DeltaTableFormat {
                 self.add_check_constraint(runtime_env, path, &name, &expression)
                     .await
             }
+            TableFormatAlterTableOperation::RenameTable => Ok(()),
+            TableFormatAlterTableOperation::AddColumns { .. } => {
+                not_impl_err!("ADD COLUMNS is not yet supported for Delta Lake")
+            }
+            TableFormatAlterTableOperation::DropColumns { .. } => {
+                not_impl_err!("DROP COLUMNS is not yet supported for Delta Lake")
+            }
         }
     }
 }
@@ -527,6 +534,9 @@ fn delta_alter_operation_name(operation: &TableFormatAlterTableOperation) -> &'s
             "ALTER TABLE ALTER COLUMN DEFAULT"
         }
         TableFormatAlterTableOperation::AddCheckConstraint { .. } => "ALTER TABLE ADD CONSTRAINT",
+        TableFormatAlterTableOperation::RenameTable => "ALTER TABLE RENAME TO",
+        TableFormatAlterTableOperation::AddColumns { .. } => "ALTER TABLE ADD COLUMNS",
+        TableFormatAlterTableOperation::DropColumns { .. } => "ALTER TABLE DROP COLUMNS",
     }
 }
 

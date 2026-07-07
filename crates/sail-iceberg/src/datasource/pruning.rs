@@ -247,6 +247,30 @@ pub fn prune_files(
     Ok((kept, Some(files_to_keep)))
 }
 
+/// Check if a single DataFile might contain rows matching the given expression.
+/// Uses column-level statistics (min/max bounds, null counts) for pruning.
+/// Returns `true` if the file might match (conservative — may return false positives).
+pub fn data_file_might_match(
+    session: &dyn Session,
+    file: &DataFile,
+    filter: &Expr,
+    arrow_schema: Arc<ArrowSchema>,
+    iceberg_schema: &Schema,
+) -> Result<bool> {
+    use datafusion::common::ToDFSchema;
+    let df_schema = arrow_schema.clone().to_dfschema()?;
+    let physical_predicate = session.create_physical_expr(filter.clone(), &df_schema)?;
+    let pruning_predicate = datafusion::physical_optimizer::pruning::PruningPredicate::try_new(
+        physical_predicate,
+        arrow_schema.clone(),
+    )?;
+    let stats = IcebergPruningStats::new(vec![file.clone()], arrow_schema, iceberg_schema);
+    let result = pruning_predicate.prune(&stats)?;
+    // If `prune()` returns `false`, the file might match (not pruned).
+    // If `true`, the file is definitely not matching (pruned away).
+    Ok(!result[0])
+}
+
 /// Manifest-level pruning using partition summaries from ManifestList
 pub fn prune_manifests_by_partition_summaries<'a>(
     manifest_list: &'a ManifestList,

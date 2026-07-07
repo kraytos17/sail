@@ -37,4 +37,8 @@ pub struct IcebergCommitInfo {
     /// Stored as a JSON array of [column, value] pairs: `[["col1","val1"],["col2","val2"]]`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overwrite_predicate: Option<String>,
+    /// Optional JSON-serialized partition values for partition overwrite.
+    /// Stored as a JSON array of partition value arrays: `[["val1"],["val2"]]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overwrite_partition_values: Option<String>,
 }

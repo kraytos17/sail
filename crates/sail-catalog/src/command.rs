@@ -1009,6 +1009,34 @@ fn table_format_alter_operation(options: &AlterTableOptions) -> TableFormatAlter
                 default: default.clone(),
             }
         }
+        AlterTableOptions::RenameTable { .. } => TableFormatAlterTableOperation::RenameTable,
+        AlterTableOptions::AddColumns { columns } => {
+            let format_columns: Vec<
+                sail_common_datafusion::datasource::TableFormatCreateTableColumn,
+            > = columns
+                .iter()
+                .map(
+                    |c| sail_common_datafusion::datasource::TableFormatCreateTableColumn {
+                        name: c.name.join("."),
+                        data_type: c.data_type.clone(),
+                        nullable: c.nullable,
+                        comment: c.comment.clone(),
+                        default: c.default.clone(),
+                        generated_always_as: None,
+                        identity: None,
+                    },
+                )
+                .collect();
+            TableFormatAlterTableOperation::AddColumns {
+                columns: format_columns,
+            }
+        }
+        AlterTableOptions::DropColumns { names, if_exists } => {
+            TableFormatAlterTableOperation::DropColumns {
+                names: names.clone(),
+                if_exists: *if_exists,
+            }
+        }
         AlterTableOptions::AddCheckConstraint { name, expression } => {
             TableFormatAlterTableOperation::AddCheckConstraint {
                 name: name.clone(),

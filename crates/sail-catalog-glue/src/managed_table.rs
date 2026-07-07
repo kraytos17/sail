@@ -41,6 +41,21 @@ pub(crate) fn apply_alter_table_options(
                 "CHECK constraints are handled by lakehouse table formats".to_string(),
             ));
         }
+        AlterTableOptions::RenameTable { .. } => {
+            return Err(CatalogError::NotSupported(
+                "RENAME TABLE is not yet supported for Glue catalog".to_string(),
+            ));
+        }
+        AlterTableOptions::AddColumns { .. } => {
+            return Err(CatalogError::NotSupported(
+                "ADD COLUMNS is not yet supported for Glue catalog".to_string(),
+            ));
+        }
+        AlterTableOptions::DropColumns { .. } => {
+            return Err(CatalogError::NotSupported(
+                "DROP COLUMNS is not yet supported for Glue catalog".to_string(),
+            ));
+        }
     }
     Ok(parameters)
 }

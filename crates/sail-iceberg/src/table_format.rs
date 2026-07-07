@@ -33,18 +33,21 @@ use sail_common_datafusion::catalog::{
     ScanAuthority,
 };
 use sail_common_datafusion::datasource::{
-    create_sort_order, find_path_in_options, BucketBy, OptionLayer, PhysicalSinkMode, SinkInfo,
-    SinkMode, SourceInfo, TableFormat, TableFormatAlterTableOperation,
+    create_sort_order, find_path_in_options, BucketBy, DeleteInfo, OptionLayer, PhysicalSinkMode,
+    SinkInfo, SinkMode, SourceInfo, TableFormat, TableFormatAlterTableOperation,
     TableFormatCreateTableColumn, TableFormatCreateTableInfo, TableFormatCreateTableResult,
-    TableFormatRegistry,
+    TableFormatRegistry, UpdateInfo,
 };
 use sail_common_datafusion::utils::items::ItemTaker;
 use sail_common_datafusion::variant::with_variant_extension_if_marked_storage;
 use sail_data_source::options::ResolveOptions;
+use sail_logical_plan::merge::RowLevelWriteNode;
 use url::Url;
 
 use crate::datasource::provider::IcebergTableProvider;
-use crate::datasource::type_converter::{arrow_schema_to_iceberg, ICEBERG_ARROW_FIELD_DOC_KEY};
+use crate::datasource::type_converter::{
+    arrow_schema_to_iceberg, arrow_type_to_iceberg, ICEBERG_ARROW_FIELD_DOC_KEY,
+};
 use crate::io::StoreContext;
 use crate::logical::IcebergTableSource;
 use crate::operations::bootstrap::{
@@ -65,6 +68,8 @@ use crate::utils::partition_transform::{
     catalog_partition_field_from_iceberg, format_partition_expr, format_partition_exprs,
     iceberg_transform_from_partition_field, partition_field_name,
 };
+use crate::utils::timestamp::monotonic_timestamp_ms;
+use crate::utils::{parse_absolute_url, url_to_object_path};
 
 const MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES: usize = 5;
 
@@ -75,6 +80,38 @@ pub struct IcebergTableFormat;
 impl IcebergTableFormat {
     pub fn register(registry: &TableFormatRegistry) -> Result<()> {
         registry.register(Arc::new(Self))
+    }
+
+    /// Run table compaction on the Iceberg table at the given path.
+    /// Small files below 75% of `target_file_size` (default 128 MB) are merged.
+    pub async fn compact_table(
+        &self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+        path: &str,
+        target_file_size: Option<u64>,
+    ) -> Result<()> {
+        use datafusion::execution::session_state::SessionStateBuilder;
+
+        use crate::physical_plan::compact_exec::run_compaction;
+
+        let table_url = Self::parse_table_url(vec![path.to_string()]).await?;
+        let object_store = runtime_env
+            .object_store_registry
+            .get_store(&table_url)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let session_state = SessionStateBuilder::new()
+            .with_runtime_env(runtime_env)
+            .with_default_features()
+            .build();
+
+        run_compaction(
+            &table_url,
+            object_store,
+            target_file_size.unwrap_or(134_217_728),
+            &session_state,
+        )
+        .await
     }
 }
 
@@ -277,6 +314,64 @@ impl TableFormat for IcebergTableFormat {
         })
     }
 
+    async fn create_deleter(&self, _ctx: &dyn Session, info: DeleteInfo) -> Result<LogicalPlan> {
+        let DeleteInfo {
+            table_name,
+            path,
+            condition,
+            lakehouse_table,
+            options,
+        } = info;
+        let write_node = RowLevelWriteNode::new_delete(
+            Arc::new(LogicalPlan::EmptyRelation(
+                datafusion_expr::logical_plan::EmptyRelation {
+                    produce_one_row: false,
+                    schema: Arc::new(datafusion_common::DFSchema::empty()),
+                },
+            )),
+            Arc::new(datafusion_common::DFSchema::empty()),
+            condition,
+            self.name().to_string(),
+            path,
+            table_name,
+            options,
+            lakehouse_table,
+        );
+        Ok(LogicalPlan::Extension(Extension {
+            node: Arc::new(write_node),
+        }))
+    }
+
+    async fn create_updater(&self, _ctx: &dyn Session, info: UpdateInfo) -> Result<LogicalPlan> {
+        let UpdateInfo {
+            table_name,
+            path,
+            condition,
+            assignments,
+            lakehouse_table,
+            options,
+        } = info;
+        let write_node = RowLevelWriteNode::new_update(
+            Arc::new(LogicalPlan::EmptyRelation(
+                datafusion_expr::logical_plan::EmptyRelation {
+                    produce_one_row: false,
+                    schema: Arc::new(datafusion_common::DFSchema::empty()),
+                },
+            )),
+            Arc::new(datafusion_common::DFSchema::empty()),
+            assignments,
+            condition,
+            self.name().to_string(),
+            path,
+            table_name,
+            options,
+            lakehouse_table,
+        );
+        Ok(LogicalPlan::Extension(Extension {
+            node: Arc::new(write_node),
+        }))
+    }
+
     async fn alter_table(
         &self,
         runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
@@ -288,6 +383,14 @@ impl TableFormat for IcebergTableFormat {
         match operation {
             TableFormatAlterTableOperation::SetTableProperties { changes, if_exists } => {
                 self.alter_table_properties(runtime_env, path, changes, if_exists)
+                    .await
+            }
+            TableFormatAlterTableOperation::AddColumns { columns } => {
+                self.alter_table_add_columns(runtime_env, path, columns)
+                    .await
+            }
+            TableFormatAlterTableOperation::DropColumns { names, if_exists } => {
+                self.alter_table_drop_columns(runtime_env, path, names, if_exists)
                     .await
             }
             op => not_impl_err!("unsupported Iceberg ALTER TABLE operation: {op:?}"),
@@ -404,9 +507,7 @@ pub(crate) async fn plan_iceberg_write(
                 source,
             }
         }
-        SinkMode::OverwritePartitions => {
-            return not_impl_err!("partition overwrite for Iceberg");
-        }
+        SinkMode::OverwritePartitions => PhysicalSinkMode::OverwritePartitions,
     };
     validate_iceberg_lakehouse_storage_access(lakehouse_table.as_ref())?;
     let metadata_location = metadata_location_from_options(&options);
@@ -450,9 +551,7 @@ pub(crate) async fn plan_iceberg_write(
             return Ok(Arc::new(EmptyExec::new(physical_input.schema())));
         }
         PhysicalSinkMode::OverwriteIf { .. } => {}
-        PhysicalSinkMode::OverwritePartitions => {
-            return not_impl_err!("partition overwrite for Iceberg");
-        }
+        PhysicalSinkMode::OverwritePartitions => {}
         _ => {}
     }
 
@@ -600,7 +699,7 @@ impl IcebergTableFormat {
                 continue;
             }
 
-            let timestamp_ms = crate::utils::timestamp::monotonic_timestamp_ms();
+            let timestamp_ms = monotonic_timestamp_ms();
             table_meta.last_updated_ms = timestamp_ms;
             table_meta.metadata_log.push(MetadataLog {
                 timestamp_ms,
@@ -661,6 +760,276 @@ impl IcebergTableFormat {
                     return Err(alter_table_properties_conflict_error());
                 }
                 continue;
+            }
+
+            let hint_path = object_store::path::Path::from("metadata/version-hint.text");
+            store_ctx
+                .prefixed
+                .put(
+                    &hint_path,
+                    object_store::PutPayload::from(Bytes::from(next_version.to_string())),
+                )
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            return Ok(());
+        }
+    }
+
+    async fn alter_table_add_columns(
+        &self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+        path: &str,
+        columns: Vec<TableFormatCreateTableColumn>,
+    ) -> Result<()> {
+        let table_url = Self::parse_table_url(vec![path.to_string()]).await?;
+        let object_store = runtime_env
+            .object_store_registry
+            .get_store(&table_url)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
+
+        let initial_latest_meta = find_latest_metadata_file(&object_store, &table_url).await?;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let latest_meta = if attempt == 1 {
+                initial_latest_meta.clone()
+            } else {
+                find_latest_metadata_file(&object_store, &table_url).await?
+            };
+
+            let bytes = load_metadata_file_bytes(&object_store, &latest_meta).await?;
+            let mut table_meta = TableMetadata::from_json(&bytes)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let current_schema = table_meta.current_schema().cloned().ok_or_else(|| {
+                DataFusionError::Plan("No current schema in table metadata".to_string())
+            })?;
+
+            let mut new_fields: Vec<std::sync::Arc<crate::spec::types::NestedField>> =
+                current_schema.fields().iter().cloned().collect();
+            let mut next_id = table_meta.last_column_id + 1;
+
+            for col in &columns {
+                let iceberg_type = arrow_type_to_iceberg(&col.data_type)?;
+                let field =
+                    crate::spec::types::NestedField::optional(next_id, &col.name, iceberg_type);
+                new_fields.push(std::sync::Arc::new(field));
+                next_id += 1;
+            }
+            let new_schema_id = next_schema_id(&table_meta);
+
+            let new_schema = crate::spec::Schema::builder()
+                .with_schema_id(new_schema_id)
+                .with_fields(new_fields)
+                .build()
+                .map_err(|e| DataFusionError::Plan(format!("Schema build error: {e}")))?;
+
+            table_meta.last_column_id = next_id - 1;
+            table_meta.schemas.push(new_schema.clone());
+            table_meta.current_schema_id = new_schema_id;
+
+            let current_version = metadata_file_version_from_path(&latest_meta).unwrap_or(0);
+            let next_version = current_version + 1;
+            let existing_for_next = metadata_files_for_version(&store_ctx, next_version).await?;
+            if !existing_for_next.is_empty() {
+                log::warn!(
+                    "Detected existing Iceberg metadata files for version {}: {:?}. Retrying attempt {}",
+                    next_version,
+                    existing_for_next,
+                    attempt
+                );
+                if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
+                    return Err(alter_table_properties_conflict_error());
+                }
+                continue;
+            }
+
+            let timestamp_ms = monotonic_timestamp_ms();
+            table_meta.last_updated_ms = timestamp_ms;
+            table_meta.metadata_log.push(MetadataLog {
+                timestamp_ms,
+                metadata_file: latest_meta.clone(),
+            });
+
+            let new_meta_bytes = table_meta
+                .to_json()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let file_extension = metadata_file_extension_from_properties(&table_meta.properties)?;
+            let new_meta_rel = format!("metadata/v{next_version}{file_extension}");
+            let new_meta_bytes = encode_metadata_file(&new_meta_rel, &new_meta_bytes)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let new_meta_path = object_store::path::Path::from(new_meta_rel.as_str());
+            let put_opts = object_store::PutOptions {
+                mode: object_store::PutMode::Create,
+                ..Default::default()
+            };
+            let payload = object_store::PutPayload::from(Bytes::from(new_meta_bytes));
+            match store_ctx
+                .prefixed
+                .put_opts(&new_meta_path, payload, put_opts)
+                .await
+            {
+                Ok(_) => {}
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    log::warn!(
+                        "Iceberg metadata file {} already exists for version {}. Retrying attempt {}",
+                        new_meta_rel,
+                        next_version,
+                        attempt
+                    );
+                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
+                        return Err(alter_table_properties_conflict_error());
+                    }
+                    continue;
+                }
+                Err(e) => return Err(DataFusionError::External(Box::new(e))),
+            }
+
+            let version_files = metadata_files_for_version(&store_ctx, next_version).await?;
+            let conflict_after_write = version_files.iter().any(|path| path != &new_meta_rel);
+            if conflict_after_write {
+                log::warn!(
+                    "Concurrent Iceberg metadata writes detected for version {}: {:?}. Retrying attempt {}",
+                    next_version,
+                    version_files,
+                    attempt
+                );
+                if let Err(err) = store_ctx.prefixed.delete(&new_meta_path).await {
+                    log::warn!(
+                        "Failed to delete conflicted Iceberg metadata file {}: {:?}",
+                        new_meta_rel,
+                        err
+                    );
+                }
+                if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
+                    return Err(alter_table_properties_conflict_error());
+                }
+                continue;
+            }
+
+            let hint_path = object_store::path::Path::from("metadata/version-hint.text");
+            store_ctx
+                .prefixed
+                .put(
+                    &hint_path,
+                    object_store::PutPayload::from(Bytes::from(next_version.to_string())),
+                )
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            return Ok(());
+        }
+    }
+
+    async fn alter_table_drop_columns(
+        &self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+        path: &str,
+        names: Vec<String>,
+        if_exists: bool,
+    ) -> Result<()> {
+        let table_url = Self::parse_table_url(vec![path.to_string()]).await?;
+        let object_store = runtime_env
+            .object_store_registry
+            .get_store(&table_url)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
+
+        let initial_latest_meta = find_latest_metadata_file(&object_store, &table_url).await?;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let latest_meta = if attempt == 1 {
+                initial_latest_meta.clone()
+            } else {
+                find_latest_metadata_file(&object_store, &table_url).await?
+            };
+
+            let bytes = load_metadata_file_bytes(&object_store, &latest_meta).await?;
+            let mut table_meta = TableMetadata::from_json(&bytes)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let current_schema = table_meta.current_schema().cloned().ok_or_else(|| {
+                DataFusionError::Plan("No current schema in table metadata".to_string())
+            })?;
+
+            let mut new_fields: Vec<std::sync::Arc<crate::spec::types::NestedField>> =
+                current_schema.fields().iter().cloned().collect();
+            for name in &names {
+                let pos = new_fields.iter().position(|f| f.name == *name);
+                match pos {
+                    Some(idx) => {
+                        new_fields.remove(idx);
+                    }
+                    None => {
+                        if !if_exists {
+                            return Err(DataFusionError::Plan(format!(
+                                "Column '{}' not found in Iceberg table schema",
+                                name
+                            )));
+                        }
+                    }
+                }
+            }
+
+            let new_schema_id = next_schema_id(&table_meta);
+
+            let new_schema = crate::spec::Schema::builder()
+                .with_schema_id(new_schema_id)
+                .with_fields(new_fields)
+                .build()
+                .map_err(|e| DataFusionError::Plan(format!("Schema build error: {e}")))?;
+
+            table_meta.schemas.push(new_schema.clone());
+            table_meta.current_schema_id = new_schema_id;
+
+            let current_version = metadata_file_version_from_path(&latest_meta).unwrap_or(0);
+            let next_version = current_version + 1;
+
+            // Same retry + write pattern as alter_table_add_columns
+            let existing_for_next = metadata_files_for_version(&store_ctx, next_version).await?;
+            if !existing_for_next.is_empty() {
+                if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
+                    return Err(alter_table_properties_conflict_error());
+                }
+                continue;
+            }
+
+            let timestamp_ms = monotonic_timestamp_ms();
+            table_meta.last_updated_ms = timestamp_ms;
+            table_meta.metadata_log.push(MetadataLog {
+                timestamp_ms,
+                metadata_file: latest_meta.clone(),
+            });
+
+            let new_meta_bytes = table_meta
+                .to_json()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let file_extension = metadata_file_extension_from_properties(&table_meta.properties)?;
+            let new_meta_rel = format!("metadata/v{next_version}{file_extension}");
+            let new_meta_bytes = encode_metadata_file(&new_meta_rel, &new_meta_bytes)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let new_meta_path = object_store::path::Path::from(new_meta_rel.as_str());
+            let put_opts = object_store::PutOptions {
+                mode: object_store::PutMode::Create,
+                ..Default::default()
+            };
+            let payload = object_store::PutPayload::from(Bytes::from(new_meta_bytes));
+            match store_ctx
+                .prefixed
+                .put_opts(&new_meta_path, payload, put_opts)
+                .await
+            {
+                Ok(_) => {}
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
+                        return Err(alter_table_properties_conflict_error());
+                    }
+                    continue;
+                }
+                Err(e) => return Err(DataFusionError::External(Box::new(e))),
             }
 
             let hint_path = object_store::path::Path::from("metadata/version-hint.text");
@@ -811,7 +1180,7 @@ impl IcebergTableFormat {
         }
 
         let path = &paths[0];
-        let mut table_url = match crate::utils::parse_absolute_url(path) {
+        let mut table_url = match parse_absolute_url(path) {
             Some(url) => url,
             _ => file_url_from_absolute_path(path).ok_or_else(|| {
                 DataFusionError::Plan(format!(
@@ -976,7 +1345,7 @@ fn windows_drive_path_to_file_url(path: &str) -> Option<Url> {
 }
 
 pub(crate) fn table_metadata_location(table_url: &Url, metadata_file: &str) -> Result<String> {
-    if crate::utils::parse_absolute_url(metadata_file).is_some() {
+    if parse_absolute_url(metadata_file).is_some() {
         return Ok(metadata_file.to_string());
     }
 
@@ -988,7 +1357,7 @@ pub(crate) fn table_metadata_location(table_url: &Url, metadata_file: &str) -> R
 }
 
 fn relative_metadata_file(table_url: &Url, metadata_file: &str) -> Result<String> {
-    let base_path = crate::utils::url_to_object_path(table_url)?.to_string();
+    let base_path = url_to_object_path(table_url)?.to_string();
     let metadata_file = metadata_file.trim_start_matches('/');
 
     if let Some(relative) = strip_path_prefix(metadata_file, &base_path) {
@@ -1481,5 +1850,64 @@ mod tests {
         assert_eq!(merged[0].transform, Some(PartitionTransform::Day));
         assert_eq!(merged[1].column, "user_id");
         assert_eq!(merged[1].transform, Some(PartitionTransform::Bucket(16)));
+    }
+
+    #[test]
+    fn extract_partition_predicate_simple_eq() {
+        use datafusion_expr::{col, lit};
+        // col("event_date") = lit("2024-01-15")
+        let expr = col("event_date").eq(lit("2024-01-15"));
+        let result = extract_partition_predicate_from_expr(&expr);
+        assert!(result.is_some());
+        let pairs = result.unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "event_date");
+    }
+
+    #[test]
+    fn extract_partition_predicate_and_combined() {
+        use datafusion_expr::{col, lit};
+        // col("year") = lit("2024") AND col("month") = lit("01")
+        let expr = col("year").eq(lit("2024")).and(col("month").eq(lit("01")));
+        let result = extract_partition_predicate_from_expr(&expr);
+        assert!(result.is_some());
+        let pairs = result.unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.iter().any(|(k, _)| k == "year"));
+        assert!(pairs.iter().any(|(k, _)| k == "month"));
+    }
+
+    #[test]
+    fn extract_partition_predicate_no_match() {
+        use datafusion_expr::{col, lit};
+        // col("value") > lit(100)  — not an equality predicate
+        let expr = col("value").gt(lit(100i64));
+        let result = extract_partition_predicate_from_expr(&expr);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_partition_predicate_literal_on_left() {
+        use datafusion_expr::{col, lit};
+        // lit("2024-01-15") = col("event_date")  — reversed order
+        let expr = lit("2024-01-15").eq(col("event_date"));
+        let result = extract_partition_predicate_from_expr(&expr);
+        assert!(result.is_some());
+        let pairs = result.unwrap();
+        assert_eq!(pairs[0].0, "event_date");
+    }
+
+    #[test]
+    fn extract_partition_predicate_complex_expr() {
+        use datafusion_expr::{col, lit};
+        // (col("a") = lit("1") AND col("b") = lit("2")) OR col("c") = lit("3")
+        // Only the AND branch should be extracted; OR is not supported
+        let expr = col("a")
+            .eq(lit("1"))
+            .and(col("b").eq(lit("2")))
+            .or(col("c").eq(lit("3")));
+        let result = extract_partition_predicate_from_expr(&expr);
+        // OR is not supported, so should return None for the top-level
+        assert!(result.is_none());
     }
 }
