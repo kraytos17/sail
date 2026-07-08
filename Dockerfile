@@ -5,7 +5,7 @@ ARG PYSPARK_VERSION=4.1.1
 ARG CARGO_BUILD_JOBS=0
 ARG SCCACHE_CACHE_SIZE="2G"
 
-FROM debian:bookworm-slim AS rust-base
+FROM python:3.14-slim AS rust-base
 
 ARG RUST_VERSION
 
@@ -54,6 +54,7 @@ ENV SCCACHE_DIR=/root/.cache/sccache
 ENV SCCACHE_CACHE_SIZE=${SCCACHE_CACHE_SIZE}
 ENV CARGO_NET_RETRY=3
 ENV CARGO_HTTP_TIMEOUT=30
+ENV PYO3_PYTHON=/usr/local/bin/python3.14
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=apt-cache \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked,id=apt-lists \
@@ -63,10 +64,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=apt-cache \
         libprotobuf-dev \
         git \
         pkg-config \
-        python3 \
-        python3-dev \
-        mold
-
+        mold 
+        
 WORKDIR /app
 
 COPY --link --from=planner /app/recipe.json recipe.json
