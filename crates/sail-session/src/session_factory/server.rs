@@ -161,8 +161,12 @@ impl ServerSessionFactory {
             ExecutionMode::LocalCluster => {
                 let worker_manager = Arc::new(LocalWorkerManager::new(
                     self.runtime.clone(),
-                    WorkerSessionFactory::new(self.config.clone(), self.runtime.clone())
-                        .create(())?,
+                    WorkerSessionFactory::new(
+                        self.config.clone(),
+                        self.runtime.clone(),
+                        self.catalog_cache_manager.clone(),
+                    )
+                    .create(())?,
                 ));
                 let options =
                     DriverOptions::new(&self.config, self.runtime.clone(), worker_manager);

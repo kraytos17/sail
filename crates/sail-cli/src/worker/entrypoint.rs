@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use sail_catalog::provider::CatalogCacheManager;
 use sail_common::config::AppConfig;
 use sail_common::runtime::RuntimeManager;
 use sail_session::session_factory::{SessionFactory, WorkerSessionFactory};
@@ -14,7 +15,12 @@ pub fn run_worker() -> Result<(), Box<dyn std::error::Error>> {
         init_telemetry(&config.telemetry, resource)
     })?;
 
-    let session = WorkerSessionFactory::new(config.clone(), runtime.handle()).create(())?;
+    let session = WorkerSessionFactory::new(
+        config.clone(),
+        runtime.handle(),
+        Arc::new(CatalogCacheManager::new()),
+    )
+    .create(())?;
     runtime
         .handle()
         .primary()

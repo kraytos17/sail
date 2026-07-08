@@ -7604,6 +7604,7 @@ dependencies = [
  "mimalloc",
  "pyo3",
  "rustls",
+ "sail-catalog",
  "sail-common",
  "sail-execution",
  "sail-flight",
