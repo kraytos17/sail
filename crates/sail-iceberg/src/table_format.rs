@@ -89,6 +89,8 @@ impl IcebergTableFormat {
         runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
         path: &str,
         target_file_size: Option<u64>,
+        lakehouse_table: Option<LakehouseExecutionContext>,
+        table_properties: Vec<(String, String)>,
     ) -> Result<()> {
         use datafusion::execution::session_state::SessionStateBuilder;
 
@@ -101,7 +103,7 @@ impl IcebergTableFormat {
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         let session_state = SessionStateBuilder::new()
-            .with_runtime_env(runtime_env)
+            .with_runtime_env(runtime_env.clone())
             .with_default_features()
             .build();
 
@@ -110,6 +112,9 @@ impl IcebergTableFormat {
             object_store,
             target_file_size.unwrap_or(134_217_728),
             &session_state,
+            None,
+            lakehouse_table.as_ref(),
+            &table_properties,
         )
         .await
     }

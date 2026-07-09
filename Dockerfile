@@ -3,7 +3,7 @@ ARG RUST_PROFILE=release
 ARG RUSTFLAGS="-C link-arg=-fuse-ld=mold"
 ARG PYSPARK_VERSION=4.1.1
 ARG CARGO_BUILD_JOBS=0
-ARG SCCACHE_CACHE_SIZE="2G"
+ARG SCCACHE_CACHE_SIZE="20G"
 
 FROM python:3.14-slim AS rust-base
 
@@ -32,8 +32,8 @@ FROM rust-base AS planner
 
 WORKDIR /app
 
-COPY Cargo.toml Cargo.lock ./
-COPY crates/ ./crates/
+COPY --link Cargo.toml Cargo.lock ./
+COPY --link crates/ ./crates/
 RUN find crates -type f ! -name 'Cargo.toml' -delete && \
     find crates -type d -empty -delete && \
     find crates -name Cargo.toml -execdir sh -c \
@@ -64,8 +64,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=apt-cache \
         libprotobuf-dev \
         git \
         pkg-config \
-        mold 
-        
+        mold
+
 WORKDIR /app
 
 COPY --link --from=planner /app/recipe.json recipe.json
@@ -73,6 +73,8 @@ COPY --link --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/root/.cache/sccache/,id=sccache \
     --mount=type=cache,target=/root/.cargo/registry/,id=cargo-registry \
     --mount=type=cache,target=/root/.cargo/git/,id=cargo-git \
+    --mount=type=cache,target=/root/.cargo/.package-cache,id=cargo-package-cache \
+    --mount=type=cache,target=/root/.cargo/.package-cache,id=cargo-package-cache \
     --mount=type=cache,target=/app/target/,id=cargo-target \
     JOBS="${CARGO_BUILD_JOBS}"; \
     case "$JOBS" in ''|*[!0-9]*|0) JOBS=$(nproc) ;; esac; \
@@ -92,7 +94,8 @@ RUN --mount=type=bind,source=.,target=/app,rw \
         *) echo "${RUST_PROFILE}" ;; \
     esac) && \
     cargo build -p sail-cli --profile ${RUST_PROFILE} --bins --jobs "$JOBS" && \
-    cp /app/target/${RUST_TARGET_SUBDIR}/sail /usr/local/bin/sail
+    install -m755 /app/target/${RUST_TARGET_SUBDIR}/sail /usr/local/bin/sail && \
+    sccache --show-stats
 
 FROM python:3.14-slim
 

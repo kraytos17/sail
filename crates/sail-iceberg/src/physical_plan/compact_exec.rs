@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use datafusion::arrow::array::UInt64Array;
 use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -18,7 +17,9 @@ use datafusion::physical_plan::{
 use datafusion_common::{DataFusionError, Result};
 use futures::stream::once;
 use object_store::ObjectStoreExt;
+use sail_common_datafusion::catalog::LakehouseExecutionContext;
 
+use crate::catalog_support::commit_helper::{commit_iceberg_changes, CommitResult};
 use crate::io::StoreContext;
 use crate::operations::snapshot::SnapshotProduceOperation;
 use crate::operations::write::arrow_parquet::ArrowParquetWriter;
@@ -26,16 +27,12 @@ use crate::operations::{SnapshotProducer, Transaction};
 use crate::spec::manifest_list::ManifestFile;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, Manifest, ManifestEntry,
-    ManifestList, ManifestStatus, MetadataLog, PartitionSpec, TableMetadata, TableUpdate,
+    ManifestList, ManifestStatus, PartitionSpec, TableMetadata,
 };
 use crate::table::find_latest_metadata_file;
-use crate::table::metadata_loader::{
-    encode_metadata_file, load_metadata_file_bytes, metadata_file_extension_from_properties,
-    metadata_file_version_from_path,
-};
+use crate::table::metadata_loader::{load_metadata_file_bytes, metadata_file_version_from_path};
 use crate::utils::get_object_store_from_context;
 use crate::utils::metadata::metadata_files_for_version;
-use crate::utils::timestamp::monotonic_timestamp_ms;
 
 const MAX_COMMIT_RETRIES: usize = 5;
 const DEFAULT_TARGET_FILE_SIZE: u64 = 128 * 1024 * 1024; // 128 MB
@@ -56,6 +53,8 @@ pub struct IcebergCompactExec {
     target_file_size: u64,
     schema: SchemaRef,
     session_state: SessionState,
+    lakehouse_table: Option<LakehouseExecutionContext>,
+    table_properties: Vec<(String, String)>,
     cache: Arc<PlanProperties>,
 }
 
@@ -64,6 +63,8 @@ impl IcebergCompactExec {
         table_url: String,
         target_file_size: Option<u64>,
         session_state: SessionState,
+        lakehouse_table: Option<LakehouseExecutionContext>,
+        table_properties: Vec<(String, String)>,
     ) -> Self {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "count",
@@ -76,6 +77,8 @@ impl IcebergCompactExec {
             target_file_size: target_file_size.unwrap_or(DEFAULT_TARGET_FILE_SIZE),
             schema,
             session_state,
+            lakehouse_table,
+            table_properties,
             cache,
         }
     }
@@ -142,6 +145,8 @@ impl ExecutionPlan for IcebergCompactExec {
         let target_file_size = self.target_file_size;
         let schema = self.schema();
         let session_state = self.session_state.clone();
+        let lakehouse_table = self.lakehouse_table.clone();
+        let table_properties = self.table_properties.clone();
         let future = async move {
             let table_url_parsed = url::Url::parse(&table_url)
                 .map_err(|e| DataFusionError::Plan(format!("Invalid URL: {e}")))?;
@@ -152,6 +157,9 @@ impl ExecutionPlan for IcebergCompactExec {
                 object_store,
                 target_file_size,
                 &session_state,
+                Some(&context),
+                lakehouse_table.as_ref(),
+                &table_properties,
             )
             .await?;
 
@@ -176,6 +184,9 @@ pub(crate) async fn run_compaction(
     object_store: Arc<dyn object_store::ObjectStore>,
     target_file_size: u64,
     _session_state: &SessionState,
+    context: Option<&Arc<TaskContext>>,
+    lakehouse_table: Option<&LakehouseExecutionContext>,
+    table_properties: &[(String, String)],
 ) -> Result<()> {
     let store_ctx = StoreContext::new(object_store.clone(), table_url)?;
 
@@ -320,72 +331,29 @@ pub(crate) async fn run_compaction(
             .await
             .map_err(DataFusionError::Execution)?;
 
-        let action_updates = action_commit.into_updates();
-        for update in action_updates {
-            match update {
-                TableUpdate::AddSnapshot { snapshot: new_snap } => {
-                    current_table_meta.snapshots.push(new_snap);
-                }
-                TableUpdate::SetSnapshotRef {
-                    ref_name,
-                    reference,
-                } => {
-                    current_table_meta.refs.insert(ref_name, reference);
-                }
-                _ => {}
-            }
-        }
-
-        let timestamp_ms = monotonic_timestamp_ms();
-        current_table_meta.last_updated_ms = timestamp_ms;
-        current_table_meta.metadata_log.push(MetadataLog {
-            timestamp_ms,
-            metadata_file: current_latest.clone(),
-        });
-
-        let new_meta_bytes = current_table_meta
-            .to_json()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let file_extension =
-            metadata_file_extension_from_properties(&current_table_meta.properties)?;
-        let new_meta_rel = format!("metadata/v{next_version}{file_extension}");
-        let new_meta_bytes = encode_metadata_file(&new_meta_rel, &new_meta_bytes)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let new_meta_path = object_store::path::Path::from(new_meta_rel.as_str());
-        let put_opts = object_store::PutOptions {
-            mode: object_store::PutMode::Create,
-            ..Default::default()
-        };
-        let payload = object_store::PutPayload::from(Bytes::from(new_meta_bytes));
-
-        match store_ctx
-            .prefixed
-            .put_opts(&new_meta_path, payload, put_opts)
-            .await
+        match commit_iceberg_changes(
+            context,
+            &store_ctx,
+            table_url,
+            &mut current_table_meta,
+            action_commit,
+            lakehouse_table,
+            table_properties,
+            &current_latest,
+            None,
+        )
+        .await
         {
-            Ok(_) => {}
-            Err(object_store::Error::AlreadyExists { .. }) => {
+            Ok(CommitResult::Committed { .. }) => {
+                return Ok(());
+            }
+            Err(e) => {
                 if attempt >= MAX_COMMIT_RETRIES {
-                    return Err(DataFusionError::Execution(
-                        "Compaction commit conflict".to_string(),
-                    ));
+                    return Err(e);
                 }
                 continue;
             }
-            Err(e) => return Err(DataFusionError::External(Box::new(e))),
         }
-
-        let hint_path = object_store::path::Path::from("metadata/version-hint.text");
-        store_ctx
-            .prefixed
-            .put(
-                &hint_path,
-                object_store::PutPayload::from(Bytes::from(next_version.to_string())),
-            )
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        return Ok(());
     }
 }
 

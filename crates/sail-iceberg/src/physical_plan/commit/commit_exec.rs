@@ -708,7 +708,8 @@ impl ExecutionPlan for IcebergCommitExec {
                             CatalogCommitOutcome::NotSupported => {
                                 if matches!(
                                     catalog_commit_mode,
-                                    IcebergCatalogCommitMode::CompatibilityCatalogCommit
+                                    IcebergCatalogCommitMode::CatalogCommit
+                                        | IcebergCatalogCommitMode::CompatibilityCatalogCommit
                                 ) {
                                     catalog_fallback_table = Some(catalog_table);
                                 } else {
@@ -919,7 +920,8 @@ impl ExecutionPlan for IcebergCommitExec {
                         CatalogCommitOutcome::NotSupported
                             if matches!(
                                 catalog_commit_mode,
-                                IcebergCatalogCommitMode::CompatibilityCatalogCommit
+                                IcebergCatalogCommitMode::CatalogCommit
+                                    | IcebergCatalogCommitMode::CompatibilityCatalogCommit
                             ) => {}
                         CatalogCommitOutcome::NotSupported => {
                             return Err(DataFusionError::Plan(
