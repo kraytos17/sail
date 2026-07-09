@@ -20,6 +20,7 @@ sail-logical-plan = { path = "../sail-logical-plan" }
 sail-physical-plan = { path = "../sail-physical-plan" }
 sail-telemetry = { path = "../sail-telemetry" }
 sail-catalog-system = { path = "../sail-catalog-system" }
+sail-sql-analyzer = { path = "../sail-sql-analyzer" }
 
 thiserror = { workspace = true }
 tokio = { workspace = true }

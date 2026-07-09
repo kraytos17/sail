@@ -252,3 +252,46 @@ pub(crate) fn extract_table_properties(options: &[OptionLayer]) -> Vec<(String, 
         .next()
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_table_properties_returns_first_list() {
+        let options = vec![
+            OptionLayer::OptionList {
+                items: vec![("k1".to_string(), "v1".to_string())],
+            },
+            OptionLayer::TablePropertyList {
+                items: vec![
+                    ("prop1".to_string(), "val1".to_string()),
+                    ("prop2".to_string(), "val2".to_string()),
+                ],
+            },
+            OptionLayer::TablePropertyList {
+                items: vec![("prop3".to_string(), "val3".to_string())],
+            },
+        ];
+        let result = extract_table_properties(&options);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], ("prop1".to_string(), "val1".to_string()));
+        assert_eq!(result[1], ("prop2".to_string(), "val2".to_string()));
+    }
+
+    #[test]
+    fn test_extract_table_properties_returns_empty_when_no_table_property_list() {
+        let options = vec![OptionLayer::OptionList {
+            items: vec![("k1".to_string(), "v1".to_string())],
+        }];
+        let result = extract_table_properties(&options);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_table_properties_returns_empty_when_empty_input() {
+        let options: Vec<OptionLayer> = vec![];
+        let result = extract_table_properties(&options);
+        assert!(result.is_empty());
+    }
+}

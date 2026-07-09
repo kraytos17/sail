@@ -83,6 +83,22 @@ impl IcebergCompactExec {
         }
     }
 
+    pub fn table_url(&self) -> &str {
+        &self.table_url
+    }
+
+    pub fn target_file_size(&self) -> u64 {
+        self.target_file_size
+    }
+
+    pub fn lakehouse_table(&self) -> Option<&LakehouseExecutionContext> {
+        self.lakehouse_table.as_ref()
+    }
+
+    pub fn table_properties(&self) -> &[(String, String)] {
+        &self.table_properties
+    }
+
     fn compute_properties(schema: SchemaRef) -> Arc<PlanProperties> {
         Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),

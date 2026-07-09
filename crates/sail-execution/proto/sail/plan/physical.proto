@@ -65,6 +65,9 @@ message ExtendedPhysicalPlanNode {
     CoalesceExecNode coalesce = 50;
     FileDeleteExecNode file_delete = 51;
     NoopSinkExecNode noop_sink = 52;
+    IcebergDeleteExecNode iceberg_delete = 53;
+    IcebergUpdateExecNode iceberg_update = 54;
+    IcebergCompactExecNode iceberg_compact = 55;
   }
 }
 
@@ -1002,4 +1005,39 @@ message BarrierExecNode {
   repeated bytes preconditions = 1;
   // The main plan to execute after all preconditions are exhausted.
   bytes plan = 2;
+}
+
+message StringPair {
+  string key = 1;
+  string value = 2;
+}
+
+message AssignmentNode {
+  string column = 1;
+  string expr_source = 2;
+}
+
+message IcebergDeleteExecNode {
+  string table_url = 1;
+  string condition_source = 2;
+  bytes schema = 3;
+  string lakehouse_table_json = 4;
+  repeated StringPair properties = 5;
+}
+
+message IcebergUpdateExecNode {
+  string table_url = 1;
+  string condition_source = 2;
+  bytes schema = 3;
+  string lakehouse_table_json = 4;
+  repeated AssignmentNode assignments = 5;
+  repeated StringPair properties = 6;
+}
+
+message IcebergCompactExecNode {
+  string table_url = 1;
+  uint64 target_file_size = 2;
+  bytes schema = 3;
+  string lakehouse_table_json = 4;
+  repeated StringPair properties = 5;
 }

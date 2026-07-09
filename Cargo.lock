@@ -7799,6 +7799,7 @@ dependencies = [
  "sail-physical-plan",
  "sail-python-udf",
  "sail-server",
+ "sail-sql-analyzer",
  "sail-telemetry",
  "serde",
  "serde_json",

@@ -72,11 +72,13 @@ use datafusion_spark::function::url::url_decode::UrlDecode;
 use datafusion_spark::function::url::url_encode::UrlEncode;
 use prost::Message;
 use sail_catalog_system::physical_plan::SystemTableExec;
+use sail_common::spec;
 use sail_common_datafusion::array::record_batch::{read_record_batches, write_record_batches};
 use sail_common_datafusion::catalog::{
     CatalogPartitionField, LakehouseExecutionContext, PartitionTransform,
 };
 use sail_common_datafusion::datasource::PhysicalSinkMode;
+use sail_common_datafusion::logical_expr::ExprWithSource;
 use sail_common_datafusion::schema_evolution::SchemaEvolutionCastColumnExpr;
 use sail_common_datafusion::system::catalog::SystemTable;
 use sail_common_datafusion::udf::StreamUDF;
@@ -232,8 +234,9 @@ use sail_function::scalar::xml::xpath::Xpath;
 use sail_function::scalar::xml::xpath_typed::{xpath_typed_name_to_kind, XpathTyped};
 use sail_function::window::{SparkFirstLastValue, SparkFirstLastValueKind, SparkNtile};
 use sail_iceberg::physical_plan::{
-    IcebergCommitExec, IcebergDeleteApplyExec, IcebergDiscoveryExec, IcebergManifestScanExec,
-    IcebergScanByDataFilesExec, IcebergWriterExec,
+    IcebergCommitExec, IcebergCompactExec, IcebergDeleteApplyExec, IcebergDeleteExec,
+    IcebergDiscoveryExec, IcebergManifestScanExec, IcebergScanByDataFilesExec, IcebergUpdateExec,
+    IcebergWriterExec,
 };
 use sail_iceberg::IcebergWriterExecOptions;
 use sail_logical_plan::range::Range;
@@ -1345,6 +1348,123 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 let plan = try_decode_physical_plan(ctx, self, &plan)?;
                 Ok(Arc::new(BarrierExec::new(preconditions, plan)))
             }
+            NodeKind::IcebergDelete(gen::IcebergDeleteExecNode {
+                table_url,
+                condition_source,
+                schema,
+                lakehouse_table_json,
+                properties,
+            }) => {
+                let _schema = Arc::new(try_decode_schema(&schema)?);
+                let condition = if condition_source.is_empty() {
+                    None
+                } else {
+                    let ast = sail_sql_analyzer::parser::parse_expression(&condition_source)
+                        .map_err(|e| plan_datafusion_err!("{e}"))?;
+                    let spec_expr = sail_sql_analyzer::expression::from_ast_expression(ast)
+                        .map_err(|e| plan_datafusion_err!("{e}"))?;
+                    let expr = spec_expr_to_datafusion_expr(spec_expr)?;
+                    Some(ExprWithSource {
+                        expr,
+                        source: Some(condition_source),
+                    })
+                };
+                let lakehouse_table = self.try_decode_lakehouse_table(&lakehouse_table_json)?;
+                let table_properties = properties.into_iter().map(|p| (p.key, p.value)).collect();
+                let session_state =
+                    datafusion::execution::session_state::SessionStateBuilder::new()
+                        .with_config(ctx.session_config().clone())
+                        .with_runtime_env(ctx.runtime_env().clone())
+                        .with_default_features()
+                        .build();
+                Ok(Arc::new(IcebergDeleteExec::new(
+                    table_url,
+                    condition,
+                    session_state,
+                    lakehouse_table,
+                    table_properties,
+                )))
+            }
+            NodeKind::IcebergUpdate(gen::IcebergUpdateExecNode {
+                table_url,
+                condition_source,
+                schema,
+                lakehouse_table_json,
+                assignments,
+                properties,
+            }) => {
+                let _schema = Arc::new(try_decode_schema(&schema)?);
+                let condition = if condition_source.is_empty() {
+                    None
+                } else {
+                    let ast = sail_sql_analyzer::parser::parse_expression(&condition_source)
+                        .map_err(|e| plan_datafusion_err!("{e}"))?;
+                    let spec_expr = sail_sql_analyzer::expression::from_ast_expression(ast)
+                        .map_err(|e| plan_datafusion_err!("{e}"))?;
+                    let expr = spec_expr_to_datafusion_expr(spec_expr)?;
+                    Some(ExprWithSource {
+                        expr,
+                        source: Some(condition_source),
+                    })
+                };
+                let lakehouse_table = self.try_decode_lakehouse_table(&lakehouse_table_json)?;
+                let table_properties = properties.into_iter().map(|p| (p.key, p.value)).collect();
+                let resolved_assignments = assignments
+                    .into_iter()
+                    .map(|a| {
+                        let ast = sail_sql_analyzer::parser::parse_expression(&a.expr_source)
+                            .map_err(|e| plan_datafusion_err!("{e}"))?;
+                        let spec_expr = sail_sql_analyzer::expression::from_ast_expression(ast)
+                            .map_err(|e| plan_datafusion_err!("{e}"))?;
+                        let expr = spec_expr_to_datafusion_expr(spec_expr)?;
+                        Ok((
+                            a.column,
+                            ExprWithSource {
+                                expr,
+                                source: Some(a.expr_source),
+                            },
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let session_state =
+                    datafusion::execution::session_state::SessionStateBuilder::new()
+                        .with_config(ctx.session_config().clone())
+                        .with_runtime_env(ctx.runtime_env().clone())
+                        .with_default_features()
+                        .build();
+                Ok(Arc::new(IcebergUpdateExec::new(
+                    table_url,
+                    resolved_assignments,
+                    condition,
+                    session_state,
+                    lakehouse_table,
+                    table_properties,
+                )))
+            }
+            NodeKind::IcebergCompact(gen::IcebergCompactExecNode {
+                table_url,
+                target_file_size,
+                schema,
+                lakehouse_table_json,
+                properties,
+            }) => {
+                let _schema = Arc::new(try_decode_schema(&schema)?);
+                let lakehouse_table = self.try_decode_lakehouse_table(&lakehouse_table_json)?;
+                let table_properties = properties.into_iter().map(|p| (p.key, p.value)).collect();
+                let session_state =
+                    datafusion::execution::session_state::SessionStateBuilder::new()
+                        .with_config(ctx.session_config().clone())
+                        .with_runtime_env(ctx.runtime_env().clone())
+                        .with_default_features()
+                        .build();
+                Ok(Arc::new(IcebergCompactExec::new(
+                    table_url,
+                    Some(target_file_size),
+                    session_state,
+                    lakehouse_table,
+                    table_properties,
+                )))
+            }
             _ => plan_err!("unsupported physical plan node: {node_kind:?}"),
         }
     }
@@ -2065,6 +2185,82 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 preconditions,
                 plan,
             })
+        } else if let Some(delete_exec) = node.downcast_ref::<IcebergDeleteExec>() {
+            let schema = try_encode_schema(delete_exec.schema().as_ref())?;
+            let condition_source = delete_exec
+                .condition()
+                .as_ref()
+                .and_then(|c| c.source.clone())
+                .unwrap_or_default();
+            let lakehouse_table_json =
+                self.try_encode_lakehouse_table(delete_exec.lakehouse_table())?;
+            let properties = delete_exec
+                .table_properties()
+                .iter()
+                .map(|(k, v)| gen::StringPair {
+                    key: k.clone(),
+                    value: v.clone(),
+                })
+                .collect();
+            NodeKind::IcebergDelete(gen::IcebergDeleteExecNode {
+                table_url: delete_exec.table_url().to_string(),
+                condition_source,
+                schema,
+                lakehouse_table_json,
+                properties,
+            })
+        } else if let Some(update_exec) = node.downcast_ref::<IcebergUpdateExec>() {
+            let schema = try_encode_schema(update_exec.schema().as_ref())?;
+            let condition_source = update_exec
+                .condition()
+                .as_ref()
+                .and_then(|c| c.source.clone())
+                .unwrap_or_default();
+            let lakehouse_table_json =
+                self.try_encode_lakehouse_table(update_exec.lakehouse_table())?;
+            let properties = update_exec
+                .table_properties()
+                .iter()
+                .map(|(k, v)| gen::StringPair {
+                    key: k.clone(),
+                    value: v.clone(),
+                })
+                .collect();
+            let assignments = update_exec
+                .assignments()
+                .iter()
+                .map(|(col, expr)| gen::AssignmentNode {
+                    column: col.clone(),
+                    expr_source: expr.source.clone().unwrap_or_default(),
+                })
+                .collect();
+            NodeKind::IcebergUpdate(gen::IcebergUpdateExecNode {
+                table_url: update_exec.table_url().to_string(),
+                condition_source,
+                schema,
+                lakehouse_table_json,
+                assignments,
+                properties,
+            })
+        } else if let Some(compact_exec) = node.downcast_ref::<IcebergCompactExec>() {
+            let schema = try_encode_schema(compact_exec.schema().as_ref())?;
+            let lakehouse_table_json =
+                self.try_encode_lakehouse_table(compact_exec.lakehouse_table())?;
+            let properties = compact_exec
+                .table_properties()
+                .iter()
+                .map(|(k, v)| gen::StringPair {
+                    key: k.clone(),
+                    value: v.clone(),
+                })
+                .collect();
+            NodeKind::IcebergCompact(gen::IcebergCompactExecNode {
+                table_url: compact_exec.table_url().to_string(),
+                target_file_size: compact_exec.target_file_size(),
+                schema,
+                lakehouse_table_json,
+                properties,
+            })
         } else {
             return plan_err!("unsupported physical plan node: {node:?}");
         };
@@ -2074,7 +2270,205 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
         node.encode(buf)
             .map_err(|e| plan_datafusion_err!("failed to encode plan: {e}"))
     }
+}
 
+/// Convert a [`spec::Expr`] to a [`datafusion_expr::Expr`].
+/// This handles the subset of expression types that can appear in SQL WHERE clauses
+/// for DELETE/UPDATE conditions.
+fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::logical_expr::Expr> {
+    use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::expr::InList;
+    use datafusion::logical_expr::{col, BinaryExpr, Cast, Expr, Operator};
+    use sail_common::spec::Literal;
+
+    let result = match spec_expr {
+        spec::Expr::Literal(literal) => match literal {
+            Literal::Null => Expr::Literal(ScalarValue::Null, None),
+            Literal::Boolean { value } => Expr::Literal(ScalarValue::Boolean(value), None),
+            Literal::Int32 { value } => Expr::Literal(ScalarValue::Int32(value), None),
+            Literal::Int64 { value } => Expr::Literal(ScalarValue::Int64(value), None),
+            Literal::Float32 { value } => Expr::Literal(ScalarValue::Float32(value), None),
+            Literal::Float64 { value } => Expr::Literal(ScalarValue::Float64(value), None),
+            Literal::Utf8 { value } => Expr::Literal(ScalarValue::Utf8(value), None),
+            Literal::LargeUtf8 { value } => Expr::Literal(ScalarValue::LargeUtf8(value), None),
+            Literal::Date32 { days } => Expr::Literal(ScalarValue::Date32(days), None),
+            Literal::TimestampMicrosecond { microseconds, .. } => {
+                Expr::Literal(ScalarValue::TimestampMicrosecond(microseconds, None), None)
+            }
+            _ => {
+                return plan_err!("unsupported literal type in expression: {literal:?}");
+            }
+        },
+        spec::Expr::UnresolvedAttribute { name, .. } => {
+            let col_name = name
+                .parts()
+                .first()
+                .map(|id| id.as_ref().to_string())
+                .unwrap_or_default();
+            col(col_name)
+        }
+        spec::Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let expr = spec_expr_to_datafusion_expr(*expr)?;
+            let list = list
+                .into_iter()
+                .map(spec_expr_to_datafusion_expr)
+                .collect::<Result<Vec<_>>>()?;
+            Expr::InList(InList {
+                expr: Box::new(expr),
+                list,
+                negated,
+            })
+        }
+        spec::Expr::IsNull(expr) => Expr::IsNull(Box::new(spec_expr_to_datafusion_expr(*expr)?)),
+        spec::Expr::IsNotNull(expr) => {
+            Expr::IsNotNull(Box::new(spec_expr_to_datafusion_expr(*expr)?))
+        }
+        spec::Expr::Cast {
+            expr, cast_to_type, ..
+        } => {
+            let arrow_type = spec_data_type_to_arrow(&cast_to_type)?;
+            let field = datafusion::arrow::datatypes::Field::new("", arrow_type, true);
+            Expr::Cast(Cast {
+                expr: Box::new(spec_expr_to_datafusion_expr(*expr)?),
+                field: field.into(),
+            })
+        }
+        spec::Expr::CallFunction {
+            function_name,
+            arguments,
+        } => {
+            let op_name = function_name
+                .parts()
+                .first()
+                .map(|id| id.as_ref().to_string())
+                .unwrap_or_default();
+            if arguments.len() == 2 {
+                let mut args = arguments.into_iter();
+                let left = spec_expr_to_datafusion_expr(args.next().unwrap())?;
+                let right = spec_expr_to_datafusion_expr(args.next().unwrap())?;
+                let op = match op_name.as_str() {
+                    "==" => Operator::Eq,
+                    "!=" => Operator::NotEq,
+                    ">" => Operator::Gt,
+                    ">=" => Operator::GtEq,
+                    "<" => Operator::Lt,
+                    "<=" => Operator::LtEq,
+                    "+" => Operator::Plus,
+                    "-" => Operator::Minus,
+                    "*" => Operator::Multiply,
+                    "/" => Operator::Divide,
+                    "and" => Operator::And,
+                    "or" => Operator::Or,
+                    _ => {
+                        return plan_err!("unsupported operator in expression: {op_name}");
+                    }
+                };
+                Expr::BinaryExpr(BinaryExpr {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                })
+            } else {
+                return plan_err!(
+                    "unsupported function call in expression: {op_name} with {} args",
+                    arguments.len()
+                );
+            }
+        }
+        spec::Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let expr = spec_expr_to_datafusion_expr(*expr)?;
+            let low = spec_expr_to_datafusion_expr(*low)?;
+            let high = spec_expr_to_datafusion_expr(*high)?;
+            let ge = Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(expr.clone()),
+                op: Operator::GtEq,
+                right: Box::new(low),
+            });
+            let le = Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(expr),
+                op: Operator::LtEq,
+                right: Box::new(high),
+            });
+            let combined = Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(ge),
+                op: Operator::And,
+                right: Box::new(le),
+            });
+            if negated {
+                Expr::Not(Box::new(combined))
+            } else {
+                combined
+            }
+        }
+        spec::Expr::IsDistinctFrom { left, right } => Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(spec_expr_to_datafusion_expr(*left)?),
+            op: Operator::IsDistinctFrom,
+            right: Box::new(spec_expr_to_datafusion_expr(*right)?),
+        }),
+        spec::Expr::IsNotDistinctFrom { left, right } => Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(spec_expr_to_datafusion_expr(*left)?),
+            op: Operator::IsNotDistinctFrom,
+            right: Box::new(spec_expr_to_datafusion_expr(*right)?),
+        }),
+        spec::Expr::UnresolvedDate { value } => {
+            let parsed = chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d")
+                .map_err(|e| plan_datafusion_err!("failed to parse date '{value}': {e}"))?;
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            let days_since_epoch = parsed.signed_duration_since(epoch).num_days() as i32;
+            Expr::Literal(ScalarValue::Date32(Some(days_since_epoch)), None)
+        }
+        spec::Expr::UnresolvedTimestamp { value, .. } => {
+            let parsed = chrono::NaiveDateTime::parse_from_str(&value, "%Y-%m-%dT%H:%M:%S")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S"))
+                .map_err(|e| plan_datafusion_err!("failed to parse timestamp '{value}': {e}"))?;
+            let micros = parsed.and_utc().timestamp_micros();
+            Expr::Literal(ScalarValue::TimestampMicrosecond(Some(micros), None), None)
+        }
+        _ => {
+            return plan_err!("unsupported expression type in condition: {spec_expr:?}");
+        }
+    };
+    Ok(result)
+}
+
+/// Convert a [`spec::DataType`] to an Arrow [`datafusion::arrow::datatypes::DataType`].
+fn spec_data_type_to_arrow(dt: &spec::DataType) -> Result<datafusion::arrow::datatypes::DataType> {
+    use sail_common::spec::DataType;
+    let arrow_type = match dt {
+        DataType::Boolean => datafusion::arrow::datatypes::DataType::Boolean,
+        DataType::Int8 => datafusion::arrow::datatypes::DataType::Int8,
+        DataType::Int16 => datafusion::arrow::datatypes::DataType::Int16,
+        DataType::Int32 => datafusion::arrow::datatypes::DataType::Int32,
+        DataType::Int64 => datafusion::arrow::datatypes::DataType::Int64,
+        DataType::Float16 => datafusion::arrow::datatypes::DataType::Float16,
+        DataType::Float32 => datafusion::arrow::datatypes::DataType::Float32,
+        DataType::Float64 => datafusion::arrow::datatypes::DataType::Float64,
+        DataType::Utf8 => datafusion::arrow::datatypes::DataType::Utf8,
+        DataType::Date32 => datafusion::arrow::datatypes::DataType::Date32,
+        DataType::Timestamp { .. } => datafusion::arrow::datatypes::DataType::Timestamp(
+            datafusion::arrow::datatypes::TimeUnit::Microsecond,
+            None,
+        ),
+        DataType::Decimal128 { precision, scale } => {
+            datafusion::arrow::datatypes::DataType::Decimal128(*precision as u8, *scale as i8)
+        }
+        _ => {
+            return plan_err!("unsupported data type in expression: {dt:?}");
+        }
+    };
+    Ok(arrow_type)
+}
+
+impl RemoteExecutionCodec {
     fn try_decode_udf(&self, name: &str, buf: &[u8]) -> Result<Arc<ScalarUDF>> {
         // TODO: Implement custom registry to avoid codec for built-in functions.
         // The `match name` below has no session-registry fallback, so every
@@ -4124,6 +4518,8 @@ mod tests {
     use datafusion::arrow::array::{Array, ArrayRef, RecordBatch};
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::{col, BinaryExpr, Expr, Operator};
     use datafusion::physical_expr::HigherOrderFunctionExpr;
 
     use super::*;
@@ -4988,5 +5384,118 @@ mod tests {
         );
 
         assert_same_result(&physical, &decoded, schema_ref, vec![Arc::new(arr2d)])
+    }
+
+    #[test]
+    fn test_spec_expr_literal_int32() {
+        let spec = spec::Expr::Literal(spec::Literal::Int32 { value: Some(42) });
+        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        assert!(matches!(
+            result,
+            Expr::Literal(ScalarValue::Int32(Some(42)), None)
+        ));
+    }
+
+    #[test]
+    fn test_spec_expr_literal_null() {
+        let spec = spec::Expr::Literal(spec::Literal::Null);
+        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        assert!(matches!(result, Expr::Literal(ScalarValue::Null, None)));
+    }
+
+    #[test]
+    fn test_spec_expr_literal_utf8() {
+        let spec = spec::Expr::Literal(spec::Literal::Utf8 {
+            value: Some("hello".to_string()),
+        });
+        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        assert!(
+            matches!(result, Expr::Literal(ScalarValue::Utf8(Some(ref s)), None) if s == "hello")
+        );
+    }
+
+    #[test]
+    fn test_spec_expr_unresolved_attribute() {
+        let spec = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("age"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let expected = col("age");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_spec_expr_binary_eq() {
+        use spec::Literal;
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("id"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Int32 { value: Some(5) });
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("=="),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Eq,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_spec_expr_is_null() {
+        let inner = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("name"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let spec = spec::Expr::IsNull(Box::new(inner));
+        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        assert!(matches!(result, Expr::IsNull(_)));
+    }
+
+    #[test]
+    fn test_spec_expr_date_literal() {
+        let spec = spec::Expr::UnresolvedDate {
+            value: "2024-01-15".to_string(),
+        };
+        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        assert!(matches!(
+            result,
+            Expr::Literal(ScalarValue::Date32(Some(_)), None)
+        ));
+    }
+
+    #[test]
+    fn test_spec_expr_between() {
+        use spec::Literal;
+        let expr = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("score"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let low = spec::Expr::Literal(Literal::Int32 { value: Some(10) });
+        let high = spec::Expr::Literal(Literal::Int32 { value: Some(20) });
+        let spec = spec::Expr::Between {
+            expr: Box::new(expr),
+            negated: false,
+            low: Box::new(low),
+            high: Box::new(high),
+        };
+        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::And,
+                ..
+            })
+        ));
     }
 }
