@@ -2295,6 +2295,14 @@ fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::log
             Literal::TimestampMicrosecond { microseconds, .. } => {
                 Expr::Literal(ScalarValue::TimestampMicrosecond(microseconds, None), None)
             }
+            Literal::TimestampNanosecond { nanoseconds, .. } => {
+                Expr::Literal(ScalarValue::TimestampNanosecond(nanoseconds, None), None)
+            }
+            Literal::Decimal128 {
+                precision,
+                scale,
+                value,
+            } => Expr::Literal(ScalarValue::Decimal128(value, precision, scale), None),
             _ => {
                 return plan_err!("unsupported literal type in expression: {literal:?}");
             }
@@ -2361,6 +2369,8 @@ fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::log
                     "-" => Operator::Minus,
                     "*" => Operator::Multiply,
                     "/" => Operator::Divide,
+                    "%" => Operator::Modulo,
+                    "<=>" => Operator::IsNotDistinctFrom,
                     "and" => Operator::And,
                     "or" => Operator::Or,
                     _ => {
@@ -2372,12 +2382,102 @@ fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::log
                     op,
                     right: Box::new(right),
                 })
+            } else if arguments.len() == 1 {
+                let inner = spec_expr_to_datafusion_expr(arguments.into_iter().next().unwrap())?;
+                match op_name.as_str() {
+                    "not" => Expr::Not(Box::new(inner)),
+                    "+" => inner,
+                    _ => {
+                        return plan_err!("unsupported 1-arg function in expression: {op_name}");
+                    }
+                }
             } else {
                 return plan_err!(
                     "unsupported function call in expression: {op_name} with {} args",
                     arguments.len()
                 );
             }
+        }
+        spec::Expr::UnresolvedFunction(f) => {
+            let op_name = f
+                .function_name
+                .parts()
+                .first()
+                .map(|id| id.as_ref().to_string())
+                .unwrap_or_default();
+            if f.arguments.len() == 2 {
+                let mut args = f.arguments.into_iter();
+                let left = spec_expr_to_datafusion_expr(args.next().unwrap())?;
+                let right = spec_expr_to_datafusion_expr(args.next().unwrap())?;
+                let op = match op_name.as_str() {
+                    "==" => Operator::Eq,
+                    "!=" => Operator::NotEq,
+                    ">" => Operator::Gt,
+                    ">=" => Operator::GtEq,
+                    "<" => Operator::Lt,
+                    "<=" => Operator::LtEq,
+                    "+" => Operator::Plus,
+                    "-" => Operator::Minus,
+                    "*" => Operator::Multiply,
+                    "/" => Operator::Divide,
+                    "%" => Operator::Modulo,
+                    "<=>" => Operator::IsNotDistinctFrom,
+                    "and" => Operator::And,
+                    "or" => Operator::Or,
+                    _ => {
+                        return plan_err!("unsupported operator in expression: {op_name}");
+                    }
+                };
+                Expr::BinaryExpr(BinaryExpr {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                })
+            } else if f.arguments.len() == 1 {
+                let inner = spec_expr_to_datafusion_expr(f.arguments.into_iter().next().unwrap())?;
+                match op_name.as_str() {
+                    "not" => Expr::Not(Box::new(inner)),
+                    _ => {
+                        return plan_err!("unsupported 1-arg function in expression: {op_name}");
+                    }
+                }
+            } else {
+                return plan_err!(
+                    "unsupported function in expression: {op_name} with {} args",
+                    f.arguments.len()
+                );
+            }
+        }
+        spec::Expr::SimilarTo {
+            expr,
+            pattern,
+            negated,
+            escape_char,
+            case_insensitive,
+        } => {
+            use datafusion::logical_expr::expr::Like;
+            let expr = spec_expr_to_datafusion_expr(*expr)?;
+            let pattern = spec_expr_to_datafusion_expr(*pattern)?;
+            Expr::SimilarTo(Like::new(
+                negated,
+                Box::new(expr),
+                Box::new(pattern),
+                escape_char,
+                case_insensitive,
+            ))
+        }
+        spec::Expr::IsTrue(expr) => Expr::IsNotNull(Box::new(spec_expr_to_datafusion_expr(*expr)?)),
+        spec::Expr::IsNotTrue(expr) => Expr::IsNull(Box::new(spec_expr_to_datafusion_expr(*expr)?)),
+        spec::Expr::IsFalse(expr) => {
+            let inner = spec_expr_to_datafusion_expr(*expr)?;
+            Expr::Not(Box::new(Expr::IsNotNull(Box::new(inner))))
+        }
+        spec::Expr::IsNotFalse(expr) => {
+            Expr::IsNotNull(Box::new(spec_expr_to_datafusion_expr(*expr)?))
+        }
+        spec::Expr::IsUnknown(expr) => Expr::IsNull(Box::new(spec_expr_to_datafusion_expr(*expr)?)),
+        spec::Expr::IsNotUnknown(expr) => {
+            Expr::IsNotNull(Box::new(spec_expr_to_datafusion_expr(*expr)?))
         }
         spec::Expr::Between {
             expr,
@@ -2432,6 +2532,14 @@ fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::log
                 .map_err(|e| plan_datafusion_err!("failed to parse timestamp '{value}': {e}"))?;
             let micros = parsed.and_utc().timestamp_micros();
             Expr::Literal(ScalarValue::TimestampMicrosecond(Some(micros), None), None)
+        }
+        spec::Expr::UnresolvedTime { value } => {
+            use chrono::Timelike;
+            let parsed = chrono::NaiveTime::parse_from_str(&value, "%H:%M:%S")
+                .or_else(|_| chrono::NaiveTime::parse_from_str(&value, "%H:%M:%S%.f"))
+                .map_err(|e| plan_datafusion_err!("failed to parse time '{value}': {e}"))?;
+            let micros = parsed.num_seconds_from_midnight() as i64 * 1_000_000;
+            Expr::Literal(ScalarValue::Time64Microsecond(Some(micros)), None)
         }
         _ => {
             return plan_err!("unsupported expression type in condition: {spec_expr:?}");
@@ -5496,6 +5604,120 @@ mod tests {
                 op: Operator::And,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn test_spec_expr_decimal128_literal() {
+        use spec::Literal;
+        let spec = spec::Expr::Literal(Literal::Decimal128 {
+            precision: 10,
+            scale: 2,
+            value: Some(12345),
+        });
+        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        assert!(matches!(
+            result,
+            Expr::Literal(ScalarValue::Decimal128(Some(12345), 10, 2), None)
+        ));
+    }
+
+    #[test]
+    fn test_spec_expr_not_unresolved_function() {
+        let inner = spec::Expr::Literal(spec::Literal::Boolean { value: Some(false) });
+        let spec = spec::Expr::UnresolvedFunction(spec::UnresolvedFunction {
+            function_name: spec::ObjectName::bare("not"),
+            arguments: vec![inner],
+            named_arguments: vec![],
+            is_distinct: false,
+            is_user_defined_function: false,
+            is_internal: None,
+            ignore_nulls: None,
+            filter: None,
+            order_by: None,
+        });
+        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        assert!(matches!(result, Expr::Not(_)));
+    }
+
+    #[test]
+    fn test_spec_expr_modulo_operator() {
+        use spec::Literal;
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("id"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Int32 { value: Some(2) });
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("%"),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Modulo,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_spec_expr_is_true() {
+        let inner = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("flag"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let spec = spec::Expr::IsTrue(Box::new(inner));
+        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        assert!(matches!(result, Expr::IsNotNull(_)));
+    }
+
+    #[test]
+    fn test_spec_expr_is_unknown() {
+        let inner = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("val"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let spec = spec::Expr::IsUnknown(Box::new(inner));
+        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        assert!(matches!(result, Expr::IsNull(_)));
+    }
+
+    #[test]
+    fn test_spec_expr_similar_to() {
+        use spec::Literal;
+        let expr = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("name"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let pattern = spec::Expr::Literal(Literal::Utf8 {
+            value: Some("foo%".to_string()),
+        });
+        let spec = spec::Expr::SimilarTo {
+            expr: Box::new(expr),
+            pattern: Box::new(pattern),
+            negated: false,
+            escape_char: None,
+            case_insensitive: false,
+        };
+        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        assert!(matches!(result, Expr::SimilarTo(_)));
+    }
+
+    #[test]
+    fn test_spec_expr_unresolved_time() {
+        let spec = spec::Expr::UnresolvedTime {
+            value: "12:30:00".to_string(),
+        };
+        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        assert!(matches!(
+            result,
+            Expr::Literal(ScalarValue::Time64Microsecond(Some(45_000_000_000)), None)
         ));
     }
 }
