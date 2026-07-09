@@ -17,7 +17,9 @@ use sail_catalog_system::physical_plan::SystemTableExec;
 use sail_common_datafusion::utils::items::ItemTaker;
 use sail_data_source::listing::delete::FileDeleteExec;
 use sail_delta_lake::physical_plan::DeltaCommitExec;
-use sail_iceberg::physical_plan::IcebergCommitExec;
+use sail_iceberg::physical_plan::{
+    IcebergCommitExec, IcebergCompactExec, IcebergDeleteExec, IcebergUpdateExec,
+};
 use sail_physical_plan::catalog_command::CatalogCommandExec;
 use sail_physical_plan::coalesce::CoalesceExec;
 use sail_physical_plan::repartition::ExplicitRepartitionExec;
@@ -289,6 +291,9 @@ fn build_job_graph(
     } else if plan.is::<SystemTableExec>()
         || plan.is::<CatalogCommandExec>()
         || plan.is::<FileDeleteExec>()
+        || plan.is::<IcebergDeleteExec>()
+        || plan.is::<IcebergUpdateExec>()
+        || plan.is::<IcebergCompactExec>()
     {
         plan.children().zero()?;
         create_driver_stage(&plan, graph)?
