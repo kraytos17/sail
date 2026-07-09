@@ -289,10 +289,16 @@ fn build_job_graph(
     } else if plan.is::<SystemTableExec>()
         || plan.is::<CatalogCommandExec>()
         || plan.is::<FileDeleteExec>()
-        || plan.is::<IcebergCommitExec>()
-        || plan.is::<DeltaCommitExec>()
     {
         plan.children().zero()?;
+        create_driver_stage(&plan, graph)?
+    } else if plan.is::<IcebergCommitExec>() || plan.is::<DeltaCommitExec>() {
+        let processed_children: ExecutionResult<Vec<_>> = plan
+            .children()
+            .into_iter()
+            .map(|child| build_job_graph(child.clone(), PartitionUsage::Once, graph))
+            .collect();
+        let plan = plan.clone().with_new_children(processed_children?)?;
         create_driver_stage(&plan, graph)?
     } else {
         plan
