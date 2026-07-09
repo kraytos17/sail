@@ -46,7 +46,10 @@ impl WritePathMode {
 
 pub fn join_table_uri(table_uri: &str, rel: &str, mode: &WritePathMode) -> String {
     match mode {
-        WritePathMode::Absolute => format!("{}{}", table_uri, rel),
+        WritePathMode::Absolute => {
+            let sep = if table_uri.ends_with('/') { "" } else { "/" };
+            format!("{}{}{}", table_uri, sep, rel)
+        }
         WritePathMode::Relative => rel.to_string(),
     }
 }
@@ -97,4 +100,77 @@ pub fn get_object_store_from_session(
         .object_store_registry
         .get_store(table_url)
         .map_err(|e| DataFusionError::External(Box::new(e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_join_table_uri_absolute_adds_separator() {
+        let uri = join_table_uri(
+            "s3://bucket/test.db/my_table",
+            "metadata/snap-123.avro",
+            &WritePathMode::Absolute,
+        );
+        assert_eq!(uri, "s3://bucket/test.db/my_table/metadata/snap-123.avro");
+    }
+
+    #[test]
+    fn test_join_table_uri_absolute_with_trailing_slash() {
+        let uri = join_table_uri(
+            "s3://bucket/test.db/my_table/",
+            "metadata/snap-123.avro",
+            &WritePathMode::Absolute,
+        );
+        assert_eq!(uri, "s3://bucket/test.db/my_table/metadata/snap-123.avro");
+    }
+
+    #[test]
+    fn test_join_table_uri_relative() {
+        let uri = join_table_uri(
+            "s3://bucket/test.db/my_table",
+            "metadata/snap-123.avro",
+            &WritePathMode::Relative,
+        );
+        assert_eq!(uri, "metadata/snap-123.avro");
+    }
+
+    #[test]
+    fn test_join_table_uri_absolute_manifest_file() {
+        let uri = join_table_uri(
+            "s3://work/testcat/test/events_del",
+            "metadata/snap-1313974928833409311.avro",
+            &WritePathMode::Absolute,
+        );
+        // This is the exact case that was failing (missing / between "events_del" and "metadata")
+        assert_eq!(
+            uri,
+            "s3://work/testcat/test/events_del/metadata/snap-1313974928833409311.avro"
+        );
+        assert!(
+            !uri.contains("events_delmetadata"),
+            "should not have missing separator: {uri}"
+        );
+    }
+
+    #[test]
+    fn test_join_table_uri_absolute_v2() {
+        let uri = join_table_uri(
+            "s3://bucket/table",
+            "metadata/00001-abc.metadata.json",
+            &WritePathMode::Absolute,
+        );
+        assert_eq!(uri, "s3://bucket/table/metadata/00001-abc.metadata.json");
+    }
+
+    #[test]
+    fn test_join_table_uri_absolute_data_file() {
+        let uri = join_table_uri(
+            "s3://bucket/test.db/my_table",
+            "data/00001-xyz.parquet",
+            &WritePathMode::Absolute,
+        );
+        assert_eq!(uri, "s3://bucket/test.db/my_table/data/00001-xyz.parquet");
+    }
 }
