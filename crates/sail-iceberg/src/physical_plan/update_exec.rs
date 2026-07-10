@@ -48,6 +48,7 @@ pub struct IcebergUpdateExec {
     session_state: SessionState,
     lakehouse_table: Option<LakehouseExecutionContext>,
     table_properties: Vec<(String, String)>,
+    table_schema: Option<SchemaRef>,
     cache: Arc<PlanProperties>,
 }
 
@@ -59,6 +60,7 @@ impl IcebergUpdateExec {
         session_state: SessionState,
         lakehouse_table: Option<LakehouseExecutionContext>,
         table_properties: Vec<(String, String)>,
+        table_schema: Option<SchemaRef>,
     ) -> Self {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "count",
@@ -74,6 +76,7 @@ impl IcebergUpdateExec {
             session_state,
             lakehouse_table,
             table_properties,
+            table_schema,
             cache,
         }
     }
@@ -96,6 +99,10 @@ impl IcebergUpdateExec {
 
     pub fn table_properties(&self) -> &[(String, String)] {
         &self.table_properties
+    }
+
+    pub fn table_schema(&self) -> Option<&SchemaRef> {
+        self.table_schema.as_ref()
     }
 
     fn compute_properties(schema: SchemaRef) -> Arc<PlanProperties> {

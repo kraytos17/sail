@@ -1379,6 +1379,18 @@ pub enum AlterTableOperation {
         name: ObjectName,
         default: Option<String>,
     },
+    AlterColumnComment {
+        name: ObjectName,
+        comment: Option<String>,
+    },
+    AlterColumnNullability {
+        name: ObjectName,
+        nullable: bool,
+    },
+    AlterColumnPosition {
+        name: ObjectName,
+        position: ColumnPosition,
+    },
     AddCheckConstraint {
         name: Identifier,
         expression: ExprWithSource,
@@ -1412,7 +1424,7 @@ pub enum ColumnAlterationOption {
 }
 
 /// Column position for ALTER TABLE ADD COLUMNS.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ColumnPosition {
     First,
     After(ObjectName),

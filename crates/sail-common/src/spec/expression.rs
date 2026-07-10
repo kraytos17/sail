@@ -152,7 +152,7 @@ pub enum Expr {
 
 /// An identifier with only one part.
 /// It is the raw value without quotes or escape characters.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Identifier(String);
 
 impl From<String> for Identifier {
@@ -181,7 +181,7 @@ impl AsRef<str> for Identifier {
 
 /// An object name with potentially multiple parts.
 /// Each part is a raw value without quotes or escape characters.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ObjectName(Vec<Identifier>);
 
 impl ObjectName {

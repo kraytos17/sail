@@ -484,6 +484,21 @@ pub enum TableFormatAlterTableOperation {
         column_path: Vec<String>,
         default: Option<String>,
     },
+    /// Alters the comment of a table column.
+    AlterColumnComment {
+        column_path: Vec<String>,
+        comment: Option<String>,
+    },
+    /// Sets or drops NOT NULL on a table column.
+    AlterColumnNullability {
+        column_path: Vec<String>,
+        nullable: bool,
+    },
+    /// Reorders a table column to a new position.
+    AlterColumnPosition {
+        column_path: Vec<String>,
+        position: sail_common::spec::ColumnPosition,
+    },
     /// Adds a CHECK constraint after the caller has validated existing rows.
     AddCheckConstraint { name: String, expression: String },
 }
@@ -592,6 +607,24 @@ pub trait TableFormat: Send + Sync {
             TableFormatAlterTableOperation::DropColumns { .. } => {
                 not_impl_err!(
                     "DROP COLUMNS not yet implemented for {} format",
+                    self.name()
+                )
+            }
+            TableFormatAlterTableOperation::AlterColumnComment { .. } => {
+                not_impl_err!(
+                    "ALTER COLUMN COMMENT not yet implemented for {} format",
+                    self.name()
+                )
+            }
+            TableFormatAlterTableOperation::AlterColumnNullability { .. } => {
+                not_impl_err!(
+                    "ALTER COLUMN NULLABILITY not yet implemented for {} format",
+                    self.name()
+                )
+            }
+            TableFormatAlterTableOperation::AlterColumnPosition { .. } => {
+                not_impl_err!(
+                    "ALTER COLUMN POSITION not yet implemented for {} format",
                     self.name()
                 )
             }

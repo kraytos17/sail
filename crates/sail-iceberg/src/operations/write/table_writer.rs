@@ -288,7 +288,7 @@ impl IcebergTableWriter {
             let file_path = match self.table_url.join(&rel) {
                 Ok(u) => u.to_string(),
                 Err(_) => {
-                    format!("{}{}", self.table_url.as_str(), rel)
+                    format!("{}/{}", self.table_url.as_str().trim_end_matches('/'), rel)
                 }
             };
             let df = DataFileWriter::new(self.partition_spec_id, file_path, partition_values)

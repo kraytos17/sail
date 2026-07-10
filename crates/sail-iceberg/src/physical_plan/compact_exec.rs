@@ -40,7 +40,6 @@ const SMALL_FILE_THRESHOLD: f64 = 0.75; // Files below 75% of target are candida
 
 /// A batch of small files to compact into one output file.
 struct CompactBatch {
-    partition_dir: String,
     partition_values: Vec<Option<crate::spec::types::values::Literal>>,
     files: Vec<DataFile>,
     total_size: u64,
@@ -55,6 +54,7 @@ pub struct IcebergCompactExec {
     session_state: SessionState,
     lakehouse_table: Option<LakehouseExecutionContext>,
     table_properties: Vec<(String, String)>,
+    table_schema: Option<SchemaRef>,
     cache: Arc<PlanProperties>,
 }
 
@@ -65,6 +65,7 @@ impl IcebergCompactExec {
         session_state: SessionState,
         lakehouse_table: Option<LakehouseExecutionContext>,
         table_properties: Vec<(String, String)>,
+        table_schema: Option<SchemaRef>,
     ) -> Self {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "count",
@@ -79,6 +80,7 @@ impl IcebergCompactExec {
             session_state,
             lakehouse_table,
             table_properties,
+            table_schema,
             cache,
         }
     }
@@ -97,6 +99,10 @@ impl IcebergCompactExec {
 
     pub fn table_properties(&self) -> &[(String, String)] {
         &self.table_properties
+    }
+
+    pub fn table_schema(&self) -> Option<&SchemaRef> {
+        self.table_schema.as_ref()
     }
 
     fn compute_properties(schema: SchemaRef) -> Arc<PlanProperties> {
@@ -440,7 +446,6 @@ impl IcebergCompactExec {
             sorted.sort_by(|a, b| b.file_size_in_bytes.cmp(&a.file_size_in_bytes));
 
             let mut current_batch = CompactBatch {
-                partition_dir: String::new(),
                 partition_values: Vec::new(),
                 files: Vec::new(),
                 total_size: 0,
@@ -455,7 +460,6 @@ impl IcebergCompactExec {
                     let batch = std::mem::replace(
                         &mut current_batch,
                         CompactBatch {
-                            partition_dir: String::new(),
                             partition_values: Vec::new(),
                             files: Vec::new(),
                             total_size: 0,

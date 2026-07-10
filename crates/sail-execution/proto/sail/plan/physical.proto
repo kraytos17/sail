@@ -1023,6 +1023,7 @@ message IcebergDeleteExecNode {
   bytes schema = 3;
   string lakehouse_table_json = 4;
   repeated StringPair properties = 5;
+  bytes table_schema = 6;
 }
 
 message IcebergUpdateExecNode {
@@ -1032,6 +1033,7 @@ message IcebergUpdateExecNode {
   string lakehouse_table_json = 4;
   repeated AssignmentNode assignments = 5;
   repeated StringPair properties = 6;
+  bytes table_schema = 7;
 }
 
 message IcebergCompactExecNode {
@@ -1040,4 +1042,5 @@ message IcebergCompactExecNode {
   bytes schema = 3;
   string lakehouse_table_json = 4;
   repeated StringPair properties = 5;
+  bytes table_schema = 6;
 }

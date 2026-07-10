@@ -519,6 +519,24 @@ impl PlanResolver<'_> {
                     default,
                 }
             }
+            spec::AlterTableOperation::AlterColumnComment { name, comment } => {
+                AlterTableOptions::AlterColumnComment {
+                    name: name.into(),
+                    comment,
+                }
+            }
+            spec::AlterTableOperation::AlterColumnNullability { name, nullable } => {
+                AlterTableOptions::AlterColumnNullability {
+                    name: name.into(),
+                    nullable,
+                }
+            }
+            spec::AlterTableOperation::AlterColumnPosition { name, position } => {
+                AlterTableOptions::AlterColumnPosition {
+                    name: name.into(),
+                    position,
+                }
+            }
             spec::AlterTableOperation::AddCheckConstraint { .. } => {
                 return Err(PlanError::unsupported(
                     "ALTER TABLE ADD CONSTRAINT is only supported for Delta Lake tables",

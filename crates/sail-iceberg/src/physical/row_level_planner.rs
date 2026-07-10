@@ -8,6 +8,7 @@ use sail_common_datafusion::datasource::RowLevelCommand;
 use sail_logical_plan::merge::RowLevelWriteNode;
 
 use crate::catalog_support::commit_helper::extract_table_properties;
+use crate::datasource::type_converter::iceberg_schema_to_arrow;
 use crate::physical_plan::delete_exec::IcebergDeleteExec;
 use crate::physical_plan::update_exec::IcebergUpdateExec;
 use crate::table::Table;
@@ -25,6 +26,12 @@ pub(crate) async fn plan_iceberg_row_level_write(
         return datafusion_common::plan_err!("Cannot modify a table with no data");
     }
 
+    let table_schema = table
+        .metadata()
+        .current_schema()
+        .and_then(|s| iceberg_schema_to_arrow(s).ok())
+        .map(Arc::new);
+
     let lakehouse_table: Option<LakehouseExecutionContext> = node.target_lakehouse_table().cloned();
     let table_properties = extract_table_properties(node.target_options());
 
@@ -37,6 +44,7 @@ pub(crate) async fn plan_iceberg_row_level_write(
                 session_state.clone(),
                 lakehouse_table,
                 table_properties,
+                table_schema,
             )))
         }
         RowLevelCommand::Update => {
@@ -49,6 +57,7 @@ pub(crate) async fn plan_iceberg_row_level_write(
                 session_state.clone(),
                 lakehouse_table,
                 table_properties,
+                table_schema,
             )))
         }
         _ => datafusion_common::not_impl_err!(

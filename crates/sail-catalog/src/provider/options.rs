@@ -162,6 +162,18 @@ pub enum AlterTableOptions {
         name: Vec<String>,
         default: Option<String>,
     },
+    AlterColumnComment {
+        name: Vec<String>,
+        comment: Option<String>,
+    },
+    AlterColumnNullability {
+        name: Vec<String>,
+        nullable: bool,
+    },
+    AlterColumnPosition {
+        name: Vec<String>,
+        position: sail_common::spec::ColumnPosition,
+    },
     AddCheckConstraint {
         name: String,
         expression: String,

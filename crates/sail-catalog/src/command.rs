@@ -504,6 +504,51 @@ impl CatalogCommand {
                         .await
                         .map_err(|e| CatalogError::External(e.to_string()))?;
 
+                    // For catalog-managed Iceberg tables, the storage-layer alter
+                    // writes a new metadata file (v{next_version}.metadata.json).
+                    // Update the catalog's metadata-location pointer so subsequent
+                    // reads find the new metadata.
+                    if format.eq_ignore_ascii_case("iceberg") {
+                        let props: Vec<(&str, &str)> = table_status
+                            .kind
+                            .properties()
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v.as_str()))
+                            .collect();
+                        if let Some(meta_location) =
+                            sail_common_datafusion::catalog::managed::metadata_location_value(
+                                props.iter().copied(),
+                            )
+                        {
+                            if let Some((prefix, version_str)) =
+                                meta_location.rsplit_once("/metadata/v")
+                            {
+                                if let Some(ver_str) = version_str.split('.').next() {
+                                    if let Ok(ver) = ver_str.parse::<u64>() {
+                                        let ext = meta_location
+                                            .rsplit('.')
+                                            .next()
+                                            .unwrap_or("metadata.json");
+                                        let new_meta_location =
+                                            format!("{}/metadata/v{}.{}", prefix, ver + 1, ext);
+                                        let _ = manager
+                                            .alter_table(
+                                                &table,
+                                                AlterTableOptions::SetTableProperties {
+                                                    properties: vec![(
+                                                        sail_common_datafusion::catalog::managed::METADATA_LOCATION_KEY
+                                                            .to_string(),
+                                                        new_meta_location,
+                                                    )],
+                                                },
+                                            )
+                                            .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Storage is the source of truth for lakehouse ALTER TABLE
                     // operations, but metadata reads still flow through the
                     // catalog. Surface catalog sync failures so callers do not
@@ -1007,6 +1052,24 @@ fn table_format_alter_operation(options: &AlterTableOptions) -> TableFormatAlter
             TableFormatAlterTableOperation::AlterColumnDefault {
                 column_path: name.clone(),
                 default: default.clone(),
+            }
+        }
+        AlterTableOptions::AlterColumnComment { name, comment } => {
+            TableFormatAlterTableOperation::AlterColumnComment {
+                column_path: name.clone(),
+                comment: comment.clone(),
+            }
+        }
+        AlterTableOptions::AlterColumnNullability { name, nullable } => {
+            TableFormatAlterTableOperation::AlterColumnNullability {
+                column_path: name.clone(),
+                nullable: *nullable,
+            }
+        }
+        AlterTableOptions::AlterColumnPosition { name, position } => {
+            TableFormatAlterTableOperation::AlterColumnPosition {
+                column_path: name.clone(),
+                position: position.clone(),
             }
         }
         AlterTableOptions::RenameTable { .. } => TableFormatAlterTableOperation::RenameTable,

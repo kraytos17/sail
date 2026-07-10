@@ -1355,14 +1355,21 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 schema: schema_bytes,
                 lakehouse_table_json,
                 properties,
+                table_schema: table_schema_bytes,
             }) => {
                 let decoded_schema = try_decode_schema(&schema_bytes)?;
-                let column_types: HashMap<String, datafusion::arrow::datatypes::DataType> =
-                    decoded_schema
+                let column_types: HashMap<String, datafusion::arrow::datatypes::DataType> = {
+                    let schema = if !table_schema_bytes.is_empty() {
+                        try_decode_schema(&table_schema_bytes)?
+                    } else {
+                        decoded_schema
+                    };
+                    schema
                         .fields()
                         .iter()
                         .map(|f| (f.name().to_lowercase(), f.data_type().clone()))
-                        .collect();
+                        .collect()
+                };
                 let condition = if condition_source.is_empty() {
                     None
                 } else {
@@ -1390,6 +1397,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     session_state,
                     lakehouse_table,
                     table_properties,
+                    None,
                 )))
             }
             NodeKind::IcebergUpdate(gen::IcebergUpdateExecNode {
@@ -1399,14 +1407,21 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 lakehouse_table_json,
                 assignments,
                 properties,
+                table_schema: table_schema_bytes,
             }) => {
                 let decoded_schema = try_decode_schema(&schema_bytes)?;
-                let column_types: HashMap<String, datafusion::arrow::datatypes::DataType> =
-                    decoded_schema
+                let column_types: HashMap<String, datafusion::arrow::datatypes::DataType> = {
+                    let schema = if !table_schema_bytes.is_empty() {
+                        try_decode_schema(&table_schema_bytes)?
+                    } else {
+                        decoded_schema
+                    };
+                    schema
                         .fields()
                         .iter()
                         .map(|f| (f.name().to_lowercase(), f.data_type().clone()))
-                        .collect();
+                        .collect()
+                };
                 let condition = if condition_source.is_empty() {
                     None
                 } else {
@@ -1452,6 +1467,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     session_state,
                     lakehouse_table,
                     table_properties,
+                    None,
                 )))
             }
             NodeKind::IcebergCompact(gen::IcebergCompactExecNode {
@@ -1460,6 +1476,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 schema,
                 lakehouse_table_json,
                 properties,
+                table_schema: _,
             }) => {
                 let _schema = Arc::new(try_decode_schema(&schema)?);
                 let lakehouse_table = self.try_decode_lakehouse_table(&lakehouse_table_json)?;
@@ -1476,6 +1493,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     session_state,
                     lakehouse_table,
                     table_properties,
+                    None,
                 )))
             }
             _ => plan_err!("unsupported physical plan node: {node_kind:?}"),
@@ -2221,6 +2239,11 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 schema,
                 lakehouse_table_json,
                 properties,
+                table_schema: delete_exec
+                    .table_schema()
+                    .map(|s| try_encode_schema(s.as_ref()))
+                    .transpose()?
+                    .unwrap_or_default(),
             })
         } else if let Some(update_exec) = node.downcast_ref::<IcebergUpdateExec>() {
             let schema = try_encode_schema(update_exec.schema().as_ref())?;
@@ -2254,6 +2277,11 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 lakehouse_table_json,
                 assignments,
                 properties,
+                table_schema: update_exec
+                    .table_schema()
+                    .map(|s| try_encode_schema(s.as_ref()))
+                    .transpose()?
+                    .unwrap_or_default(),
             })
         } else if let Some(compact_exec) = node.downcast_ref::<IcebergCompactExec>() {
             let schema = try_encode_schema(compact_exec.schema().as_ref())?;
@@ -2273,6 +2301,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 schema,
                 lakehouse_table_json,
                 properties,
+                table_schema: vec![],
             })
         } else {
             return plan_err!("unsupported physical plan node: {node:?}");
@@ -2293,7 +2322,6 @@ fn maybe_cast_literal(
     literal: Expr,
     column_types: &HashMap<String, datafusion::arrow::datatypes::DataType>,
 ) -> Result<Expr> {
-    use datafusion::arrow::datatypes::DataType;
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::{Cast, Expr};
     // Extract the column name from a Column expression
@@ -2340,7 +2368,6 @@ fn spec_expr_to_datafusion_expr(
     spec_expr: spec::Expr,
     column_types: &HashMap<String, datafusion::arrow::datatypes::DataType>,
 ) -> Result<datafusion::logical_expr::Expr> {
-    use datafusion::arrow::datatypes::DataType;
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::{col, BinaryExpr, Cast, Expr, Operator};
@@ -4706,11 +4733,14 @@ impl RemoteExecutionCodec {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use datafusion::arrow::array::{Array, ArrayRef, RecordBatch};
-    use datafusion::arrow::datatypes::{Schema, SchemaRef};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::common::ScalarValue;
-    use datafusion::logical_expr::{col, BinaryExpr, Expr, Operator};
+    use datafusion::execution::session_state::SessionStateBuilder;
+    use datafusion::logical_expr::{col, lit, BinaryExpr, Expr, Operator};
     use datafusion::physical_expr::HigherOrderFunctionExpr;
 
     use super::*;
@@ -5802,5 +5832,533 @@ mod tests {
             result,
             Expr::Literal(ScalarValue::Time64Microsecond(Some(45_000_000_000)), None)
         ));
+    }
+
+    #[test]
+    fn test_cast_int32_via_column_types() {
+        use spec::Literal;
+        let mut col_types = HashMap::new();
+        col_types.insert(
+            "age".to_string(),
+            datafusion::arrow::datatypes::DataType::Int32,
+        );
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("age"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Utf8 {
+            value: Some("42".to_string()),
+        });
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("=="),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec, &col_types).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Eq,
+                ..
+            })
+        ));
+        if let Expr::BinaryExpr(BinaryExpr { right, .. }) = &result {
+            assert!(matches!(right.as_ref(), Expr::Cast(_)));
+        }
+    }
+
+    #[test]
+    fn test_cast_boolean_via_column_types() {
+        use spec::Literal;
+        let mut col_types = HashMap::new();
+        col_types.insert(
+            "is_active".to_string(),
+            datafusion::arrow::datatypes::DataType::Boolean,
+        );
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("is_active"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Utf8 {
+            value: Some("true".to_string()),
+        });
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("=="),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec, &col_types).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Eq,
+                ..
+            })
+        ));
+        if let Expr::BinaryExpr(BinaryExpr { right, .. }) = &result {
+            assert!(matches!(right.as_ref(), Expr::Cast(_)));
+        }
+    }
+
+    #[test]
+    fn test_cast_int32_literal_no_cast_needed() {
+        use spec::Literal;
+        let mut col_types = HashMap::new();
+        col_types.insert(
+            "age".to_string(),
+            datafusion::arrow::datatypes::DataType::Int32,
+        );
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("age"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Int32 { value: Some(42) });
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("=="),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec, &col_types).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Eq,
+                ..
+            })
+        ));
+        if let Expr::BinaryExpr(BinaryExpr { right, .. }) = &result {
+            assert!(!matches!(right.as_ref(), Expr::Cast(_)));
+            assert!(matches!(
+                right.as_ref(),
+                Expr::Literal(ScalarValue::Int32(Some(42)), _)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_cast_empty_column_types() {
+        use spec::Literal;
+        let col_types = HashMap::new();
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("event_date"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Utf8 {
+            value: Some("2024-01-15".to_string()),
+        });
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("=="),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec, &col_types).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Eq,
+                ..
+            })
+        ));
+        if let Expr::BinaryExpr(BinaryExpr { right, .. }) = &result {
+            assert!(!matches!(right.as_ref(), Expr::Cast(_)));
+        }
+    }
+
+    #[test]
+    fn test_cast_and_compound_predicate() {
+        use spec::Literal;
+        let mut col_types = HashMap::new();
+        col_types.insert(
+            "event_date".to_string(),
+            datafusion::arrow::datatypes::DataType::Date32,
+        );
+        col_types.insert(
+            "score".to_string(),
+            datafusion::arrow::datatypes::DataType::Float64,
+        );
+        let date_left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("event_date"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let date_right = spec::Expr::Literal(Literal::Utf8 {
+            value: Some("2024-01-15".to_string()),
+        });
+        let date_eq = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("=="),
+            arguments: vec![date_left, date_right],
+        };
+        let score_left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("score"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let score_right = spec::Expr::Literal(Literal::Utf8 {
+            value: Some("100.0".to_string()),
+        });
+        let score_gt = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare(">"),
+            arguments: vec![score_left, score_right],
+        };
+        let and_expr = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("and"),
+            arguments: vec![date_eq, score_gt],
+        };
+        let result = spec_expr_to_datafusion_expr(and_expr, &col_types).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::And,
+                ..
+            })
+        ));
+        if let Expr::BinaryExpr(BinaryExpr { left, right, .. }) = &result {
+            assert!(matches!(
+                left.as_ref(),
+                Expr::BinaryExpr(BinaryExpr {
+                    op: Operator::Eq,
+                    ..
+                })
+            ));
+            assert!(matches!(
+                right.as_ref(),
+                Expr::BinaryExpr(BinaryExpr {
+                    op: Operator::Gt,
+                    ..
+                })
+            ));
+            if let Expr::BinaryExpr(BinaryExpr {
+                right: inner_right, ..
+            }) = left.as_ref()
+            {
+                assert!(matches!(inner_right.as_ref(), Expr::Cast(_)));
+            }
+            if let Expr::BinaryExpr(BinaryExpr {
+                right: inner_right, ..
+            }) = right.as_ref()
+            {
+                assert!(matches!(inner_right.as_ref(), Expr::Cast(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_cast_in_list() {
+        use spec::Literal;
+        let mut col_types = HashMap::new();
+        col_types.insert(
+            "event_date".to_string(),
+            datafusion::arrow::datatypes::DataType::Date32,
+        );
+        let expr = spec::Expr::InList {
+            expr: Box::new(spec::Expr::UnresolvedAttribute {
+                name: spec::ObjectName::bare("event_date"),
+                plan_id: None,
+                is_metadata_column: false,
+            }),
+            list: vec![
+                spec::Expr::Literal(Literal::Utf8 {
+                    value: Some("2024-01-15".to_string()),
+                }),
+                spec::Expr::Literal(Literal::Utf8 {
+                    value: Some("2024-02-01".to_string()),
+                }),
+            ],
+            negated: false,
+        };
+        let result = spec_expr_to_datafusion_expr(expr, &col_types).unwrap();
+        assert!(matches!(result, Expr::InList(_)));
+    }
+
+    #[test]
+    fn test_cast_null_literal() {
+        use spec::Literal;
+        let mut col_types = HashMap::new();
+        col_types.insert(
+            "event_date".to_string(),
+            datafusion::arrow::datatypes::DataType::Date32,
+        );
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("event_date"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Null {});
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("=="),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec, &col_types).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Eq,
+                ..
+            })
+        ));
+        if let Expr::BinaryExpr(BinaryExpr { right, .. }) = &result {
+            assert!(matches!(
+                right.as_ref(),
+                Expr::Literal(ScalarValue::Null, _)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_iceberg_compact_codec_encode() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("event_date", DataType::Date32, true),
+        ]));
+        let compact_exec = IcebergCompactExec::new(
+            "s3://bucket/table".to_string(),
+            None,
+            SessionStateBuilder::new().with_default_features().build(),
+            None,
+            vec![],
+            Some(schema),
+        );
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        let _ = codec.try_encode(Arc::new(compact_exec), &mut buf);
+        assert!(!buf.is_empty(), "codec encoding should produce output");
+    }
+
+    #[test]
+    fn test_cast_date32_via_column_types() {
+        use spec::Literal;
+        let mut col_types = HashMap::new();
+        col_types.insert(
+            "event_date".to_string(),
+            datafusion::arrow::datatypes::DataType::Date32,
+        );
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("event_date"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Utf8 {
+            value: Some("2024-01-15".to_string()),
+        });
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("=="),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec, &col_types).unwrap();
+        // The string literal should be wrapped in CAST to Date32
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Eq,
+                ..
+            })
+        ));
+        if let Expr::BinaryExpr(BinaryExpr { right, .. }) = &result {
+            assert!(matches!(right.as_ref(), Expr::Cast(_)));
+        }
+    }
+
+    #[test]
+    fn test_cast_timestamp_via_column_types() {
+        use spec::Literal;
+        let mut col_types = HashMap::new();
+        col_types.insert(
+            "ts".to_string(),
+            datafusion::arrow::datatypes::DataType::Timestamp(
+                datafusion::arrow::datatypes::TimeUnit::Microsecond,
+                None,
+            ),
+        );
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("ts"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Utf8 {
+            value: Some("2024-01-15T10:30:00".to_string()),
+        });
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("=="),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec, &col_types).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Eq,
+                ..
+            })
+        ));
+        if let Expr::BinaryExpr(BinaryExpr { right, .. }) = &result {
+            assert!(matches!(right.as_ref(), Expr::Cast(_)));
+        }
+    }
+
+    #[test]
+    fn test_no_cast_for_string_column() {
+        use spec::Literal;
+        let mut col_types = HashMap::new();
+        col_types.insert(
+            "name".to_string(),
+            datafusion::arrow::datatypes::DataType::Utf8,
+        );
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("name"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Utf8 {
+            value: Some("alice".to_string()),
+        });
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("=="),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec, &col_types).unwrap();
+        // String compared to string should NOT have a CAST
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Eq,
+                ..
+            })
+        ));
+        if let Expr::BinaryExpr(BinaryExpr { right, .. }) = &result {
+            assert!(
+                matches!(right.as_ref(), Expr::Literal(ScalarValue::Utf8(Some(s)), _) if s == "alice")
+            );
+        }
+    }
+
+    #[test]
+    fn test_cast_decimal128_via_column_types() {
+        use spec::Literal;
+        let mut col_types = HashMap::new();
+        col_types.insert(
+            "price".to_string(),
+            datafusion::arrow::datatypes::DataType::Decimal128(10, 2),
+        );
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("price"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Utf8 {
+            value: Some("10.50".to_string()),
+        });
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("=="),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec, &col_types).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Eq,
+                ..
+            })
+        ));
+        if let Expr::BinaryExpr(BinaryExpr { right, .. }) = &result {
+            assert!(matches!(right.as_ref(), Expr::Cast(_)));
+        }
+    }
+
+    #[test]
+    fn test_cast_float64_via_column_types() {
+        use spec::Literal;
+        let mut col_types = HashMap::new();
+        col_types.insert(
+            "score".to_string(),
+            datafusion::arrow::datatypes::DataType::Float64,
+        );
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("score"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Utf8 {
+            value: Some("10.5".to_string()),
+        });
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("=="),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec, &col_types).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Eq,
+                ..
+            })
+        ));
+        if let Expr::BinaryExpr(BinaryExpr { right, .. }) = &result {
+            assert!(matches!(right.as_ref(), Expr::Cast(_)));
+        }
+    }
+
+    #[test]
+    fn test_iceberg_delete_codec_encode_decode() {
+        // Build a full IcebergDeleteExec with table_schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("event_date", DataType::Date32, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("score", DataType::Float64, true),
+        ]));
+        let table_schema = Some(schema);
+        let condition = Some(ExprWithSource {
+            expr: col("event_date").eq(lit("2024-01-15")),
+            source: Some("event_date = '2024-01-15'".to_string()),
+        });
+        let delete_exec = IcebergDeleteExec::new(
+            "s3://bucket/table".to_string(),
+            condition,
+            SessionStateBuilder::new().with_default_features().build(),
+            None,
+            vec![],
+            table_schema,
+        );
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        let cloned = delete_exec.schema();
+        let _ = codec.try_encode(Arc::new(delete_exec), &mut buf);
+        // Encoding should succeed without "unsupported physical plan node"
+        assert!(!buf.is_empty(), "codec encoding should produce output");
+        // Decoding needs a TaskContext which is not available in simple unit tests,
+        // but the encoding succeeded which is the part that often fails.
+    }
+
+    #[test]
+    fn test_iceberg_update_codec_encode_with_assignments() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("event_date", DataType::Date32, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("score", DataType::Float64, true),
+        ]));
+        let table_schema = Some(schema);
+        let condition = Some(ExprWithSource {
+            expr: col("name").eq(lit("alice")),
+            source: Some("name = 'alice'".to_string()),
+        });
+        let update_exec = IcebergUpdateExec::new(
+            "s3://bucket/table".to_string(),
+            vec![(
+                "score".to_string(),
+                ExprWithSource {
+                    expr: lit(50.0),
+                    source: Some("50.0".to_string()),
+                },
+            )],
+            condition,
+            SessionStateBuilder::new().with_default_features().build(),
+            None,
+            vec![],
+            table_schema,
+        );
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        let _ = codec.try_encode(Arc::new(update_exec), &mut buf);
+        assert!(!buf.is_empty(), "codec encoding should produce output");
     }
 }

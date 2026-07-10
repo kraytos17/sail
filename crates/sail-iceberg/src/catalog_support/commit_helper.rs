@@ -22,8 +22,7 @@ use crate::utils::timestamp::monotonic_timestamp_ms;
 
 /// Result of a single-shot commit attempt via the shared helper.
 pub(crate) enum CommitResult {
-    /// The commit was successful (row count to return to the caller).
-    Committed { row_count: u64 },
+    Committed,
 }
 
 /// Attempt a single-shot Iceberg commit.
@@ -110,7 +109,7 @@ pub(crate) async fn commit_iceberg_changes(
             .await?
         {
             CatalogCommitOutcome::Committed(_) => {
-                return Ok(CommitResult::Committed { row_count: 0 });
+                return Ok(CommitResult::Committed);
             }
             CatalogCommitOutcome::NotSupported => {}
             CatalogCommitOutcome::Conflict => {
@@ -238,7 +237,7 @@ pub(crate) async fn commit_iceberg_changes(
             .await?;
     }
 
-    Ok(CommitResult::Committed { row_count: 0 })
+    Ok(CommitResult::Committed)
 }
 
 /// Extract the first `TablePropertyList` from an `OptionLayer` slice.
