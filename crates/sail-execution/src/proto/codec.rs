@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -23,7 +24,7 @@ use datafusion::functions::core::greatest::GreatestFunc;
 use datafusion::functions::core::least::LeastFunc;
 use datafusion::functions::string::overlay::OverlayFunc;
 use datafusion::logical_expr::{
-    AggregateUDF, AggregateUDFImpl, ScalarUDF, ScalarUDFImpl, WindowUDF,
+    AggregateUDF, AggregateUDFImpl, Expr, ScalarUDF, ScalarUDFImpl, WindowUDF,
 };
 use datafusion::physical_expr::equivalence::{EquivalenceClass, EquivalenceGroup};
 use datafusion::physical_expr::expressions::{LambdaExpr, LambdaVariable};
@@ -1351,11 +1352,17 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
             NodeKind::IcebergDelete(gen::IcebergDeleteExecNode {
                 table_url,
                 condition_source,
-                schema,
+                schema: schema_bytes,
                 lakehouse_table_json,
                 properties,
             }) => {
-                let _schema = Arc::new(try_decode_schema(&schema)?);
+                let decoded_schema = try_decode_schema(&schema_bytes)?;
+                let column_types: HashMap<String, datafusion::arrow::datatypes::DataType> =
+                    decoded_schema
+                        .fields()
+                        .iter()
+                        .map(|f| (f.name().to_lowercase(), f.data_type().clone()))
+                        .collect();
                 let condition = if condition_source.is_empty() {
                     None
                 } else {
@@ -1363,7 +1370,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                         .map_err(|e| plan_datafusion_err!("{e}"))?;
                     let spec_expr = sail_sql_analyzer::expression::from_ast_expression(ast)
                         .map_err(|e| plan_datafusion_err!("{e}"))?;
-                    let expr = spec_expr_to_datafusion_expr(spec_expr)?;
+                    let expr = spec_expr_to_datafusion_expr(spec_expr, &column_types)?;
                     Some(ExprWithSource {
                         expr,
                         source: Some(condition_source),
@@ -1388,12 +1395,18 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
             NodeKind::IcebergUpdate(gen::IcebergUpdateExecNode {
                 table_url,
                 condition_source,
-                schema,
+                schema: schema_bytes,
                 lakehouse_table_json,
                 assignments,
                 properties,
             }) => {
-                let _schema = Arc::new(try_decode_schema(&schema)?);
+                let decoded_schema = try_decode_schema(&schema_bytes)?;
+                let column_types: HashMap<String, datafusion::arrow::datatypes::DataType> =
+                    decoded_schema
+                        .fields()
+                        .iter()
+                        .map(|f| (f.name().to_lowercase(), f.data_type().clone()))
+                        .collect();
                 let condition = if condition_source.is_empty() {
                     None
                 } else {
@@ -1401,7 +1414,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                         .map_err(|e| plan_datafusion_err!("{e}"))?;
                     let spec_expr = sail_sql_analyzer::expression::from_ast_expression(ast)
                         .map_err(|e| plan_datafusion_err!("{e}"))?;
-                    let expr = spec_expr_to_datafusion_expr(spec_expr)?;
+                    let expr = spec_expr_to_datafusion_expr(spec_expr, &column_types)?;
                     Some(ExprWithSource {
                         expr,
                         source: Some(condition_source),
@@ -1416,7 +1429,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                             .map_err(|e| plan_datafusion_err!("{e}"))?;
                         let spec_expr = sail_sql_analyzer::expression::from_ast_expression(ast)
                             .map_err(|e| plan_datafusion_err!("{e}"))?;
-                        let expr = spec_expr_to_datafusion_expr(spec_expr)?;
+                        let expr = spec_expr_to_datafusion_expr(spec_expr, &column_types)?;
                         Ok((
                             a.column,
                             ExprWithSource {
@@ -2272,10 +2285,62 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
     }
 }
 
+/// Try to cast a string literal to the expected column type.
+/// When a WHERE clause has `event_date = '2024-01-15'` and the column `event_date`
+/// is of type Date32, the string literal needs an implicit CAST to Date32.
+fn maybe_cast_literal(
+    column: &Expr,
+    literal: Expr,
+    column_types: &HashMap<String, datafusion::arrow::datatypes::DataType>,
+) -> Result<Expr> {
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::{Cast, Expr};
+    // Extract the column name from a Column expression
+    let col_name = match column {
+        Expr::Column(col_ref) => Some(col_ref.name.to_lowercase()),
+        _ => None,
+    };
+    let Some(col_name) = col_name else {
+        return Ok(literal);
+    };
+    // Check if this column has a known type
+    let Some(col_type) = column_types.get(&col_name) else {
+        return Ok(literal);
+    };
+    // Only cast when the literal is a string and the column type is not string
+    let is_string_literal = matches!(
+        &literal,
+        Expr::Literal(ScalarValue::Utf8(_), _) | Expr::Literal(ScalarValue::LargeUtf8(_), _)
+    );
+    if !is_string_literal {
+        return Ok(literal);
+    }
+    let is_string_col = matches!(
+        col_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    );
+    if is_string_col {
+        return Ok(literal);
+    }
+    // Cast the string literal to the column type
+    let field = datafusion::arrow::datatypes::Field::new("", col_type.clone(), true);
+    Ok(Expr::Cast(Cast {
+        expr: Box::new(literal),
+        field: field.into(),
+    }))
+}
+
 /// Convert a [`spec::Expr`] to a [`datafusion_expr::Expr`].
 /// This handles the subset of expression types that can appear in SQL WHERE clauses
 /// for DELETE/UPDATE conditions.
-fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::logical_expr::Expr> {
+/// `column_types` maps column names (lowercase) to their Arrow data types for implicit
+/// casting of string literals to the appropriate type (e.g., CAST('2024-01-15' AS DATE)).
+fn spec_expr_to_datafusion_expr(
+    spec_expr: spec::Expr,
+    column_types: &HashMap<String, datafusion::arrow::datatypes::DataType>,
+) -> Result<datafusion::logical_expr::Expr> {
+    use datafusion::arrow::datatypes::DataType;
     use datafusion::common::ScalarValue;
     use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::{col, BinaryExpr, Cast, Expr, Operator};
@@ -2320,10 +2385,10 @@ fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::log
             list,
             negated,
         } => {
-            let expr = spec_expr_to_datafusion_expr(*expr)?;
+            let expr = spec_expr_to_datafusion_expr(*expr, column_types)?;
             let list = list
                 .into_iter()
-                .map(spec_expr_to_datafusion_expr)
+                .map(|e| spec_expr_to_datafusion_expr(e, column_types))
                 .collect::<Result<Vec<_>>>()?;
             Expr::InList(InList {
                 expr: Box::new(expr),
@@ -2331,9 +2396,11 @@ fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::log
                 negated,
             })
         }
-        spec::Expr::IsNull(expr) => Expr::IsNull(Box::new(spec_expr_to_datafusion_expr(*expr)?)),
+        spec::Expr::IsNull(expr) => {
+            Expr::IsNull(Box::new(spec_expr_to_datafusion_expr(*expr, column_types)?))
+        }
         spec::Expr::IsNotNull(expr) => {
-            Expr::IsNotNull(Box::new(spec_expr_to_datafusion_expr(*expr)?))
+            Expr::IsNotNull(Box::new(spec_expr_to_datafusion_expr(*expr, column_types)?))
         }
         spec::Expr::Cast {
             expr, cast_to_type, ..
@@ -2341,7 +2408,7 @@ fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::log
             let arrow_type = spec_data_type_to_arrow(&cast_to_type)?;
             let field = datafusion::arrow::datatypes::Field::new("", arrow_type, true);
             Expr::Cast(Cast {
-                expr: Box::new(spec_expr_to_datafusion_expr(*expr)?),
+                expr: Box::new(spec_expr_to_datafusion_expr(*expr, column_types)?),
                 field: field.into(),
             })
         }
@@ -2356,8 +2423,8 @@ fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::log
                 .unwrap_or_default();
             if arguments.len() == 2 {
                 let mut args = arguments.into_iter();
-                let left = spec_expr_to_datafusion_expr(args.next().unwrap())?;
-                let right = spec_expr_to_datafusion_expr(args.next().unwrap())?;
+                let left = spec_expr_to_datafusion_expr(args.next().unwrap(), column_types)?;
+                let right = spec_expr_to_datafusion_expr(args.next().unwrap(), column_types)?;
                 let op = match op_name.as_str() {
                     "==" => Operator::Eq,
                     "!=" => Operator::NotEq,
@@ -2377,13 +2444,18 @@ fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::log
                         return plan_err!("unsupported operator in expression: {op_name}");
                     }
                 };
+                let right = maybe_cast_literal(&left, right, column_types)?;
+                let left = maybe_cast_literal(&right, left, column_types)?;
                 Expr::BinaryExpr(BinaryExpr {
                     left: Box::new(left),
                     op,
                     right: Box::new(right),
                 })
             } else if arguments.len() == 1 {
-                let inner = spec_expr_to_datafusion_expr(arguments.into_iter().next().unwrap())?;
+                let inner = spec_expr_to_datafusion_expr(
+                    arguments.into_iter().next().unwrap(),
+                    column_types,
+                )?;
                 match op_name.as_str() {
                     "not" => Expr::Not(Box::new(inner)),
                     "+" => inner,
@@ -2407,8 +2479,8 @@ fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::log
                 .unwrap_or_default();
             if f.arguments.len() == 2 {
                 let mut args = f.arguments.into_iter();
-                let left = spec_expr_to_datafusion_expr(args.next().unwrap())?;
-                let right = spec_expr_to_datafusion_expr(args.next().unwrap())?;
+                let left = spec_expr_to_datafusion_expr(args.next().unwrap(), column_types)?;
+                let right = spec_expr_to_datafusion_expr(args.next().unwrap(), column_types)?;
                 let op = match op_name.as_str() {
                     "==" => Operator::Eq,
                     "!=" => Operator::NotEq,
@@ -2428,13 +2500,18 @@ fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::log
                         return plan_err!("unsupported operator in expression: {op_name}");
                     }
                 };
+                let right = maybe_cast_literal(&left, right, column_types)?;
+                let left = maybe_cast_literal(&right, left, column_types)?;
                 Expr::BinaryExpr(BinaryExpr {
                     left: Box::new(left),
                     op,
                     right: Box::new(right),
                 })
             } else if f.arguments.len() == 1 {
-                let inner = spec_expr_to_datafusion_expr(f.arguments.into_iter().next().unwrap())?;
+                let inner = spec_expr_to_datafusion_expr(
+                    f.arguments.into_iter().next().unwrap(),
+                    column_types,
+                )?;
                 match op_name.as_str() {
                     "not" => Expr::Not(Box::new(inner)),
                     _ => {
@@ -2456,8 +2533,8 @@ fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::log
             case_insensitive,
         } => {
             use datafusion::logical_expr::expr::Like;
-            let expr = spec_expr_to_datafusion_expr(*expr)?;
-            let pattern = spec_expr_to_datafusion_expr(*pattern)?;
+            let expr = spec_expr_to_datafusion_expr(*expr, column_types)?;
+            let pattern = spec_expr_to_datafusion_expr(*pattern, column_types)?;
             Expr::SimilarTo(Like::new(
                 negated,
                 Box::new(expr),
@@ -2466,18 +2543,24 @@ fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::log
                 case_insensitive,
             ))
         }
-        spec::Expr::IsTrue(expr) => Expr::IsNotNull(Box::new(spec_expr_to_datafusion_expr(*expr)?)),
-        spec::Expr::IsNotTrue(expr) => Expr::IsNull(Box::new(spec_expr_to_datafusion_expr(*expr)?)),
+        spec::Expr::IsTrue(expr) => {
+            Expr::IsNotNull(Box::new(spec_expr_to_datafusion_expr(*expr, column_types)?))
+        }
+        spec::Expr::IsNotTrue(expr) => {
+            Expr::IsNull(Box::new(spec_expr_to_datafusion_expr(*expr, column_types)?))
+        }
         spec::Expr::IsFalse(expr) => {
-            let inner = spec_expr_to_datafusion_expr(*expr)?;
+            let inner = spec_expr_to_datafusion_expr(*expr, column_types)?;
             Expr::Not(Box::new(Expr::IsNotNull(Box::new(inner))))
         }
         spec::Expr::IsNotFalse(expr) => {
-            Expr::IsNotNull(Box::new(spec_expr_to_datafusion_expr(*expr)?))
+            Expr::IsNotNull(Box::new(spec_expr_to_datafusion_expr(*expr, column_types)?))
         }
-        spec::Expr::IsUnknown(expr) => Expr::IsNull(Box::new(spec_expr_to_datafusion_expr(*expr)?)),
+        spec::Expr::IsUnknown(expr) => {
+            Expr::IsNull(Box::new(spec_expr_to_datafusion_expr(*expr, column_types)?))
+        }
         spec::Expr::IsNotUnknown(expr) => {
-            Expr::IsNotNull(Box::new(spec_expr_to_datafusion_expr(*expr)?))
+            Expr::IsNotNull(Box::new(spec_expr_to_datafusion_expr(*expr, column_types)?))
         }
         spec::Expr::Between {
             expr,
@@ -2485,9 +2568,9 @@ fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::log
             low,
             high,
         } => {
-            let expr = spec_expr_to_datafusion_expr(*expr)?;
-            let low = spec_expr_to_datafusion_expr(*low)?;
-            let high = spec_expr_to_datafusion_expr(*high)?;
+            let expr = spec_expr_to_datafusion_expr(*expr, column_types)?;
+            let low = spec_expr_to_datafusion_expr(*low, column_types)?;
+            let high = spec_expr_to_datafusion_expr(*high, column_types)?;
             let ge = Expr::BinaryExpr(BinaryExpr {
                 left: Box::new(expr.clone()),
                 op: Operator::GtEq,
@@ -2510,14 +2593,14 @@ fn spec_expr_to_datafusion_expr(spec_expr: spec::Expr) -> Result<datafusion::log
             }
         }
         spec::Expr::IsDistinctFrom { left, right } => Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(spec_expr_to_datafusion_expr(*left)?),
+            left: Box::new(spec_expr_to_datafusion_expr(*left, column_types)?),
             op: Operator::IsDistinctFrom,
-            right: Box::new(spec_expr_to_datafusion_expr(*right)?),
+            right: Box::new(spec_expr_to_datafusion_expr(*right, column_types)?),
         }),
         spec::Expr::IsNotDistinctFrom { left, right } => Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(spec_expr_to_datafusion_expr(*left)?),
+            left: Box::new(spec_expr_to_datafusion_expr(*left, column_types)?),
             op: Operator::IsNotDistinctFrom,
-            right: Box::new(spec_expr_to_datafusion_expr(*right)?),
+            right: Box::new(spec_expr_to_datafusion_expr(*right, column_types)?),
         }),
         spec::Expr::UnresolvedDate { value } => {
             let parsed = chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d")
@@ -5497,7 +5580,7 @@ mod tests {
     #[test]
     fn test_spec_expr_literal_int32() {
         let spec = spec::Expr::Literal(spec::Literal::Int32 { value: Some(42) });
-        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
         assert!(matches!(
             result,
             Expr::Literal(ScalarValue::Int32(Some(42)), None)
@@ -5507,7 +5590,7 @@ mod tests {
     #[test]
     fn test_spec_expr_literal_null() {
         let spec = spec::Expr::Literal(spec::Literal::Null);
-        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
         assert!(matches!(result, Expr::Literal(ScalarValue::Null, None)));
     }
 
@@ -5516,7 +5599,7 @@ mod tests {
         let spec = spec::Expr::Literal(spec::Literal::Utf8 {
             value: Some("hello".to_string()),
         });
-        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
         assert!(
             matches!(result, Expr::Literal(ScalarValue::Utf8(Some(ref s)), None) if s == "hello")
         );
@@ -5529,7 +5612,7 @@ mod tests {
             plan_id: None,
             is_metadata_column: false,
         };
-        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
         let expected = col("age");
         assert_eq!(result, expected);
     }
@@ -5547,7 +5630,7 @@ mod tests {
             function_name: spec::ObjectName::bare("=="),
             arguments: vec![left, right],
         };
-        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
         assert!(matches!(
             result,
             Expr::BinaryExpr(BinaryExpr {
@@ -5565,7 +5648,7 @@ mod tests {
             is_metadata_column: false,
         };
         let spec = spec::Expr::IsNull(Box::new(inner));
-        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
         assert!(matches!(result, Expr::IsNull(_)));
     }
 
@@ -5574,7 +5657,7 @@ mod tests {
         let spec = spec::Expr::UnresolvedDate {
             value: "2024-01-15".to_string(),
         };
-        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
         assert!(matches!(
             result,
             Expr::Literal(ScalarValue::Date32(Some(_)), None)
@@ -5597,7 +5680,7 @@ mod tests {
             low: Box::new(low),
             high: Box::new(high),
         };
-        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
         assert!(matches!(
             result,
             Expr::BinaryExpr(BinaryExpr {
@@ -5615,7 +5698,7 @@ mod tests {
             scale: 2,
             value: Some(12345),
         });
-        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
         assert!(matches!(
             result,
             Expr::Literal(ScalarValue::Decimal128(Some(12345), 10, 2), None)
@@ -5636,7 +5719,7 @@ mod tests {
             filter: None,
             order_by: None,
         });
-        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
         assert!(matches!(result, Expr::Not(_)));
     }
 
@@ -5653,7 +5736,7 @@ mod tests {
             function_name: spec::ObjectName::bare("%"),
             arguments: vec![left, right],
         };
-        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
         assert!(matches!(
             result,
             Expr::BinaryExpr(BinaryExpr {
@@ -5671,7 +5754,7 @@ mod tests {
             is_metadata_column: false,
         };
         let spec = spec::Expr::IsTrue(Box::new(inner));
-        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
         assert!(matches!(result, Expr::IsNotNull(_)));
     }
 
@@ -5683,7 +5766,7 @@ mod tests {
             is_metadata_column: false,
         };
         let spec = spec::Expr::IsUnknown(Box::new(inner));
-        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
         assert!(matches!(result, Expr::IsNull(_)));
     }
 
@@ -5705,7 +5788,7 @@ mod tests {
             escape_char: None,
             case_insensitive: false,
         };
-        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
         assert!(matches!(result, Expr::SimilarTo(_)));
     }
 
@@ -5714,7 +5797,7 @@ mod tests {
         let spec = spec::Expr::UnresolvedTime {
             value: "12:30:00".to_string(),
         };
-        let result = spec_expr_to_datafusion_expr(spec).unwrap();
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
         assert!(matches!(
             result,
             Expr::Literal(ScalarValue::Time64Microsecond(Some(45_000_000_000)), None)
