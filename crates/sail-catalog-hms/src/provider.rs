@@ -177,6 +177,21 @@ pub(crate) fn apply_alter_table_options(
                 "DROP COLUMNS is not yet supported for HMS catalog".to_string(),
             ));
         }
+        AlterTableOptions::AlterColumnComment { .. } => {
+            return Err(CatalogError::NotSupported(
+                "Hive Metastore catalog does not support ALTER COLUMN COMMENT".to_string(),
+            ));
+        }
+        AlterTableOptions::AlterColumnNullability { .. } => {
+            return Err(CatalogError::NotSupported(
+                "Hive Metastore catalog does not support ALTER COLUMN NULLABILITY".to_string(),
+            ));
+        }
+        AlterTableOptions::AlterColumnPosition { .. } => {
+            return Err(CatalogError::NotSupported(
+                "Hive Metastore catalog does not support ALTER COLUMN POSITION".to_string(),
+            ));
+        }
     }
     Ok(())
 }
