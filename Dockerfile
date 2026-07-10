@@ -29,6 +29,8 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
         --profile minimal \
         --default-toolchain ${RUST_VERSION}
 
+RUN /root/.cargo/bin/rustup component add rustfmt
+
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 RUN curl -L --proto '=https' --tlsv1.2 -sSf \
