@@ -1385,6 +1385,11 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 };
                 let lakehouse_table = self.try_decode_lakehouse_table(&lakehouse_table_json)?;
                 let table_properties = properties.into_iter().map(|p| (p.key, p.value)).collect();
+                let decoded_table_schema = if !table_schema_bytes.is_empty() {
+                    Some(Arc::new(try_decode_schema(&table_schema_bytes)?))
+                } else {
+                    None
+                };
                 let session_state =
                     datafusion::execution::session_state::SessionStateBuilder::new()
                         .with_config(ctx.session_config().clone())
@@ -1397,7 +1402,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     session_state,
                     lakehouse_table,
                     table_properties,
-                    None,
+                    decoded_table_schema,
                 )))
             }
             NodeKind::IcebergUpdate(gen::IcebergUpdateExecNode {
@@ -1437,6 +1442,11 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 };
                 let lakehouse_table = self.try_decode_lakehouse_table(&lakehouse_table_json)?;
                 let table_properties = properties.into_iter().map(|p| (p.key, p.value)).collect();
+                let decoded_table_schema = if !table_schema_bytes.is_empty() {
+                    Some(Arc::new(try_decode_schema(&table_schema_bytes)?))
+                } else {
+                    None
+                };
                 let resolved_assignments = assignments
                     .into_iter()
                     .map(|a| {
@@ -1467,7 +1477,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     session_state,
                     lakehouse_table,
                     table_properties,
-                    None,
+                    decoded_table_schema,
                 )))
             }
             NodeKind::IcebergCompact(gen::IcebergCompactExecNode {
@@ -1476,11 +1486,16 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 schema,
                 lakehouse_table_json,
                 properties,
-                table_schema: _,
+                table_schema: table_schema_bytes,
             }) => {
                 let _schema = Arc::new(try_decode_schema(&schema)?);
                 let lakehouse_table = self.try_decode_lakehouse_table(&lakehouse_table_json)?;
                 let table_properties = properties.into_iter().map(|p| (p.key, p.value)).collect();
+                let decoded_table_schema = if !table_schema_bytes.is_empty() {
+                    Some(Arc::new(try_decode_schema(&table_schema_bytes)?))
+                } else {
+                    None
+                };
                 let session_state =
                     datafusion::execution::session_state::SessionStateBuilder::new()
                         .with_config(ctx.session_config().clone())
@@ -1493,7 +1508,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     session_state,
                     lakehouse_table,
                     table_properties,
-                    None,
+                    decoded_table_schema,
                 )))
             }
             _ => plan_err!("unsupported physical plan node: {node_kind:?}"),
@@ -2301,7 +2316,11 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 schema,
                 lakehouse_table_json,
                 properties,
-                table_schema: vec![],
+                table_schema: compact_exec
+                    .table_schema()
+                    .map(|s| try_encode_schema(s.as_ref()))
+                    .transpose()?
+                    .unwrap_or_default(),
             })
         } else {
             return plan_err!("unsupported physical plan node: {node:?}");
@@ -6120,8 +6139,25 @@ mod tests {
         );
         let codec = RemoteExecutionCodec;
         let mut buf = vec![];
-        let _ = codec.try_encode(Arc::new(compact_exec), &mut buf);
+        codec.try_encode(Arc::new(compact_exec), &mut buf).unwrap();
         assert!(!buf.is_empty(), "codec encoding should produce output");
+
+        // Decode protobuf and verify table_schema is preserved
+        use prost::Message;
+        let plan_node = gen::ExtendedPhysicalPlanNode::decode(buf.as_slice()).unwrap();
+        match plan_node.node_kind.unwrap() {
+            gen::extended_physical_plan_node::NodeKind::IcebergCompact(n) => {
+                assert!(
+                    !n.table_schema.is_empty(),
+                    "table_schema must be encoded into protobuf bytes"
+                );
+                let decoded = try_decode_schema(&n.table_schema).unwrap();
+                assert_eq!(decoded.fields().len(), 2);
+                assert_eq!(decoded.field(0).data_type(), &DataType::Int32);
+                assert_eq!(decoded.field(1).data_type(), &DataType::Date32);
+            }
+            other => panic!("expected IcebergCompact, got {other:?}"),
+        }
     }
 
     #[test]
@@ -6305,7 +6341,7 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
             Field::new("score", DataType::Float64, true),
         ]));
-        let table_schema = Some(schema);
+        let table_schema = Some(schema.clone());
         let condition = Some(ExprWithSource {
             expr: col("event_date").eq(lit("2024-01-15")),
             source: Some("event_date = '2024-01-15'".to_string()),
@@ -6320,12 +6356,25 @@ mod tests {
         );
         let codec = RemoteExecutionCodec;
         let mut buf = vec![];
-        let cloned = delete_exec.schema();
-        let _ = codec.try_encode(Arc::new(delete_exec), &mut buf);
-        // Encoding should succeed without "unsupported physical plan node"
+        codec.try_encode(Arc::new(delete_exec), &mut buf).unwrap();
         assert!(!buf.is_empty(), "codec encoding should produce output");
-        // Decoding needs a TaskContext which is not available in simple unit tests,
-        // but the encoding succeeded which is the part that often fails.
+
+        // Decode protobuf and verify table_schema is preserved
+        use prost::Message;
+        let plan_node = gen::ExtendedPhysicalPlanNode::decode(buf.as_slice()).unwrap();
+        match plan_node.node_kind.unwrap() {
+            gen::extended_physical_plan_node::NodeKind::IcebergDelete(n) => {
+                assert!(
+                    !n.table_schema.is_empty(),
+                    "table_schema must be encoded into protobuf bytes"
+                );
+                let decoded = try_decode_schema(&n.table_schema).unwrap();
+                assert_eq!(decoded.fields().len(), 4);
+                assert_eq!(decoded.field(1).data_type(), &DataType::Date32);
+                assert_eq!(decoded.field(2).data_type(), &DataType::Utf8);
+            }
+            other => panic!("expected IcebergDelete, got {other:?}"),
+        }
     }
 
     #[test]
@@ -6336,7 +6385,7 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
             Field::new("score", DataType::Float64, true),
         ]));
-        let table_schema = Some(schema);
+        let table_schema = Some(schema.clone());
         let condition = Some(ExprWithSource {
             expr: col("name").eq(lit("alice")),
             source: Some("name = 'alice'".to_string()),
@@ -6358,7 +6407,24 @@ mod tests {
         );
         let codec = RemoteExecutionCodec;
         let mut buf = vec![];
-        let _ = codec.try_encode(Arc::new(update_exec), &mut buf);
+        codec.try_encode(Arc::new(update_exec), &mut buf).unwrap();
         assert!(!buf.is_empty(), "codec encoding should produce output");
+
+        // Decode protobuf and verify table_schema is preserved
+        use prost::Message;
+        let plan_node = gen::ExtendedPhysicalPlanNode::decode(buf.as_slice()).unwrap();
+        match plan_node.node_kind.unwrap() {
+            gen::extended_physical_plan_node::NodeKind::IcebergUpdate(n) => {
+                assert!(
+                    !n.table_schema.is_empty(),
+                    "table_schema must be encoded into protobuf bytes"
+                );
+                let decoded = try_decode_schema(&n.table_schema).unwrap();
+                assert_eq!(decoded.fields().len(), 4);
+                assert_eq!(decoded.field(1).data_type(), &DataType::Date32);
+                assert_eq!(decoded.field(3).data_type(), &DataType::Float64);
+            }
+            other => panic!("expected IcebergUpdate, got {other:?}"),
+        }
     }
 }

@@ -229,9 +229,10 @@ impl ExecutionPlan for IcebergDeleteExec {
 
             // Rewrite files that might match the predicate
             let mut rewritten_data_files: Vec<DataFile> = Vec::new();
+            let mut total_deleted_rows: u64 = 0;
             for df in &files_to_rewrite {
                 if let Some(ref condition) = condition {
-                    let rewritten = Self::rewrite_data_file(
+                    let (rewritten, deleted) = Self::rewrite_data_file(
                         &store_ctx,
                         df,
                         &condition.expr,
@@ -239,6 +240,7 @@ impl ExecutionPlan for IcebergDeleteExec {
                         &session_state,
                     )
                     .await?;
+                    total_deleted_rows += deleted;
                     rewritten_data_files.push(rewritten);
                 }
             }
@@ -332,7 +334,7 @@ impl ExecutionPlan for IcebergDeleteExec {
                 .await
                 {
                     Ok(CommitResult::Committed { .. }) => {
-                        let array = Arc::new(UInt64Array::from(vec![0u64]));
+                        let array = Arc::new(UInt64Array::from(vec![total_deleted_rows]));
                         let batch = RecordBatch::try_new(schema, vec![array])
                             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                         return Ok(batch);
@@ -406,7 +408,7 @@ impl IcebergDeleteExec {
         condition: &Expr,
         _arrow_schema: &SchemaRef,
         session_state: &datafusion::execution::SessionState,
-    ) -> Result<DataFile> {
+    ) -> Result<(DataFile, u64)> {
         let (store_ref, resolved_path) = store_ctx
             .resolve(&data_file.file_path)
             .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
@@ -443,11 +445,15 @@ impl IcebergDeleteExec {
 
         // Read all batches and filter
         let mut filtered_batches: Vec<RecordBatch> = Vec::new();
+        let mut total_original_rows: u64 = 0;
+        let mut total_kept_rows: u64 = 0;
         let mut stream = std::pin::pin!(stream);
         use futures::StreamExt;
         while let Some(batch_result) = stream.next().await {
             let batch = batch_result
                 .map_err(|e| DataFusionError::Execution(format!("Parquet read: {e}")))?;
+            let original_rows = batch.num_rows();
+            total_original_rows += original_rows as u64;
             let mask = physical_expr
                 .evaluate(&batch)
                 .map_err(|e| DataFusionError::Execution(format!("Filter eval: {e}")))?
@@ -464,14 +470,19 @@ impl IcebergDeleteExec {
             let filtered = filter_record_batch(&batch, mask)
                 .map_err(|e| DataFusionError::Execution(format!("Filter batch: {e}")))?;
 
+            let kept = filtered.num_rows() as u64;
+            total_kept_rows += kept;
+
             if filtered.num_rows() > 0 {
                 filtered_batches.push(filtered);
             }
         }
 
+        let deleted_rows = total_original_rows - total_kept_rows;
+
         // If all rows were deleted, skip writing
         if filtered_batches.is_empty() {
-            return Ok(data_file.clone());
+            return Ok((data_file.clone(), deleted_rows));
         }
 
         // Write filtered data as new Parquet file
@@ -544,6 +555,171 @@ impl IcebergDeleteExec {
             content_size_in_bytes: None,
         };
 
-        Ok(rewritten_file)
+        Ok((rewritten_file, deleted_rows))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{BooleanArray, Int32Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::common::ToDFSchema;
+    use datafusion::execution::session_state::SessionStateBuilder;
+    use datafusion::logical_expr::{col, lit, Expr};
+
+    #[test]
+    fn test_delete_count_matching_rows() {
+        // Create a batch: id=[1,2,3,4,5], condition matches id>2 → 3 rows match
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
+        )
+        .unwrap();
+        let total_original = batch.num_rows();
+
+        // Build NOT(condition): condition is "id > 2", NOT means "keep rows where id <= 2"
+        let condition = col("id").gt(lit(3i32));
+        let negated = Expr::Not(Box::new(condition));
+
+        let session_state = SessionStateBuilder::new().with_default_features().build();
+        let df_schema = schema.clone().to_dfschema().unwrap();
+        let physical_expr = session_state
+            .create_physical_expr(negated, &df_schema)
+            .unwrap();
+
+        let mask = physical_expr
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let bool_mask = mask.as_any().downcast_ref::<BooleanArray>().unwrap();
+
+        let kept_batch =
+            datafusion::arrow::compute::filter_record_batch(&batch, bool_mask).unwrap();
+        let total_kept = kept_batch.num_rows();
+        let deleted = total_original - total_kept;
+
+        assert_eq!(total_original, 5);
+        assert_eq!(deleted, 2, "id=4,5 should match condition id>3");
+        assert_eq!(total_kept, 3, "id=1,2,3 should not match id>3");
+    }
+
+    #[test]
+    fn test_delete_count_all_rows_match() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        // Condition matches ALL rows: id > 0 means NOT(id > 0) keeps nothing
+        let condition = col("id").gt(lit(0i32));
+        let negated = Expr::Not(Box::new(condition));
+
+        let session_state = SessionStateBuilder::new().with_default_features().build();
+        let df_schema = schema.clone().to_dfschema().unwrap();
+        let physical_expr = session_state
+            .create_physical_expr(negated, &df_schema)
+            .unwrap();
+
+        let mask = physical_expr
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let bool_mask = mask.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let kept_batch =
+            datafusion::arrow::compute::filter_record_batch(&batch, bool_mask).unwrap();
+
+        assert_eq!(kept_batch.num_rows(), 0, "all rows should be deleted");
+        assert_eq!(batch.num_rows() - kept_batch.num_rows(), 3);
+    }
+
+    #[test]
+    fn test_delete_count_no_rows_match() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        // Condition matches NO rows: id > 100 means NOT(id > 100) keeps all
+        let condition = col("id").gt(lit(100i32));
+        let negated = Expr::Not(Box::new(condition));
+
+        let session_state = SessionStateBuilder::new().with_default_features().build();
+        let df_schema = schema.clone().to_dfschema().unwrap();
+        let physical_expr = session_state
+            .create_physical_expr(negated, &df_schema)
+            .unwrap();
+
+        let mask = physical_expr
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let bool_mask = mask.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let kept_batch =
+            datafusion::arrow::compute::filter_record_batch(&batch, bool_mask).unwrap();
+
+        assert_eq!(kept_batch.num_rows(), 3, "no rows should be deleted");
+        assert_eq!(batch.num_rows() - kept_batch.num_rows(), 0);
+    }
+
+    #[test]
+    fn test_delete_count_date_condition() {
+        use datafusion::arrow::array::Date32Array;
+        use datafusion::arrow::datatypes::DataType as ArrowDataType;
+        use datafusion::common::ScalarValue;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_date", ArrowDataType::Date32, true),
+            Field::new("name", ArrowDataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Date32Array::from(vec![
+                    Some(19747), // 2024-01-15
+                    Some(19747), // 2024-01-15
+                    Some(19748), // 2024-01-16
+                    Some(19749), // 2024-01-17
+                ])),
+                Arc::new(StringArray::from(vec!["alice", "bob", "charlie", "dave"])),
+            ],
+        )
+        .unwrap();
+
+        let session_state = SessionStateBuilder::new().with_default_features().build();
+        let df_schema = schema.clone().to_dfschema().unwrap();
+
+        let condition = col("event_date").eq(Expr::Literal(ScalarValue::Date32(Some(19747)), None));
+        let negated = Expr::Not(Box::new(condition));
+
+        let physical_expr = session_state
+            .create_physical_expr(negated, &df_schema)
+            .unwrap();
+
+        let mask = physical_expr
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let bool_mask = mask.as_any().downcast_ref::<BooleanArray>().unwrap();
+        let kept_batch =
+            datafusion::arrow::compute::filter_record_batch(&batch, bool_mask).unwrap();
+
+        let deleted = batch.num_rows() - kept_batch.num_rows();
+        assert_eq!(
+            deleted, 2,
+            "alice and bob should be deleted (event_date = 2024-01-15)"
+        );
+        assert_eq!(kept_batch.num_rows(), 2, "charlie and dave remain");
     }
 }

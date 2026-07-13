@@ -233,9 +233,10 @@ impl ExecutionPlan for IcebergUpdateExec {
 
             // Rewrite files applying SET expressions
             let mut rewritten_data_files: Vec<DataFile> = Vec::new();
+            let mut total_updated_rows: u64 = 0;
             for df in &files_to_rewrite {
                 if let Some(ref cond) = condition {
-                    let rewritten = Self::rewrite_and_update_file(
+                    let (rewritten, updated) = Self::rewrite_and_update_file(
                         &store_ctx,
                         df,
                         &cond.expr,
@@ -244,6 +245,7 @@ impl ExecutionPlan for IcebergUpdateExec {
                         &session_state,
                     )
                     .await?;
+                    total_updated_rows += updated;
                     rewritten_data_files.push(rewritten);
                 }
             }
@@ -337,7 +339,7 @@ impl ExecutionPlan for IcebergUpdateExec {
                 .await
                 {
                     Ok(CommitResult::Committed { .. }) => {
-                        let array = Arc::new(UInt64Array::from(vec![0u64]));
+                        let array = Arc::new(UInt64Array::from(vec![total_updated_rows]));
                         let batch = RecordBatch::try_new(schema, vec![array])
                             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
                         return Ok(batch);
@@ -412,7 +414,7 @@ impl IcebergUpdateExec {
         assignments: &[(String, ExprWithSource)],
         _arrow_schema: &SchemaRef,
         session_state: &SessionState,
-    ) -> Result<DataFile> {
+    ) -> Result<(DataFile, u64)> {
         // TODO: Implement full SET expression application on matching rows
         // For now, this is a stub — reads the file and writes it back unchanged
         let (store_ref, resolved_path) = store_ctx
@@ -466,6 +468,7 @@ impl IcebergUpdateExec {
 
         // Read all batches and apply SET expressions
         let mut updated_batches: Vec<RecordBatch> = Vec::new();
+        let mut total_matching_rows: u64 = 0;
         let mut stream = std::pin::pin!(stream);
         use futures::StreamExt;
         while let Some(batch_result) = stream.next().await {
@@ -489,10 +492,12 @@ impl IcebergUpdateExec {
                 })?;
 
             // If no rows match the condition, keep batch unchanged
-            if decision_mask.true_count() == 0 {
+            let matching = decision_mask.true_count() as u64;
+            if matching == 0 {
                 updated_batches.push(batch);
                 continue;
             }
+            total_matching_rows += matching;
 
             // Apply each assignment: replace column values for matching rows
             let mut columns: Vec<datafusion::arrow::array::ArrayRef> = batch.columns().to_vec();
@@ -535,7 +540,7 @@ impl IcebergUpdateExec {
         }
 
         if updated_batches.is_empty() {
-            return Ok(data_file.clone());
+            return Ok((data_file.clone(), total_matching_rows));
         }
 
         // Write updated data as new Parquet file
@@ -606,6 +611,104 @@ impl IcebergUpdateExec {
             content_size_in_bytes: None,
         };
 
-        Ok(rewritten_file)
+        Ok((rewritten_file, total_matching_rows))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{BooleanArray, Int32Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::common::ToDFSchema;
+    use datafusion::execution::session_state::SessionStateBuilder;
+    use datafusion::logical_expr::{col, lit, Expr};
+
+    fn count_matching_rows(batch: &RecordBatch, condition: Expr) -> usize {
+        let session_state = SessionStateBuilder::new().with_default_features().build();
+        let df_schema = batch.schema().to_dfschema().unwrap();
+        let physical_expr = session_state
+            .create_physical_expr(condition, &df_schema)
+            .unwrap();
+        let mask = physical_expr
+            .evaluate(batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let bool_mask = mask.as_any().downcast_ref::<BooleanArray>().unwrap();
+        bool_mask.true_count()
+    }
+
+    #[test]
+    fn test_update_count_matching_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5]))],
+        )
+        .unwrap();
+
+        let matching = count_matching_rows(&batch, col("id").gt(lit(3i32)));
+        assert_eq!(matching, 2, "id=4,5 should match id>3");
+    }
+
+    #[test]
+    fn test_update_count_all_rows_match() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let matching = count_matching_rows(&batch, col("id").gt(lit(0i32)));
+        assert_eq!(matching, 3);
+    }
+
+    #[test]
+    fn test_update_count_no_rows_match() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let matching = count_matching_rows(&batch, col("id").gt(lit(100i32)));
+        assert_eq!(matching, 0);
+    }
+
+    #[test]
+    fn test_update_count_date_condition() {
+        use datafusion::arrow::array::Date32Array;
+        use datafusion::arrow::datatypes::DataType as ArrowDataType;
+        use datafusion::common::ScalarValue;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_date", ArrowDataType::Date32, true),
+            Field::new("name", ArrowDataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Date32Array::from(vec![
+                    Some(19747),
+                    Some(19747),
+                    Some(19748),
+                    Some(19749),
+                ])),
+                Arc::new(StringArray::from(vec!["alice", "bob", "charlie", "dave"])),
+            ],
+        )
+        .unwrap();
+
+        let condition = col("event_date").eq(Expr::Literal(ScalarValue::Date32(Some(19747)), None));
+        let matching = count_matching_rows(&batch, condition);
+        assert_eq!(
+            matching, 2,
+            "alice and bob should match event_date = 2024-01-15"
+        );
     }
 }

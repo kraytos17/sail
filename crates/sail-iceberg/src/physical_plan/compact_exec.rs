@@ -174,7 +174,7 @@ impl ExecutionPlan for IcebergCompactExec {
                 .map_err(|e| DataFusionError::Plan(format!("Invalid URL: {e}")))?;
             let object_store = get_object_store_from_context(&context, &table_url_parsed)?;
 
-            run_compaction(
+            let num_files = run_compaction(
                 &table_url_parsed,
                 object_store,
                 target_file_size,
@@ -185,7 +185,7 @@ impl ExecutionPlan for IcebergCompactExec {
             )
             .await?;
 
-            let array = Arc::new(UInt64Array::from(vec![0u64]));
+            let array = Arc::new(UInt64Array::from(vec![num_files]));
             let batch = RecordBatch::try_new(schema, vec![array])
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
             Ok(batch)
@@ -200,7 +200,7 @@ impl ExecutionPlan for IcebergCompactExec {
 }
 
 /// Run table compaction on the specified Iceberg table.
-/// Returns Ok(()) on success.
+/// Returns the number of small files that were compacted.
 pub(crate) async fn run_compaction(
     table_url: &url::Url,
     object_store: Arc<dyn object_store::ObjectStore>,
@@ -209,7 +209,7 @@ pub(crate) async fn run_compaction(
     context: Option<&Arc<TaskContext>>,
     lakehouse_table: Option<&LakehouseExecutionContext>,
     table_properties: &[(String, String)],
-) -> Result<()> {
+) -> Result<u64> {
     let store_ctx = StoreContext::new(object_store.clone(), table_url)?;
 
     let latest_meta = find_latest_metadata_file(&object_store, table_url).await?;
@@ -262,9 +262,10 @@ pub(crate) async fn run_compaction(
     }
 
     if small_files.is_empty() {
-        return Ok(());
+        return Ok(0u64);
     }
 
+    let num_small_files = small_files.len() as u64;
     let batches =
         IcebergCompactExec::bin_pack_files(&small_files, target_file_size, &partition_spec);
 
@@ -367,7 +368,7 @@ pub(crate) async fn run_compaction(
         .await
         {
             Ok(CommitResult::Committed { .. }) => {
-                return Ok(());
+                return Ok(num_small_files);
             }
             Err(e) => {
                 if attempt >= MAX_COMMIT_RETRIES {

@@ -116,6 +116,7 @@ impl IcebergTableFormat {
             &table_properties,
         )
         .await
+        .map(|_| ())
     }
 }
 
