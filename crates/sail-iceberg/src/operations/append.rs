@@ -115,7 +115,15 @@ impl TransactionAction for FastAppendAction {
         snapshot_producer.validate_added_data_files(&self.added_data_files)?;
 
         if self.check_duplicate {
-            // TODO: validate duplicate files later
+            let mut seen = std::collections::HashSet::new();
+            for file in &self.added_data_files {
+                if !seen.insert(&file.file_path) {
+                    return Err(format!(
+                        "Duplicate data file path in append: '{}'",
+                        file.file_path
+                    ));
+                }
+            }
         }
 
         struct FastAppendOperation;

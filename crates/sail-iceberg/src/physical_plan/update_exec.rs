@@ -437,8 +437,6 @@ impl IcebergUpdateExec {
         _arrow_schema: &SchemaRef,
         session_state: &SessionState,
     ) -> Result<(DataFile, u64)> {
-        // TODO: Implement full SET expression application on matching rows
-        // For now, this is a stub — reads the file and writes it back unchanged
         let (store_ref, resolved_path) = store_ctx
             .resolve(&data_file.file_path)
             .map_err(|e| DataFusionError::Execution(format!("{e}")))?;

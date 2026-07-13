@@ -88,8 +88,24 @@ impl<'a> SnapshotProducer<'a> {
         self
     }
 
-    pub fn validate_added_data_files(&self, _files: &[DataFile]) -> Result<(), String> {
-        // TODO: Implement this function to validate the added data files
+    pub fn validate_added_data_files(&self, files: &[DataFile]) -> Result<(), String> {
+        for file in files {
+            if file.file_path.is_empty() {
+                return Err("DataFile has empty file_path".to_string());
+            }
+            if file.record_count == 0 {
+                return Err(format!(
+                    "DataFile '{}' has zero record_count",
+                    file.file_path
+                ));
+            }
+            if file.file_size_in_bytes == 0 {
+                return Err(format!(
+                    "DataFile '{}' has zero file_size_in_bytes",
+                    file.file_path
+                ));
+            }
+        }
         Ok(())
     }
 
