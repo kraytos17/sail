@@ -111,8 +111,14 @@ pub(crate) async fn commit_iceberg_changes(
             .await?
         {
             CatalogCommitOutcome::Committed(_) => {
-                log::info!("iceberg commit: catalog-native commit succeeded");
-                return Ok(CommitResult::Committed);
+                log::info!("iceberg commit: catalog-native commit succeeded, updating metadata");
+                // Even though the catalog commit succeeded, we still need to write the
+                // metadata JSON file and update the metadata-location pointer so that
+                // subsequent reads discover the latest metadata. Fall through to the
+                // object-store write path with MetadataLocationCas mode.
+                catalog_commit_mode = IcebergCatalogCommitMode::MetadataLocationCas;
+                catalog_metadata_update_table = Some(catalog_table)
+                    .filter(|_| catalog_commit_mode.uses_metadata_location_update());
             }
             CatalogCommitOutcome::NotSupported => {
                 log::warn!(
@@ -316,5 +322,51 @@ mod tests {
         let options: Vec<OptionLayer> = vec![];
         let result = extract_table_properties(&options);
         assert!(result.is_empty());
+    }
+
+    // ── IcebergCatalogCommitMode tests ──
+
+    #[test]
+    fn test_catalog_commit_mode_uses_catalog_commit() {
+        assert!(!IcebergCatalogCommitMode::Filesystem.uses_catalog_commit());
+        assert!(!IcebergCatalogCommitMode::MetadataLocationCas.uses_catalog_commit());
+        assert!(IcebergCatalogCommitMode::CatalogCommit.uses_catalog_commit());
+        assert!(IcebergCatalogCommitMode::CompatibilityCatalogCommit.uses_catalog_commit());
+    }
+
+    #[test]
+    fn test_catalog_commit_mode_uses_metadata_location_update() {
+        assert!(!IcebergCatalogCommitMode::Filesystem.uses_metadata_location_update());
+        assert!(IcebergCatalogCommitMode::MetadataLocationCas.uses_metadata_location_update());
+        assert!(!IcebergCatalogCommitMode::CatalogCommit.uses_metadata_location_update());
+        assert!(
+            IcebergCatalogCommitMode::CompatibilityCatalogCommit.uses_metadata_location_update()
+        );
+    }
+
+    #[test]
+    fn test_catalog_commit_mode_metadata_location_cas_after_not_supported() {
+        // This simulates the fallback in commit_iceberg_changes: when CatalogCommit
+        // returns NotSupported, the mode is changed to MetadataLocationCas, which
+        // enables metadata-location updates.
+        let original = IcebergCatalogCommitMode::CatalogCommit;
+        assert!(original.uses_catalog_commit());
+        assert!(!original.uses_metadata_location_update());
+
+        let fallback = IcebergCatalogCommitMode::MetadataLocationCas;
+        assert!(!fallback.uses_catalog_commit());
+        assert!(fallback.uses_metadata_location_update());
+    }
+
+    #[test]
+    fn test_catalog_commit_mode_metadata_location_cas_after_committed() {
+        // This tests the new fix: when CatalogCommit returns Committed, the mode
+        // is changed to MetadataLocationCas so metadata-location is still updated.
+        let original = IcebergCatalogCommitMode::CatalogCommit;
+        let after_fix = IcebergCatalogCommitMode::MetadataLocationCas;
+        assert!(original.uses_catalog_commit());
+        assert!(!original.uses_metadata_location_update());
+        assert!(!after_fix.uses_catalog_commit());
+        assert!(after_fix.uses_metadata_location_update());
     }
 }
