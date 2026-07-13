@@ -17,9 +17,10 @@ use datafusion::catalog::Session;
 use datafusion::common::Result;
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
 use sail_common_datafusion::catalog::CatalogPartitionField;
 use sail_common_datafusion::datasource::PhysicalSinkMode;
 use url::Url;
@@ -139,8 +140,20 @@ impl<'a> IcebergPlanBuilder<'a> {
     }
 
     fn add_writer_node(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+        // Ensure the writer receives exactly one partition. DataFusion's PhysicalOptimizer
+        // should auto-insert CoalescePartitionsExec based on required_input_distribution,
+        // but we add it explicitly to guarantee correct behavior.
+        let coalesced = if input.output_partitioning().partition_count() > 1 {
+            log::info!(
+                "iceberg writer: coalescing {} input partitions into 1",
+                input.output_partitioning().partition_count()
+            );
+            Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
+        } else {
+            input
+        };
         Ok(Arc::new(IcebergWriterExec::new(
-            input,
+            coalesced,
             self.table_config.table_url.clone(),
             self.table_config.partition_columns.clone(),
             self.sink_mode.clone(),
