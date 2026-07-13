@@ -15,12 +15,9 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::common::Result;
-use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
+use datafusion::physical_plan::ExecutionPlan;
 use sail_common_datafusion::catalog::CatalogPartitionField;
 use sail_common_datafusion::datasource::PhysicalSinkMode;
 use url::Url;
@@ -93,39 +90,11 @@ impl<'a> IcebergPlanBuilder<'a> {
         &self,
         input: Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let repartitioning = if self.table_config.partition_columns.is_empty() {
-            Partitioning::RoundRobinBatch(4)
-        } else {
-            let schema = input.schema();
-            let mut seen = std::collections::HashSet::new();
-            let partition_source_columns = self
-                .table_config
-                .partition_columns
-                .iter()
-                .filter_map(|field| {
-                    if seen.insert(field.column.clone()) {
-                        Some(field.column.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            let exprs: Vec<Arc<dyn PhysicalExpr>> = partition_source_columns
-                .iter()
-                .map(|name| {
-                    let idx = schema.index_of(name).map_err(|_| {
-                        datafusion::common::DataFusionError::Plan(format!(
-                            "Partition column '{}' not found in schema",
-                            name
-                        ))
-                    })?;
-                    Ok(Arc::new(Column::new(name, idx)) as Arc<dyn PhysicalExpr>)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Partitioning::Hash(exprs, 4)
-        };
-
-        Ok(Arc::new(RepartitionExec::try_new(input, repartitioning)?))
+        // The IcebergTableWriter handles partition routing internally via
+        // split_record_batch_by_partition. DataFusion's RepartitionExec +
+        // CoalescePartitionsExec introduces duplicate rows during the shuffle.
+        // Skip repartition entirely and feed rows sequentially.
+        Ok(input)
     }
 
     fn add_sort_node(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
@@ -140,20 +109,8 @@ impl<'a> IcebergPlanBuilder<'a> {
     }
 
     fn add_writer_node(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
-        // Ensure the writer receives exactly one partition. DataFusion's PhysicalOptimizer
-        // should auto-insert CoalescePartitionsExec based on required_input_distribution,
-        // but we add it explicitly to guarantee correct behavior.
-        let coalesced = if input.output_partitioning().partition_count() > 1 {
-            log::info!(
-                "iceberg writer: coalescing {} input partitions into 1",
-                input.output_partitioning().partition_count()
-            );
-            Arc::new(CoalescePartitionsExec::new(input)) as Arc<dyn ExecutionPlan>
-        } else {
-            input
-        };
         Ok(Arc::new(IcebergWriterExec::new(
-            coalesced,
+            input,
             self.table_config.table_url.clone(),
             self.table_config.partition_columns.clone(),
             self.sink_mode.clone(),

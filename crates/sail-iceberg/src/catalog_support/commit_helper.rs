@@ -55,7 +55,7 @@ pub(crate) async fn commit_iceberg_changes(
         .map(|t| t.catalog_table().to_vec())
         .filter(|v| !v.is_empty());
 
-    let (catalog_table_info, catalog_commit_mode) = match context {
+    let (catalog_table_info, mut catalog_commit_mode) = match context {
         Some(ctx) => {
             let info = match catalog_table.as_ref() {
                 Some(table) => {
@@ -64,6 +64,7 @@ pub(crate) async fn commit_iceberg_changes(
                 None => CatalogTableInfo::default(),
             };
             let mode = IcebergCatalogCommitMode::resolve(lakehouse_table, &info, table_properties);
+            log::info!("iceberg commit: resolved commit mode={mode:?}");
             (info, mode)
         }
         None => (
@@ -82,7 +83,7 @@ pub(crate) async fn commit_iceberg_changes(
     let catalog_commit_table = catalog_table
         .as_ref()
         .filter(|_| catalog_commit_mode.uses_catalog_commit());
-    let catalog_metadata_update_table = catalog_table
+    let mut catalog_metadata_update_table = catalog_table
         .as_ref()
         .filter(|_| catalog_commit_mode.uses_metadata_location_update());
     let catalog_registered_metadata_table = catalog_table
@@ -94,6 +95,7 @@ pub(crate) async fn commit_iceberg_changes(
 
     // Try catalog commit first
     if let (Some(catalog_table), Some(ctx)) = (catalog_commit_table, context) {
+        log::info!("iceberg commit: attempting catalog-native commit");
         let requirements = catalog_requirements(table_meta, &[], &action_requirements);
         let updates = action_updates.clone();
         match IcebergCatalogCommitCoordinator::new(ctx.as_ref(), catalog_table)
@@ -109,9 +111,20 @@ pub(crate) async fn commit_iceberg_changes(
             .await?
         {
             CatalogCommitOutcome::Committed(_) => {
+                log::info!("iceberg commit: catalog-native commit succeeded");
                 return Ok(CommitResult::Committed);
             }
-            CatalogCommitOutcome::NotSupported => {}
+            CatalogCommitOutcome::NotSupported => {
+                log::warn!(
+                    "iceberg commit: catalog commit not supported, falling back to object-store write"
+                );
+                // Recompute metadata update tables: when catalog commit is not supported,
+                // fall back to MetadataLocationCas so we still update the catalog's
+                // metadata-location pointer to the new metadata file.
+                catalog_commit_mode = IcebergCatalogCommitMode::MetadataLocationCas;
+                catalog_metadata_update_table = Some(catalog_table)
+                    .filter(|_| catalog_commit_mode.uses_metadata_location_update());
+            }
             CatalogCommitOutcome::Conflict => {
                 return Err(DataFusionError::Execution(
                     "Iceberg commit conflict: concurrent modification".to_string(),
@@ -220,6 +233,10 @@ pub(crate) async fn commit_iceberg_changes(
 
     // Update catalog metadata location if needed
     if let (Some(catalog_table), Some(ctx)) = (catalog_metadata_update_table, context) {
+        log::info!(
+            "iceberg commit: updating catalog metadata-location to {}",
+            new_metadata_location
+        );
         IcebergCatalogCommitCoordinator::new(ctx.as_ref(), catalog_table)
             .update_metadata_location(
                 table_properties,
@@ -227,7 +244,12 @@ pub(crate) async fn commit_iceberg_changes(
                 &new_metadata_location,
             )
             .await?;
+        log::info!("iceberg commit: catalog metadata-location updated successfully");
     } else if let (Some(catalog_table), Some(ctx)) = (catalog_registered_metadata_table, context) {
+        log::info!(
+            "iceberg commit: updating catalog metadata-location (filesystem mode) to {}",
+            new_metadata_location
+        );
         IcebergCatalogCommitCoordinator::new(ctx.as_ref(), catalog_table)
             .update_metadata_location(
                 table_properties,
@@ -235,8 +257,10 @@ pub(crate) async fn commit_iceberg_changes(
                 &new_metadata_location,
             )
             .await?;
+        log::info!("iceberg commit: catalog metadata-location updated successfully");
     }
 
+    log::info!("iceberg commit: committed successfully");
     Ok(CommitResult::Committed)
 }
 
