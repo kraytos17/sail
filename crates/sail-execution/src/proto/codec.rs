@@ -5854,6 +5854,182 @@ mod tests {
     }
 
     #[test]
+    fn test_spec_expr_not_equal() {
+        use spec::Literal;
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("id"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Int32 { value: Some(5) });
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("!="),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::NotEq,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_spec_expr_greater_equal() {
+        use spec::Literal;
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("score"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Float64 { value: Some(10.0) });
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare(">="),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::GtEq,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_spec_expr_less_equal() {
+        use spec::Literal;
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("age"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Int32 { value: Some(30) });
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("<="),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::LtEq,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_spec_expr_not_function() {
+        use spec::Literal;
+        let inner = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("=="),
+            arguments: vec![
+                spec::Expr::UnresolvedAttribute {
+                    name: spec::ObjectName::bare("id"),
+                    plan_id: None,
+                    is_metadata_column: false,
+                },
+                spec::Expr::Literal(Literal::Int32 { value: Some(5) }),
+            ],
+        };
+        let spec = spec::Expr::UnresolvedFunction(spec::UnresolvedFunction {
+            function_name: spec::ObjectName::bare("not"),
+            arguments: vec![inner],
+            named_arguments: vec![],
+            is_distinct: false,
+            is_user_defined_function: false,
+            is_internal: None,
+            ignore_nulls: None,
+            filter: None,
+            order_by: None,
+        });
+        let result = spec_expr_to_datafusion_expr(spec, &HashMap::new()).unwrap();
+        assert!(matches!(result, Expr::Not(_)));
+        if let Expr::Not(inner) = &result {
+            assert!(matches!(
+                inner.as_ref(),
+                Expr::BinaryExpr(BinaryExpr {
+                    op: Operator::Eq,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_cast_int64_via_column_types() {
+        use spec::Literal;
+        let mut col_types = HashMap::new();
+        col_types.insert(
+            "big_val".to_string(),
+            datafusion::arrow::datatypes::DataType::Int64,
+        );
+        let left = spec::Expr::UnresolvedAttribute {
+            name: spec::ObjectName::bare("big_val"),
+            plan_id: None,
+            is_metadata_column: false,
+        };
+        let right = spec::Expr::Literal(Literal::Utf8 {
+            value: Some("9223372036854775807".to_string()),
+        });
+        let spec = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("=="),
+            arguments: vec![left, right],
+        };
+        let result = spec_expr_to_datafusion_expr(spec, &col_types).unwrap();
+        assert!(matches!(
+            result,
+            Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Eq,
+                ..
+            })
+        ));
+        if let Expr::BinaryExpr(BinaryExpr { right, .. }) = &result {
+            assert!(matches!(right.as_ref(), Expr::Cast(_)));
+        }
+    }
+
+    #[test]
+    fn test_spec_expr_not_function_with_date() {
+        use spec::Literal;
+        let mut col_types = HashMap::new();
+        col_types.insert(
+            "event_date".to_string(),
+            datafusion::arrow::datatypes::DataType::Date32,
+        );
+        let inner = spec::Expr::CallFunction {
+            function_name: spec::ObjectName::bare("=="),
+            arguments: vec![
+                spec::Expr::UnresolvedAttribute {
+                    name: spec::ObjectName::bare("event_date"),
+                    plan_id: None,
+                    is_metadata_column: false,
+                },
+                spec::Expr::Literal(Literal::Utf8 {
+                    value: Some("2024-01-15".to_string()),
+                }),
+            ],
+        };
+        let spec = spec::Expr::UnresolvedFunction(spec::UnresolvedFunction {
+            function_name: spec::ObjectName::bare("not"),
+            arguments: vec![inner],
+            named_arguments: vec![],
+            is_distinct: false,
+            is_user_defined_function: false,
+            is_internal: None,
+            ignore_nulls: None,
+            filter: None,
+            order_by: None,
+        });
+        let result = spec_expr_to_datafusion_expr(spec, &col_types).unwrap();
+        assert!(matches!(result, Expr::Not(_)));
+    }
+
+    #[test]
     fn test_cast_int32_via_column_types() {
         use spec::Literal;
         let mut col_types = HashMap::new();

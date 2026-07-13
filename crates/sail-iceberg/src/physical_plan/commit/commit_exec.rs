@@ -42,9 +42,7 @@ use crate::operations::bootstrap::{
     NewTableMetadataStyle, PersistStrategy,
 };
 use crate::operations::helpers::format_version_for_schema;
-use crate::operations::{
-    SnapshotProduceOperation, SnapshotProducer, Transaction, TransactionAction,
-};
+use crate::operations::{Transaction, TransactionAction};
 use crate::physical_plan::action_schema::decode_actions_and_meta_from_batch;
 use crate::physical_plan::commit::IcebergCommitInfo;
 use crate::spec::catalog::TableUpdate;
@@ -827,13 +825,15 @@ impl ExecutionPlan for IcebergCommitExec {
                             .map_err(DataFusionError::Execution)?
                     }
                     Operation::Overwrite => {
-                        let mut producer = SnapshotProducer::new(
-                            &tx,
-                            commit_info.data_files.clone(),
-                            Some(store_ctx.clone()),
-                            Some(manifest_meta),
-                        )
-                        .with_row_lineage_start_row_id(row_lineage_start_row_id);
+                        let mut action = tx
+                            .overwrite()
+                            .with_store_context(store_ctx.clone())
+                            .with_manifest_metadata(manifest_meta)
+                            .with_row_lineage_start_row_id(row_lineage_start_row_id);
+
+                        for df in commit_info.data_files.clone().into_iter() {
+                            action.add_file(df);
+                        }
 
                         // Handle predicate overwrite: keep non-matching parent entries
                         if let Some(ref predicate_json) = commit_info.overwrite_predicate {
@@ -845,11 +845,10 @@ impl ExecutionPlan for IcebergCommitExec {
                                 &partition_spec_for_commit,
                             )
                             .await?;
-                            producer = producer.with_parent_manifest_entries(Some(kept_entries));
+                            action = action.with_parent_manifest_entries(Some(kept_entries));
                         } else if let Some(ref partition_values_json) =
                             commit_info.overwrite_partition_values
                         {
-                            // Handle partition overwrite: keep entries not matching written partitions
                             let kept_entries = Self::filter_parent_manifest_entries_by_values(
                                 &store_ctx,
                                 tx.snapshot(),
@@ -858,17 +857,11 @@ impl ExecutionPlan for IcebergCommitExec {
                                 &partition_spec_for_commit,
                             )
                             .await?;
-                            producer = producer.with_parent_manifest_entries(Some(kept_entries));
+                            action = action.with_parent_manifest_entries(Some(kept_entries));
                         }
 
-                        struct LocalOverwriteOperation;
-                        impl SnapshotProduceOperation for LocalOverwriteOperation {
-                            fn operation(&self) -> &'static str {
-                                "overwrite"
-                            }
-                        }
-                        producer
-                            .commit(LocalOverwriteOperation)
+                        Arc::new(action)
+                            .commit(&tx)
                             .await
                             .map_err(DataFusionError::Execution)?
                     }

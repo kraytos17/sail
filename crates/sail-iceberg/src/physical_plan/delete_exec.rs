@@ -304,6 +304,13 @@ impl ExecutionPlan for IcebergDeleteExec {
                     Some(store_ctx.clone()),
                     Some(manifest_meta),
                 );
+                // When truncating (no WHERE condition), discard all parent entries
+                // so the new snapshot is completely empty.
+                let producer = if condition.is_none() {
+                    producer.with_parent_manifest_entries(Some(vec![]))
+                } else {
+                    producer
+                };
 
                 struct DeleteOperation;
                 impl SnapshotProduceOperation for DeleteOperation {

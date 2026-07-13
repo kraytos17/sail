@@ -257,6 +257,12 @@ pub fn data_file_might_match(
     arrow_schema: Arc<ArrowSchema>,
     iceberg_schema: &Schema,
 ) -> Result<bool> {
+    // If no column statistics are available, assume the file might match.
+    // The DataFileWriter does not currently populate lower_bounds/upper_bounds,
+    // so without this fallback, all files would be pruned and DELETE would do nothing.
+    if file.lower_bounds().is_empty() && file.upper_bounds().is_empty() {
+        return Ok(true);
+    }
     use datafusion::common::ToDFSchema;
     let df_schema = arrow_schema.clone().to_dfschema()?;
     let physical_predicate = session.create_physical_expr(filter.clone(), &df_schema)?;

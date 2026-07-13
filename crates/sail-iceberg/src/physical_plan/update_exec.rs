@@ -229,25 +229,44 @@ impl ExecutionPlan for IcebergUpdateExec {
                         }
                     }
                 }
+            } else {
+                // UPDATE without WHERE: all rows match, rewrite all files
+                let parent_list =
+                    Self::load_manifest_list(&store_ctx, snapshot.manifest_list(), format_version)
+                        .await?;
+                for manifest_file in parent_list.entries() {
+                    let entries =
+                        Self::load_manifest_entries(&store_ctx, manifest_file, format_version)
+                            .await?;
+                    for entry in &entries {
+                        if entry.status == ManifestStatus::Deleted {
+                            continue;
+                        }
+                        files_to_rewrite.push(entry.data_file.clone());
+                    }
+                }
             }
 
             // Rewrite files applying SET expressions
             let mut rewritten_data_files: Vec<DataFile> = Vec::new();
             let mut total_updated_rows: u64 = 0;
+            let true_expr = datafusion_expr::Expr::Literal(
+                datafusion_common::ScalarValue::Boolean(Some(true)),
+                None,
+            );
+            let update_condition = condition.as_ref().map(|c| &c.expr).unwrap_or(&true_expr);
             for df in &files_to_rewrite {
-                if let Some(ref cond) = condition {
-                    let (rewritten, updated) = Self::rewrite_and_update_file(
-                        &store_ctx,
-                        df,
-                        &cond.expr,
-                        &assignments,
-                        &arrow_schema,
-                        &session_state,
-                    )
-                    .await?;
-                    total_updated_rows += updated;
-                    rewritten_data_files.push(rewritten);
-                }
+                let (rewritten, updated) = Self::rewrite_and_update_file(
+                    &store_ctx,
+                    df,
+                    update_condition,
+                    &assignments,
+                    &arrow_schema,
+                    &session_state,
+                )
+                .await?;
+                total_updated_rows += updated;
+                rewritten_data_files.push(rewritten);
             }
 
             // Build commit with retry loop
@@ -309,6 +328,12 @@ impl ExecutionPlan for IcebergUpdateExec {
                     Some(store_ctx.clone()),
                     Some(manifest_meta),
                 );
+                // UPDATE without WHERE replaces all data files; discard parent entries
+                let producer = if condition.is_none() {
+                    producer.with_parent_manifest_entries(Some(vec![]))
+                } else {
+                    producer
+                };
 
                 struct UpdateOperation;
                 impl SnapshotProduceOperation for UpdateOperation {
