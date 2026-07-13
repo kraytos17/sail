@@ -303,12 +303,9 @@ impl ExecutionPlan for IcebergUpdateExec {
                     current_table_meta.format_version,
                 );
 
-                let mut all_data_files = kept_data_files.clone();
-                all_data_files.extend(rewritten_data_files.clone());
-
                 let producer = SnapshotProducer::new(
                     &tx,
-                    all_data_files,
+                    rewritten_data_files.clone(),
                     Some(store_ctx.clone()),
                     Some(manifest_meta),
                 );

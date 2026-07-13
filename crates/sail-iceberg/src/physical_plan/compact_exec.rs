@@ -332,12 +332,9 @@ pub(crate) async fn run_compaction(
             current_table_meta.format_version,
         );
 
-        let mut all_data_files = large_files.clone();
-        all_data_files.extend(rewritten_files.clone());
-
         let producer = SnapshotProducer::new(
             &tx,
-            all_data_files,
+            rewritten_files.clone(),
             Some(store_ctx.clone()),
             Some(manifest_meta),
         );
