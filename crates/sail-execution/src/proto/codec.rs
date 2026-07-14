@@ -2236,7 +2236,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
             let condition_source = delete_exec
                 .condition()
                 .as_ref()
-                .and_then(|c| c.source.clone())
+                .and_then(|c| c.source.clone().or_else(|| Some(format!("{}", c.expr))))
                 .unwrap_or_default();
             let lakehouse_table_json =
                 self.try_encode_lakehouse_table(delete_exec.lakehouse_table())?;
@@ -2265,7 +2265,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
             let condition_source = update_exec
                 .condition()
                 .as_ref()
-                .and_then(|c| c.source.clone())
+                .and_then(|c| c.source.clone().or_else(|| Some(format!("{}", c.expr))))
                 .unwrap_or_default();
             let lakehouse_table_json =
                 self.try_encode_lakehouse_table(update_exec.lakehouse_table())?;
@@ -2282,7 +2282,11 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 .iter()
                 .map(|(col, expr)| gen::AssignmentNode {
                     column: col.clone(),
-                    expr_source: expr.source.clone().unwrap_or_default(),
+                    expr_source: expr
+                        .source
+                        .clone()
+                        .or_else(|| Some(format!("{}", expr.expr)))
+                        .unwrap_or_default(),
                 })
                 .collect();
             NodeKind::IcebergUpdate(gen::IcebergUpdateExecNode {
@@ -6601,6 +6605,89 @@ mod tests {
                 assert_eq!(decoded.field(3).data_type(), &DataType::Float64);
             }
             other => panic!("expected IcebergUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_iceberg_update_codec_encode_without_source() {
+        // When source is None, the codec should fall back to format!("{}", expr)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("score", DataType::Float64, true),
+        ]));
+        let table_schema = Some(schema);
+        let condition = Some(ExprWithSource {
+            expr: col("id").gt(lit(5i32)),
+            source: None,
+        });
+        let update_exec = IcebergUpdateExec::new(
+            "s3://bucket/table".to_string(),
+            vec![(
+                "score".to_string(),
+                ExprWithSource {
+                    expr: lit(99.0),
+                    source: None,
+                },
+            )],
+            condition,
+            SessionStateBuilder::new().with_default_features().build(),
+            None,
+            vec![],
+            table_schema,
+        );
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        codec.try_encode(Arc::new(update_exec), &mut buf).unwrap();
+
+        use prost::Message;
+        let plan_node = gen::ExtendedPhysicalPlanNode::decode(buf.as_slice()).unwrap();
+        match plan_node.node_kind.unwrap() {
+            gen::extended_physical_plan_node::NodeKind::IcebergUpdate(n) => {
+                assert!(
+                    !n.condition_source.is_empty(),
+                    "condition_source must be non-empty (fallback from format!)"
+                );
+                assert_eq!(n.assignments.len(), 1);
+                assert!(
+                    !n.assignments[0].expr_source.is_empty(),
+                    "expr_source must be non-empty (fallback from format!)"
+                );
+            }
+            other => panic!("expected IcebergUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_iceberg_delete_codec_encode_without_source() {
+        // When source is None, the codec should fall back to format!("{}", expr)
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table_schema = Some(schema);
+        let condition = Some(ExprWithSource {
+            expr: col("id").eq(lit(10i32)),
+            source: None,
+        });
+        let delete_exec = IcebergDeleteExec::new(
+            "s3://bucket/table".to_string(),
+            condition,
+            SessionStateBuilder::new().with_default_features().build(),
+            None,
+            vec![],
+            table_schema,
+        );
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        codec.try_encode(Arc::new(delete_exec), &mut buf).unwrap();
+
+        use prost::Message;
+        let plan_node = gen::ExtendedPhysicalPlanNode::decode(buf.as_slice()).unwrap();
+        match plan_node.node_kind.unwrap() {
+            gen::extended_physical_plan_node::NodeKind::IcebergDelete(n) => {
+                assert!(
+                    !n.condition_source.is_empty(),
+                    "condition_source must be non-empty (fallback from format!)"
+                );
+            }
+            other => panic!("expected IcebergDelete, got {other:?}"),
         }
     }
 }
