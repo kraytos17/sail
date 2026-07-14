@@ -1172,13 +1172,97 @@ impl CatalogProvider for IcebergRestCatalogProvider {
 
     async fn alter_table(
         &self,
-        _database: &Namespace,
-        _table: &str,
-        _options: AlterTableOptions,
+        database: &Namespace,
+        table: &str,
+        options: AlterTableOptions,
     ) -> CatalogResult<()> {
-        Err(CatalogError::NotSupported(
-            "alter table in Iceberg catalog".to_string(),
-        ))
+        let catalog_config = self.resolved_catalog_config().await?;
+        let client = self.client().await?;
+        let namespace = catalog_config.namespace_string(database)?;
+
+        let updates = match options {
+            AlterTableOptions::SetTableProperties { properties } => {
+                let map: std::collections::HashMap<String, String> =
+                    properties.into_iter().collect();
+                vec![crate::models::TableUpdate::SetPropertiesUpdate { updates: map }]
+            }
+            AlterTableOptions::UnsetTableProperties { keys, if_exists: _ } => {
+                vec![crate::models::TableUpdate::RemovePropertiesUpdate { removals: keys }]
+            }
+            other => {
+                return Err(CatalogError::NotSupported(format!(
+                    "Iceberg REST catalog does not support alter table operation {other:?}",
+                )));
+            }
+        };
+
+        let request = crate::models::CommitTableRequest {
+            identifier: Some(Box::new(crate::models::TableIdentifier::new(
+                Vec::<String>::from(database.clone()),
+                table.to_string(),
+            ))),
+            requirements: vec![],
+            updates,
+        };
+
+        client
+            .catalog_api_api()
+            .update_table(&namespace, table, request, catalog_config.prefix())
+            .await
+            .map_err(|e| match e {
+                apis::Error::ResponseError(apis::ResponseContent {
+                    status, content: _, ..
+                }) if status == reqwest::StatusCode::NOT_FOUND => CatalogError::NotFound(
+                    CatalogObject::Table,
+                    format!(
+                        "{}.{}",
+                        quote_namespace_if_needed(database),
+                        quote_name_if_needed(table)
+                    ),
+                ),
+                apis::Error::ResponseError(apis::ResponseContent {
+                    status, content, ..
+                }) if status == reqwest::StatusCode::CONFLICT => CatalogError::Conflict(format!(
+                    "Iceberg REST catalog alter table conflict for {}.{}: {content}",
+                    quote_namespace_if_needed(database),
+                    quote_name_if_needed(table)
+                )),
+                apis::Error::ResponseError(apis::ResponseContent {
+                    status, content, ..
+                }) if status == reqwest::StatusCode::UNAUTHORIZED => {
+                    CatalogError::Unauthorized(format!(
+                        "Iceberg REST catalog alter table unauthorized for {}.{}: {content}",
+                        quote_namespace_if_needed(database),
+                        quote_name_if_needed(table)
+                    ))
+                }
+                apis::Error::ResponseError(apis::ResponseContent {
+                    status, content, ..
+                }) if status == reqwest::StatusCode::FORBIDDEN => CatalogError::Forbidden(format!(
+                    "Iceberg REST catalog alter table forbidden for {}.{}: {content}",
+                    quote_namespace_if_needed(database),
+                    quote_name_if_needed(table)
+                )),
+                apis::Error::ResponseError(apis::ResponseContent {
+                    status, content, ..
+                }) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                    CatalogError::RateLimited(format!(
+                        "Iceberg REST catalog alter table rate limited for {}.{}: {content}",
+                        quote_namespace_if_needed(database),
+                        quote_name_if_needed(table)
+                    ))
+                }
+                apis::Error::ResponseError(apis::ResponseContent {
+                    status, content, ..
+                }) => CatalogError::External(format!(
+                    "Failed to alter table {}.{}: status {status}: {content}",
+                    quote_namespace_if_needed(database),
+                    quote_name_if_needed(table)
+                )),
+                e => CatalogError::External(format!("Failed to alter table: {e}")),
+            })?;
+
+        Ok(())
     }
 
     async fn commit_lakehouse_table(
@@ -3491,5 +3575,115 @@ mod tests {
     async fn test_get_database() {
         test_get_database_impl(None).await;
         test_get_database_impl(Some("test")).await;
+    }
+
+    // ── alter_table tests ──
+
+    fn alter_table_response() -> serde_json::Value {
+        serde_json::json!({
+            "metadata-location": "s3://bucket/table/metadata/00001-uuid.metadata.json",
+            "metadata": {
+                "format-version": 2,
+                "table-uuid": "12345678-1234-1234-1234-123456789012",
+                "location": "s3://bucket/table"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_set_properties() {
+        let ctx = TestContext::new(Some("test")).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        ctx.mock_post_json(
+            &ctx.path("/namespaces/db1/tables/table1"),
+            alter_table_response(),
+        )
+        .await;
+
+        ctx.catalog
+            .alter_table(
+                &namespace,
+                "table1",
+                AlterTableOptions::SetTableProperties {
+                    properties: vec![("key1".to_string(), "val1".to_string())],
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_unset_properties() {
+        let ctx = TestContext::new(Some("test")).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        ctx.mock_post_json(
+            &ctx.path("/namespaces/db1/tables/table1"),
+            alter_table_response(),
+        )
+        .await;
+
+        ctx.catalog
+            .alter_table(
+                &namespace,
+                "table1",
+                AlterTableOptions::UnsetTableProperties {
+                    keys: vec!["key1".to_string()],
+                    if_exists: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_not_supported() {
+        let ctx = TestContext::new(Some("test")).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        let err = ctx
+            .catalog
+            .alter_table(
+                &namespace,
+                "table1",
+                AlterTableOptions::AddColumns { columns: vec![] },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, CatalogError::NotSupported(_)));
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_conflict() {
+        let ctx = TestContext::new(Some("test")).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        Mock::given(method("POST"))
+            .and(path(&ctx.path("/namespaces/db1/tables/table1")))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": {
+                    "message": "table has been modified concurrently",
+                    "type": "Conflict",
+                    "code": 409
+                }
+            })))
+            .mount(&ctx.server)
+            .await;
+
+        let err = ctx
+            .catalog
+            .alter_table(
+                &namespace,
+                "table1",
+                AlterTableOptions::SetTableProperties {
+                    properties: vec![("key1".to_string(), "val1".to_string())],
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, CatalogError::Conflict(_)));
     }
 }

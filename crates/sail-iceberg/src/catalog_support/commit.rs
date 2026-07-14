@@ -243,13 +243,23 @@ impl<'a, C: SessionExtensionAccessor + ?Sized> IcebergCatalogCommitCoordinator<'
                 previous_metadata_location.to_string(),
             ));
         }
-        manager
+        match manager
             .alter_table(
                 self.catalog_table,
                 AlterTableOptions::SetTableProperties { properties },
             )
             .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))
+        {
+            Ok(()) => Ok(()),
+            Err(CatalogError::NotSupported(_)) => {
+                log::warn!(
+                    "iceberg commit: catalog does not support updating metadata-location; \
+                     metadata file was written to object store"
+                );
+                Ok(())
+            }
+            Err(e) => Err(DataFusionError::External(Box::new(e))),
+        }
     }
 }
 
