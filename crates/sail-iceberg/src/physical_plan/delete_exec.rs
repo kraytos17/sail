@@ -38,7 +38,9 @@ use crate::table::find_latest_metadata_file_with_catalog_fallback;
 use crate::table::metadata_loader::{load_metadata_file_bytes, metadata_file_version_from_path};
 use crate::table_format::metadata_location_from_properties;
 use crate::utils::get_object_store_from_context;
-use crate::utils::metadata::metadata_files_for_version;
+use crate::utils::metadata::{
+    get_metadata_file_timestamp, is_stale_metadata_file, metadata_files_for_version,
+};
 
 const MAX_COMMIT_RETRIES: usize = 5;
 
@@ -201,6 +203,8 @@ impl ExecutionPlan for IcebergDeleteExec {
 
             let mut kept_data_files: Vec<DataFile> = Vec::new();
             let mut files_to_rewrite: Vec<DataFile> = Vec::new();
+            let mut kept_manifest_entries: Vec<crate::spec::manifest_list::ManifestFile> =
+                Vec::new();
 
             if let Some(ref condition) = condition {
                 // DELETE with WHERE condition: use stats pruning + file rewrite
@@ -212,6 +216,7 @@ impl ExecutionPlan for IcebergDeleteExec {
                     let entries =
                         Self::load_manifest_entries(&store_ctx, manifest_file, format_version)
                             .await?;
+                    let mut manifest_has_match = false;
                     for entry in &entries {
                         if entry.status == ManifestStatus::Deleted {
                             continue;
@@ -226,9 +231,16 @@ impl ExecutionPlan for IcebergDeleteExec {
                         )?;
                         if might_match {
                             files_to_rewrite.push(df.clone());
+                            manifest_has_match = true;
                         } else {
                             kept_data_files.push(df.clone());
                         }
+                    }
+                    // Manifests that contain no matching files pass through
+                    // untouched.  Manifests that do contain matching files are
+                    // dropped — the rewritten data replaces them.
+                    if !manifest_has_match {
+                        kept_manifest_entries.push(manifest_file.clone());
                     }
                 }
             }
@@ -291,12 +303,19 @@ impl ExecutionPlan for IcebergDeleteExec {
                 let existing_for_next =
                     metadata_files_for_version(&store_ctx, next_version).await?;
                 if !existing_for_next.is_empty() {
-                    if attempt >= MAX_COMMIT_RETRIES {
-                        return Err(DataFusionError::Execution(
-                            "Iceberg DELETE commit conflict".to_string(),
-                        ));
+                    let current_ts =
+                        get_metadata_file_timestamp(&store_ctx, &current_latest).await?;
+                    let has_real_conflict = existing_for_next
+                        .iter()
+                        .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
+                    if has_real_conflict {
+                        if attempt >= MAX_COMMIT_RETRIES {
+                            return Err(DataFusionError::Execution(
+                                "Iceberg DELETE commit conflict".to_string(),
+                            ));
+                        }
+                        continue;
                     }
-                    continue;
                 }
 
                 let current_schema = current_table_meta
@@ -317,11 +336,13 @@ impl ExecutionPlan for IcebergDeleteExec {
                     Some(manifest_meta),
                 );
                 // When truncating (no WHERE condition), discard all parent entries
-                // so the new snapshot is completely empty.
+                // so the new snapshot is completely empty.  For conditional
+                // deletes, keep only manifests that have no matching data files
+                // — manifests with matches are replaced by the rewritten data.
                 let producer = if condition.is_none() {
                     producer.with_parent_manifest_entries(Some(vec![]))
                 } else {
-                    producer
+                    producer.with_parent_manifest_entries(Some(kept_manifest_entries.clone()))
                 };
 
                 struct DeleteOperation;
@@ -577,6 +598,7 @@ impl IcebergDeleteExec {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use datafusion::arrow::array::{BooleanArray, Int32Array, StringArray};
@@ -585,6 +607,9 @@ mod tests {
     use datafusion::common::ToDFSchema;
     use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::logical_expr::{col, lit, Expr};
+
+    use crate::datasource::pruning::data_file_might_match;
+    use crate::spec::{DataContentType, DataFile, DataFileFormat};
 
     #[test]
     fn test_delete_count_matching_rows() {
@@ -737,5 +762,61 @@ mod tests {
             "alice and bob should be deleted (event_date = 2024-01-15)"
         );
         assert_eq!(kept_batch.num_rows(), 2, "charlie and dave remain");
+    }
+
+    #[test]
+    fn test_data_file_might_match_no_stats() {
+        // Without lower/upper bounds, data_file_might_match conservatively
+        // returns true so no files are incorrectly pruned.
+        let file = DataFile {
+            content: DataContentType::Data,
+            file_path: "s3://bucket/f.parquet".to_string(),
+            file_format: DataFileFormat::Parquet,
+            partition: vec![],
+            record_count: 100,
+            file_size_in_bytes: 1024,
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            block_size_in_bytes: None,
+            key_metadata: None,
+            split_offsets: vec![],
+            equality_ids: vec![],
+            sort_order_id: None,
+            first_row_id: None,
+            partition_spec_id: 0,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let iceberg_schema = crate::spec::Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![Arc::new(crate::spec::types::NestedField {
+                id: 1,
+                name: "id".to_string(),
+                field_type: Box::new(crate::spec::types::Type::Primitive(
+                    crate::spec::types::PrimitiveType::Int,
+                )),
+                required: true,
+                doc: None,
+                initial_default: None,
+                write_default: None,
+            })])
+            .build()
+            .unwrap();
+        let session_state = SessionStateBuilder::new().with_default_features().build();
+        let result = data_file_might_match(
+            &session_state,
+            &file,
+            &col("id").gt(lit(100i32)),
+            arrow_schema,
+            &iceberg_schema,
+        )
+        .unwrap();
+        assert!(result, "file with no bounds should always match");
     }
 }

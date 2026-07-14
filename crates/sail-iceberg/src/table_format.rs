@@ -64,7 +64,9 @@ use crate::table::metadata_loader::{
 use crate::table::{
     find_latest_metadata_file, find_latest_metadata_file_with_catalog_fallback, Table,
 };
-use crate::utils::metadata::metadata_files_for_version;
+use crate::utils::metadata::{
+    get_metadata_file_timestamp, is_stale_metadata_file, metadata_files_for_version,
+};
 use crate::utils::partition_transform::{
     catalog_partition_field_from_iceberg, format_partition_expr, format_partition_exprs,
     iceberg_transform_from_partition_field, partition_field_name,
@@ -706,16 +708,22 @@ impl IcebergTableFormat {
             let next_version = current_version + 1;
             let existing_for_next = metadata_files_for_version(&store_ctx, next_version).await?;
             if !existing_for_next.is_empty() {
-                log::warn!(
-                    "Detected existing Iceberg metadata files for version {}: {:?}. Retrying attempt {}",
-                    next_version,
-                    existing_for_next,
-                    attempt
-                );
-                if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                    return Err(alter_table_properties_conflict_error());
+                let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+                let has_real_conflict = existing_for_next
+                    .iter()
+                    .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
+                if has_real_conflict {
+                    log::warn!(
+                        "Detected existing Iceberg metadata files for version {}: {:?}. Retrying attempt {}",
+                        next_version,
+                        existing_for_next,
+                        attempt
+                    );
+                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
+                        return Err(alter_table_properties_conflict_error());
+                    }
+                    continue;
                 }
-                continue;
             }
 
             let timestamp_ms = monotonic_timestamp_ms();
@@ -760,7 +768,11 @@ impl IcebergTableFormat {
             }
 
             let version_files = metadata_files_for_version(&store_ctx, next_version).await?;
-            let conflict_after_write = version_files.iter().any(|path| path != &new_meta_rel);
+            let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+            let conflict_after_write = version_files
+                .iter()
+                .filter(|(_, ts)| !is_stale_metadata_file(*ts, current_ts))
+                .any(|(path, _)| *path != new_meta_rel);
             if conflict_after_write {
                 log::warn!(
                     "Concurrent Iceberg metadata writes detected for version {}: {:?}. Retrying attempt {}",
@@ -853,16 +865,22 @@ impl IcebergTableFormat {
             let next_version = current_version + 1;
             let existing_for_next = metadata_files_for_version(&store_ctx, next_version).await?;
             if !existing_for_next.is_empty() {
-                log::warn!(
-                    "Detected existing Iceberg metadata files for version {}: {:?}. Retrying attempt {}",
-                    next_version,
-                    existing_for_next,
-                    attempt
-                );
-                if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                    return Err(alter_table_properties_conflict_error());
+                let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+                let has_real_conflict = existing_for_next
+                    .iter()
+                    .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
+                if has_real_conflict {
+                    log::warn!(
+                        "Detected existing Iceberg metadata files for version {}: {:?}. Retrying attempt {}",
+                        next_version,
+                        existing_for_next,
+                        attempt
+                    );
+                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
+                        return Err(alter_table_properties_conflict_error());
+                    }
+                    continue;
                 }
-                continue;
             }
 
             let timestamp_ms = monotonic_timestamp_ms();
@@ -907,7 +925,11 @@ impl IcebergTableFormat {
             }
 
             let version_files = metadata_files_for_version(&store_ctx, next_version).await?;
-            let conflict_after_write = version_files.iter().any(|path| path != &new_meta_rel);
+            let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+            let conflict_after_write = version_files
+                .iter()
+                .filter(|(_, ts)| !is_stale_metadata_file(*ts, current_ts))
+                .any(|(path, _)| *path != new_meta_rel);
             if conflict_after_write {
                 log::warn!(
                     "Concurrent Iceberg metadata writes detected for version {}: {:?}. Retrying attempt {}",
@@ -1010,10 +1032,16 @@ impl IcebergTableFormat {
             // Same retry + write pattern as alter_table_add_columns
             let existing_for_next = metadata_files_for_version(&store_ctx, next_version).await?;
             if !existing_for_next.is_empty() {
-                if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                    return Err(alter_table_properties_conflict_error());
+                let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+                let has_real_conflict = existing_for_next
+                    .iter()
+                    .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
+                if has_real_conflict {
+                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
+                        return Err(alter_table_properties_conflict_error());
+                    }
+                    continue;
                 }
-                continue;
             }
 
             let timestamp_ms = monotonic_timestamp_ms();
@@ -1126,10 +1154,16 @@ impl IcebergTableFormat {
             let next_version = current_version + 1;
             let existing_for_next = metadata_files_for_version(&store_ctx, next_version).await?;
             if !existing_for_next.is_empty() {
-                if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                    return Err(alter_table_properties_conflict_error());
+                let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+                let has_real_conflict = existing_for_next
+                    .iter()
+                    .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
+                if has_real_conflict {
+                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
+                        return Err(alter_table_properties_conflict_error());
+                    }
+                    continue;
                 }
-                continue;
             }
             let timestamp_ms = monotonic_timestamp_ms();
             table_meta.last_updated_ms = timestamp_ms;
@@ -1238,10 +1272,16 @@ impl IcebergTableFormat {
             let next_version = current_version + 1;
             let existing_for_next = metadata_files_for_version(&store_ctx, next_version).await?;
             if !existing_for_next.is_empty() {
-                if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                    return Err(alter_table_properties_conflict_error());
+                let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+                let has_real_conflict = existing_for_next
+                    .iter()
+                    .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
+                if has_real_conflict {
+                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
+                        return Err(alter_table_properties_conflict_error());
+                    }
+                    continue;
                 }
-                continue;
             }
             let timestamp_ms = monotonic_timestamp_ms();
             table_meta.last_updated_ms = timestamp_ms;
@@ -1368,10 +1408,16 @@ impl IcebergTableFormat {
             let next_version = current_version + 1;
             let existing_for_next = metadata_files_for_version(&store_ctx, next_version).await?;
             if !existing_for_next.is_empty() {
-                if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                    return Err(alter_table_properties_conflict_error());
+                let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+                let has_real_conflict = existing_for_next
+                    .iter()
+                    .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
+                if has_real_conflict {
+                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
+                        return Err(alter_table_properties_conflict_error());
+                    }
+                    continue;
                 }
-                continue;
             }
             let timestamp_ms = monotonic_timestamp_ms();
             table_meta.last_updated_ms = timestamp_ms;

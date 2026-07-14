@@ -61,7 +61,9 @@ use crate::table::metadata_loader::{
 };
 use crate::table_format::metadata_location_from_properties;
 use crate::utils::get_object_store_from_context;
-use crate::utils::metadata::metadata_files_for_version;
+use crate::utils::metadata::{
+    get_metadata_file_timestamp, is_stale_metadata_file, metadata_files_for_version,
+};
 use crate::utils::timestamp::monotonic_timestamp_ms;
 const MAX_COMMIT_RETRIES: usize = 5;
 
@@ -813,16 +815,22 @@ impl ExecutionPlan for IcebergCommitExec {
                 let existing_for_next =
                     metadata_files_for_version(&store_ctx, next_version).await?;
                 if !existing_for_next.is_empty() {
-                    log::warn!(
-                        "Detected existing metadata files for version {}: {:?}. Retrying attempt {}",
-                        next_version,
-                        existing_for_next,
-                        attempt
-                    );
-                    if attempt >= MAX_COMMIT_RETRIES {
-                        return Err(commit_conflict_error());
+                    let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+                    let has_real_conflict = existing_for_next
+                        .iter()
+                        .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
+                    if has_real_conflict {
+                        log::warn!(
+                            "Detected existing metadata files for version {}: {:?}. Retrying attempt {}",
+                            next_version,
+                            existing_for_next,
+                            attempt
+                        );
+                        if attempt >= MAX_COMMIT_RETRIES {
+                            return Err(commit_conflict_error());
+                        }
+                        continue;
                     }
-                    continue;
                 }
 
                 // Build transaction and action based on operation
@@ -1055,7 +1063,11 @@ impl ExecutionPlan for IcebergCommitExec {
                     Err(e) => return Err(DataFusionError::External(Box::new(e))),
                 }
                 let version_files = metadata_files_for_version(&store_ctx, next_version).await?;
-                let conflict_after_write = version_files.iter().any(|path| path != &new_meta_rel);
+                let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+                let conflict_after_write = version_files
+                    .iter()
+                    .filter(|(_, ts)| !is_stale_metadata_file(*ts, current_ts))
+                    .any(|(path, _)| *path != new_meta_rel);
                 if conflict_after_write {
                     log::warn!(
                         "Concurrent metadata writes detected for version {}: {:?}. Retrying attempt {}",
