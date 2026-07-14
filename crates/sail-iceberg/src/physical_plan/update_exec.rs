@@ -343,18 +343,21 @@ impl ExecutionPlan for IcebergUpdateExec {
                     current_table_meta.format_version,
                 );
 
+                let all_data_files: Vec<DataFile> = kept_data_files
+                    .iter()
+                    .cloned()
+                    .chain(rewritten_data_files.iter().cloned())
+                    .collect();
+
                 let producer = SnapshotProducer::new(
                     &tx,
-                    rewritten_data_files.clone(),
+                    all_data_files,
                     Some(store_ctx.clone()),
                     Some(manifest_meta),
                 );
-                // UPDATE without WHERE replaces all data files; discard parent entries
-                let producer = if condition.is_none() {
-                    producer.with_parent_manifest_entries(Some(vec![]))
-                } else {
-                    producer
-                };
+                // Discard all parent manifest entries — the single new manifest
+                // (kept + rewritten files) replaces every old file.
+                let producer = producer.with_parent_manifest_entries(Some(vec![]));
 
                 struct UpdateOperation;
                 impl SnapshotProduceOperation for UpdateOperation {

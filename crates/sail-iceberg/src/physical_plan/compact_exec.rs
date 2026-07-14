@@ -352,12 +352,21 @@ pub(crate) async fn run_compaction(
             current_table_meta.format_version,
         );
 
+        let all_data_files: Vec<DataFile> = large_files
+            .iter()
+            .cloned()
+            .chain(rewritten_files.iter().cloned())
+            .collect();
+
         let producer = SnapshotProducer::new(
             &tx,
-            rewritten_files.clone(),
+            all_data_files,
             Some(store_ctx.clone()),
             Some(manifest_meta),
         );
+        // Discard all parent manifests — the single new manifest
+        // (large + rewritten files) replaces every old file.
+        let producer = producer.with_parent_manifest_entries(Some(vec![]));
 
         struct CompactOperation;
         impl SnapshotProduceOperation for CompactOperation {

@@ -203,8 +203,6 @@ impl ExecutionPlan for IcebergDeleteExec {
 
             let mut kept_data_files: Vec<DataFile> = Vec::new();
             let mut files_to_rewrite: Vec<DataFile> = Vec::new();
-            let mut kept_manifest_entries: Vec<crate::spec::manifest_list::ManifestFile> =
-                Vec::new();
 
             if let Some(ref condition) = condition {
                 // DELETE with WHERE condition: use stats pruning + file rewrite
@@ -216,7 +214,6 @@ impl ExecutionPlan for IcebergDeleteExec {
                     let entries =
                         Self::load_manifest_entries(&store_ctx, manifest_file, format_version)
                             .await?;
-                    let mut manifest_has_match = false;
                     for entry in &entries {
                         if entry.status == ManifestStatus::Deleted {
                             continue;
@@ -231,16 +228,9 @@ impl ExecutionPlan for IcebergDeleteExec {
                         )?;
                         if might_match {
                             files_to_rewrite.push(df.clone());
-                            manifest_has_match = true;
                         } else {
                             kept_data_files.push(df.clone());
                         }
-                    }
-                    // Manifests that contain no matching files pass through
-                    // untouched.  Manifests that do contain matching files are
-                    // dropped — the rewritten data replaces them.
-                    if !manifest_has_match {
-                        kept_manifest_entries.push(manifest_file.clone());
                     }
                 }
             }
@@ -251,7 +241,7 @@ impl ExecutionPlan for IcebergDeleteExec {
             let mut total_deleted_rows: u64 = 0;
             for df in &files_to_rewrite {
                 if let Some(ref condition) = condition {
-                    let (rewritten, deleted) = Self::rewrite_data_file(
+                    let (rewritten_opt, deleted) = Self::rewrite_data_file(
                         &store_ctx,
                         df,
                         &condition.expr,
@@ -260,7 +250,9 @@ impl ExecutionPlan for IcebergDeleteExec {
                     )
                     .await?;
                     total_deleted_rows += deleted;
-                    rewritten_data_files.push(rewritten);
+                    if let Some(rewritten) = rewritten_opt {
+                        rewritten_data_files.push(rewritten);
+                    }
                 }
             }
 
@@ -329,21 +321,23 @@ impl ExecutionPlan for IcebergDeleteExec {
                     current_table_meta.format_version,
                 );
 
+                let all_data_files: Vec<DataFile> = kept_data_files
+                    .iter()
+                    .cloned()
+                    .chain(rewritten_data_files.iter().cloned())
+                    .collect();
+
                 let producer = SnapshotProducer::new(
                     &tx,
-                    rewritten_data_files.clone(),
+                    all_data_files,
                     Some(store_ctx.clone()),
                     Some(manifest_meta),
                 );
-                // When truncating (no WHERE condition), discard all parent entries
-                // so the new snapshot is completely empty.  For conditional
-                // deletes, keep only manifests that have no matching data files
-                // — manifests with matches are replaced by the rewritten data.
-                let producer = if condition.is_none() {
-                    producer.with_parent_manifest_entries(Some(vec![]))
-                } else {
-                    producer.with_parent_manifest_entries(Some(kept_manifest_entries.clone()))
-                };
+                // Always discard all parent manifest entries — the new
+                // manifest (containing kept + rewritten files) completely
+                // replaces the old data.  For TRUNCATE (no WHERE) both
+                // vectors are empty, producing an empty snapshot.
+                let producer = producer.with_parent_manifest_entries(Some(vec![]));
 
                 struct DeleteOperation;
                 impl SnapshotProduceOperation for DeleteOperation {
@@ -445,7 +439,7 @@ impl IcebergDeleteExec {
         condition: &Expr,
         _arrow_schema: &SchemaRef,
         session_state: &datafusion::execution::SessionState,
-    ) -> Result<(DataFile, u64)> {
+    ) -> Result<(Option<DataFile>, u64)> {
         let (store_ref, resolved_path) = store_ctx
             .resolve(&data_file.file_path)
             .map_err(|e| DataFusionError::Execution(format!("{e}")))?;
@@ -517,9 +511,9 @@ impl IcebergDeleteExec {
 
         let deleted_rows = total_original_rows - total_kept_rows;
 
-        // If all rows were deleted, skip writing
+        // If all rows were deleted, skip writing — no file to add
         if filtered_batches.is_empty() {
-            return Ok((data_file.clone(), deleted_rows));
+            return Ok((None, deleted_rows));
         }
 
         // Write filtered data as new Parquet file
@@ -592,7 +586,7 @@ impl IcebergDeleteExec {
             content_size_in_bytes: None,
         };
 
-        Ok((rewritten_file, deleted_rows))
+        Ok((Some(rewritten_file), deleted_rows))
     }
 }
 
