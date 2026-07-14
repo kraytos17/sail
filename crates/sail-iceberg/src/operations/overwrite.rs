@@ -104,7 +104,6 @@ impl TransactionAction for OverwriteAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::types::values::Literal;
     use crate::spec::{DataContentType, DataFile, DataFileFormat};
 
     fn dummy_data_file(path: &str) -> DataFile {

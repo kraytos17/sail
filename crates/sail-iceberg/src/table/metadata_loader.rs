@@ -158,6 +158,14 @@ pub async fn find_latest_metadata_file(
     object_store: &Arc<dyn object_store::ObjectStore>,
     table_url: &Url,
 ) -> Result<String> {
+    find_latest_metadata_file_with_catalog_fallback(object_store, table_url, None).await
+}
+
+pub async fn find_latest_metadata_file_with_catalog_fallback(
+    object_store: &Arc<dyn object_store::ObjectStore>,
+    table_url: &Url,
+    catalog_metadata_location: Option<&str>,
+) -> Result<String> {
     use futures::TryStreamExt;
 
     log::trace!("Finding latest metadata file");
@@ -232,6 +240,24 @@ pub async fn find_latest_metadata_file(
                         &path
                     );
                     return Ok(path.clone());
+                }
+            }
+
+            // Catalog fallback: when the hint didn't resolve, prefer the metadata
+            // file that the catalog considers authoritative (avoids picking stale
+            // metadata from a previous table instance when version numbers reset).
+            if let Some(location) = catalog_metadata_location {
+                if let Some(filename) = location.rsplit('/').next() {
+                    if let Some((version, path, _)) =
+                        files.iter().rev().find(|(_, p, _)| p.ends_with(filename))
+                    {
+                        log::trace!(
+                            "find_latest_metadata_file: selected by catalog metadata location version {} path={}",
+                            version,
+                            &path
+                        );
+                        return Ok(path.clone());
+                    }
                 }
             }
 

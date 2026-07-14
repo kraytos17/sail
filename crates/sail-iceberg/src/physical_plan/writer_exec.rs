@@ -46,7 +46,7 @@ use crate::spec::partition::{
 };
 use crate::spec::schema::Schema as IcebergSchema;
 use crate::spec::{Operation, TableMetadata, TableRequirement};
-use crate::table::find_latest_metadata_file;
+use crate::table::find_latest_metadata_file_with_catalog_fallback;
 use crate::table::metadata_loader::metadata_location_to_object_path_string;
 use crate::table_format::{
     catalog_managed_iceberg_from_properties, metadata_location_from_properties,
@@ -391,14 +391,28 @@ impl ExecutionPlan for IcebergWriterExec {
                 commit_requirements,
                 variant_shredding,
             ) = if table_exists {
+                let catalog_metadata_location =
+                    metadata_location_from_properties(&options.table_properties);
                 let latest_meta =
                     if catalog_managed_iceberg_from_properties(&options.table_properties) {
                         match metadata_location_from_properties(&options.table_properties) {
                             Some(location) => metadata_location_to_object_path_string(&location)?,
-                            None => find_latest_metadata_file(&object_store, &table_url).await?,
+                            None => {
+                                find_latest_metadata_file_with_catalog_fallback(
+                                    &object_store,
+                                    &table_url,
+                                    catalog_metadata_location.as_deref(),
+                                )
+                                .await?
+                            }
                         }
                     } else {
-                        find_latest_metadata_file(&object_store, &table_url).await?
+                        find_latest_metadata_file_with_catalog_fallback(
+                            &object_store,
+                            &table_url,
+                            catalog_metadata_location.as_deref(),
+                        )
+                        .await?
                     };
                 let bytes = crate::table::metadata_loader::load_metadata_file_bytes(
                     &object_store,

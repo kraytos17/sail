@@ -327,6 +327,24 @@ impl IcebergCommitExec {
             .await
     }
 
+    async fn write_version_hint_from_metadata_location(
+        store_ctx: &StoreContext,
+        metadata_location: Option<&str>,
+    ) {
+        let Some(metadata_location) = metadata_location else {
+            return;
+        };
+        let Some(filename) = metadata_location.rsplit('/').next() else {
+            log::warn!("Could not extract filename from metadata-location: {metadata_location}");
+            return;
+        };
+        let hint_path = object_store::path::Path::from("metadata/version-hint.text");
+        let payload = object_store::PutPayload::from(Bytes::copy_from_slice(filename.as_bytes()));
+        if let Err(e) = store_ctx.prefixed.put(&hint_path, payload).await {
+            log::warn!("Failed to write version-hint.text after catalog commit: {e}");
+        }
+    }
+
     async fn update_catalog_metadata_location(
         context: &Arc<TaskContext>,
         catalog_table: &[String],
@@ -698,6 +716,11 @@ impl ExecutionPlan for IcebergCommitExec {
                                 if committed.payload().is_some() {
                                     log::trace!("Iceberg catalog commit returned a payload");
                                 }
+                                Self::write_version_hint_from_metadata_location(
+                                    &store_ctx,
+                                    committed.metadata_location(),
+                                )
+                                .await;
                                 let array =
                                     Arc::new(UInt64Array::from(vec![commit_info.row_count]));
                                 let batch = RecordBatch::try_new(schema, vec![array])?;
@@ -906,6 +929,11 @@ impl ExecutionPlan for IcebergCommitExec {
                             if committed.payload().is_some() {
                                 log::trace!("Iceberg catalog commit returned a payload");
                             }
+                            Self::write_version_hint_from_metadata_location(
+                                &store_ctx,
+                                committed.metadata_location(),
+                            )
+                            .await;
                             let array = Arc::new(UInt64Array::from(vec![commit_info.row_count]));
                             let batch = RecordBatch::try_new(schema, vec![array])?;
                             return Ok(batch);

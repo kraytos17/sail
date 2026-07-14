@@ -32,8 +32,9 @@ use crate::spec::{
     DataFile, DataFileFormat, FormatVersion, Manifest, ManifestEntry, ManifestList, ManifestStatus,
     PartitionSpec, TableMetadata,
 };
-use crate::table::find_latest_metadata_file;
+use crate::table::find_latest_metadata_file_with_catalog_fallback;
 use crate::table::metadata_loader::{load_metadata_file_bytes, metadata_file_version_from_path};
+use crate::table_format::metadata_location_from_properties;
 use crate::utils::get_object_store_from_context;
 use crate::utils::metadata::metadata_files_for_version;
 
@@ -170,13 +171,19 @@ impl ExecutionPlan for IcebergUpdateExec {
         let session_state = self.session_state.clone();
         let lakehouse_table = self.lakehouse_table.clone();
         let table_properties = self.table_properties.clone();
+        let catalog_metadata_location = metadata_location_from_properties(&table_properties);
         let future = async move {
             let table_url_parsed = url::Url::parse(&table_url)
                 .map_err(|e| DataFusionError::Plan(format!("Invalid URL: {e}")))?;
             let object_store = get_object_store_from_context(&context, &table_url_parsed)?;
             let store_ctx = StoreContext::new(object_store.clone(), &table_url_parsed)?;
 
-            let latest_meta = find_latest_metadata_file(&object_store, &table_url_parsed).await?;
+            let latest_meta = find_latest_metadata_file_with_catalog_fallback(
+                &object_store,
+                &table_url_parsed,
+                catalog_metadata_location.as_deref(),
+            )
+            .await?;
             let bytes = load_metadata_file_bytes(&object_store, &latest_meta).await?;
             let table_meta = TableMetadata::from_json(&bytes)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -276,7 +283,12 @@ impl ExecutionPlan for IcebergUpdateExec {
                 let current_latest = if attempt == 1 {
                     latest_meta.clone()
                 } else {
-                    find_latest_metadata_file(&object_store, &table_url_parsed).await?
+                    find_latest_metadata_file_with_catalog_fallback(
+                        &object_store,
+                        &table_url_parsed,
+                        catalog_metadata_location.as_deref(),
+                    )
+                    .await?
                 };
 
                 let current_bytes =

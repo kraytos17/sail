@@ -61,7 +61,9 @@ use crate::table::metadata_loader::{
     encode_metadata_file, load_metadata_file_bytes, metadata_file_extension_from_properties,
     metadata_file_version_from_path, metadata_location_to_object_path_string,
 };
-use crate::table::{find_latest_metadata_file, Table};
+use crate::table::{
+    find_latest_metadata_file, find_latest_metadata_file_with_catalog_fallback, Table,
+};
 use crate::utils::metadata::metadata_files_for_version;
 use crate::utils::partition_transform::{
     catalog_partition_field_from_iceberg, format_partition_expr, format_partition_exprs,
@@ -549,7 +551,14 @@ pub(crate) async fn plan_iceberg_write(
         Some(location) if catalog_managed_table => {
             metadata_location_to_object_path_string(location)
         }
-        _ => find_latest_metadata_file(&store, &table_url).await,
+        _ => {
+            find_latest_metadata_file_with_catalog_fallback(
+                &store,
+                &table_url,
+                metadata_location.as_deref(),
+            )
+            .await
+        }
     };
     let table_exists = exists_res.is_ok();
 

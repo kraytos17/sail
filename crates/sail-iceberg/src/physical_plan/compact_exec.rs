@@ -29,8 +29,9 @@ use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, Manifest, ManifestEntry,
     ManifestList, ManifestStatus, PartitionSpec, TableMetadata,
 };
-use crate::table::find_latest_metadata_file;
+use crate::table::find_latest_metadata_file_with_catalog_fallback;
 use crate::table::metadata_loader::{load_metadata_file_bytes, metadata_file_version_from_path};
+use crate::table_format::metadata_location_from_properties;
 use crate::utils::get_object_store_from_context;
 use crate::utils::metadata::metadata_files_for_version;
 
@@ -211,8 +212,14 @@ pub(crate) async fn run_compaction(
     table_properties: &[(String, String)],
 ) -> Result<u64> {
     let store_ctx = StoreContext::new(object_store.clone(), table_url)?;
+    let catalog_metadata_location = metadata_location_from_properties(table_properties);
 
-    let latest_meta = find_latest_metadata_file(&object_store, table_url).await?;
+    let latest_meta = find_latest_metadata_file_with_catalog_fallback(
+        &object_store,
+        table_url,
+        catalog_metadata_location.as_deref(),
+    )
+    .await?;
     let bytes = load_metadata_file_bytes(&object_store, &latest_meta).await?;
     let table_meta =
         TableMetadata::from_json(&bytes).map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -288,7 +295,12 @@ pub(crate) async fn run_compaction(
         let current_latest = if attempt == 1 {
             latest_meta.clone()
         } else {
-            find_latest_metadata_file(&object_store, table_url).await?
+            find_latest_metadata_file_with_catalog_fallback(
+                &object_store,
+                table_url,
+                catalog_metadata_location.as_deref(),
+            )
+            .await?
         };
 
         let current_bytes = load_metadata_file_bytes(&object_store, &current_latest).await?;
