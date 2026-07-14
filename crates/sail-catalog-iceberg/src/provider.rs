@@ -135,6 +135,113 @@ pub struct IcebergRestCatalogProvider {
     resolved_catalog_config: OnceCell<CatalogConfig<'static>>,
 }
 
+/// Add columns to an existing schema, returning the new schema and updated last_column_id.
+fn add_columns_to_schema(
+    schema: &crate::models::Schema,
+    columns: &[sail_catalog::provider::AddColumn],
+    last_column_id: i32,
+) -> CatalogResult<(crate::models::Schema, i32)> {
+    use sail_catalog::provider::AddColumn;
+
+    let mut new_fields: Vec<sail_iceberg::NestedFieldRef> = schema.fields.clone();
+    let mut current_id = last_column_id;
+
+    for col in columns {
+        // Only support top-level columns for now
+        if col.name.len() != 1 {
+            return Err(CatalogError::NotSupported(format!(
+                "Nested column add is not supported: {:?}",
+                col.name
+            )));
+        }
+
+        // Check for default values (not supported yet)
+        if col.default.is_some() {
+            return Err(CatalogError::NotSupported(
+                "Column default values are not supported for ADD COLUMNS".to_string(),
+            ));
+        }
+
+        let name = col.name[0].clone();
+        let field_type = arrow_type_to_iceberg(&col.data_type).map_err(|e| {
+            CatalogError::External(format!(
+                "Failed to convert column '{}' data type to Iceberg: {e}",
+                name
+            ))
+        })?;
+
+        current_id += 1;
+        let mut field = NestedField::new(current_id, name, field_type, !col.nullable);
+
+        if let Some(ref comment) = col.comment {
+            field = field.with_doc(comment);
+        }
+
+        new_fields.push(Arc::new(field));
+    }
+
+    let new_schema = crate::models::Schema {
+        r#type: crate::models::schema::Type::Struct,
+        fields: new_fields,
+        schema_id: None, // Will be assigned by the catalog
+        identifier_field_ids: schema.identifier_field_ids.clone(),
+    };
+
+    Ok((new_schema, current_id))
+}
+
+/// Drop columns from an existing schema, returning the new schema.
+fn drop_columns_from_schema(
+    schema: &crate::models::Schema,
+    names: &[String],
+    if_exists: bool,
+) -> CatalogResult<crate::models::Schema> {
+    // Build a set of column names to drop (only top-level for now)
+    let names_to_drop: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+
+    let mut new_fields: Vec<sail_iceberg::NestedFieldRef> = Vec::new();
+    let mut dropped_count = 0;
+
+    for field in &schema.fields {
+        if names_to_drop.contains(field.name.as_str()) {
+            dropped_count += 1;
+            // Skip this field (drop it)
+        } else {
+            new_fields.push(field.clone());
+        }
+    }
+
+    // Validate that all requested columns were found (unless if_exists is true)
+    if !if_exists && dropped_count != names.len() {
+        let found_names: std::collections::HashSet<&str> =
+            schema.fields.iter().map(|f| f.name.as_str()).collect();
+        let missing: Vec<&str> = names
+            .iter()
+            .filter(|name| !found_names.contains(name.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        return Err(CatalogError::InvalidArgument(format!(
+            "Column(s) not found: {:?}",
+            missing
+        )));
+    }
+
+    if new_fields.is_empty() {
+        return Err(CatalogError::InvalidArgument(
+            "Cannot drop all columns from a table".to_string(),
+        ));
+    }
+
+    let new_schema = crate::models::Schema {
+        r#type: crate::models::schema::Type::Struct,
+        fields: new_fields,
+        schema_id: None, // Will be assigned by the catalog
+        identifier_field_ids: schema.identifier_field_ids.clone(),
+    };
+
+    Ok(new_schema)
+}
+
 impl IcebergRestCatalogProvider {
     pub fn new(name: String, options: IcebergRestCatalogOptions) -> Self {
         Self {
@@ -1180,89 +1287,466 @@ impl CatalogProvider for IcebergRestCatalogProvider {
         let client = self.client().await?;
         let namespace = catalog_config.namespace_string(database)?;
 
-        let updates = match options {
+        match options {
+            AlterTableOptions::RenameTable { new_name } => {
+                // Parse new_name: last element is table name, rest is namespace
+                let (dest_namespace, dest_table) = if new_name.len() > 1 {
+                    let ns = new_name[..new_name.len() - 1].to_vec();
+                    let name = new_name.last().unwrap().clone();
+                    (ns, name)
+                } else {
+                    let name = new_name.last().cloned().ok_or_else(|| {
+                        CatalogError::InvalidArgument(
+                            "RENAME TO requires a valid table name".to_string(),
+                        )
+                    })?;
+                    (Vec::<String>::from(database.clone()), name)
+                };
+
+                let source = crate::models::TableIdentifier::new(
+                    Vec::<String>::from(database.clone()),
+                    table.to_string(),
+                );
+                let destination = crate::models::TableIdentifier::new(dest_namespace, dest_table);
+                let request = crate::models::RenameTableRequest::new(source, destination);
+
+                client
+                    .catalog_api_api()
+                    .rename_table(request, catalog_config.prefix())
+                    .await
+                    .map_err(|e| match e {
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content: _, ..
+                        }) if status == reqwest::StatusCode::NOT_FOUND => CatalogError::NotFound(
+                            CatalogObject::Table,
+                            format!(
+                                "{}.{}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ),
+                        ),
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::CONFLICT => {
+                            CatalogError::Conflict(format!(
+                                "Iceberg REST catalog rename table conflict for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::UNAUTHORIZED => {
+                            CatalogError::Unauthorized(format!(
+                                "Iceberg REST catalog rename table unauthorized for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::FORBIDDEN => {
+                            CatalogError::Forbidden(format!(
+                                "Iceberg REST catalog rename table forbidden for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                            CatalogError::RateLimited(format!(
+                                "Iceberg REST catalog rename table rate limited for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) => CatalogError::External(format!(
+                            "Failed to rename table {}.{}: status {status}: {content}",
+                            quote_namespace_if_needed(database),
+                            quote_name_if_needed(table)
+                        )),
+                        e => CatalogError::External(format!("Failed to rename table: {e}")),
+                    })?;
+
+                return Ok(());
+            }
+            AlterTableOptions::AddColumns { columns } => {
+                // Load current table metadata
+                let load_result = self.load_table_result(database, table, None).await?;
+                let metadata = &*load_result.metadata;
+
+                // Find current schema
+                let current_schema = find_by_id_or_last(
+                    metadata.schemas.as_ref(),
+                    metadata.current_schema_id,
+                    |s| s.schema_id,
+                )
+                .ok_or_else(|| {
+                    CatalogError::External("No schema found in table metadata".to_string())
+                })?;
+
+                let current_schema_id = current_schema.schema_id.unwrap_or(0);
+                let last_column_id = metadata.last_column_id.unwrap_or(0);
+
+                // Build new schema with added columns
+                let (new_schema, new_last_column_id) =
+                    add_columns_to_schema(current_schema, &columns, last_column_id)?;
+
+                let updates = vec![
+                    crate::models::TableUpdate::AddSchemaUpdate {
+                        schema: Box::new(new_schema),
+                        last_column_id: Some(new_last_column_id),
+                    },
+                    crate::models::TableUpdate::SetCurrentSchemaUpdate { schema_id: -1 },
+                ];
+
+                let requirements = vec![
+                    crate::models::TableRequirement::AssertCurrentSchemaId { current_schema_id },
+                    crate::models::TableRequirement::AssertLastAssignedFieldId {
+                        last_assigned_field_id: last_column_id,
+                    },
+                ];
+
+                let request = crate::models::CommitTableRequest {
+                    identifier: Some(Box::new(crate::models::TableIdentifier::new(
+                        Vec::<String>::from(database.clone()),
+                        table.to_string(),
+                    ))),
+                    requirements,
+                    updates,
+                };
+
+                client
+                    .catalog_api_api()
+                    .update_table(&namespace, table, request, catalog_config.prefix())
+                    .await
+                    .map_err(|e| match e {
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content: _, ..
+                        }) if status == reqwest::StatusCode::NOT_FOUND => CatalogError::NotFound(
+                            CatalogObject::Table,
+                            format!(
+                                "{}.{}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ),
+                        ),
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::CONFLICT => {
+                            CatalogError::Conflict(format!(
+                                "Iceberg REST catalog alter table conflict for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::UNAUTHORIZED => {
+                            CatalogError::Unauthorized(format!(
+                                "Iceberg REST catalog alter table unauthorized for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::FORBIDDEN => {
+                            CatalogError::Forbidden(format!(
+                                "Iceberg REST catalog alter table forbidden for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                            CatalogError::RateLimited(format!(
+                                "Iceberg REST catalog alter table rate limited for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) => CatalogError::External(format!(
+                            "Failed to alter table {}.{}: status {status}: {content}",
+                            quote_namespace_if_needed(database),
+                            quote_name_if_needed(table)
+                        )),
+                        e => CatalogError::External(format!("Failed to alter table: {e}")),
+                    })?;
+
+                return Ok(());
+            }
+            AlterTableOptions::DropColumns { names, if_exists } => {
+                // Load current table metadata
+                let load_result = self.load_table_result(database, table, None).await?;
+                let metadata = &*load_result.metadata;
+
+                // Find current schema
+                let current_schema = find_by_id_or_last(
+                    metadata.schemas.as_ref(),
+                    metadata.current_schema_id,
+                    |s| s.schema_id,
+                )
+                .ok_or_else(|| {
+                    CatalogError::External("No schema found in table metadata".to_string())
+                })?;
+
+                let current_schema_id = current_schema.schema_id.unwrap_or(0);
+                let last_column_id = metadata.last_column_id.unwrap_or(0);
+
+                // Build new schema with dropped columns
+                let new_schema = drop_columns_from_schema(current_schema, &names, if_exists)?;
+
+                let updates = vec![
+                    crate::models::TableUpdate::AddSchemaUpdate {
+                        schema: Box::new(new_schema),
+                        last_column_id: Some(last_column_id),
+                    },
+                    crate::models::TableUpdate::SetCurrentSchemaUpdate { schema_id: -1 },
+                ];
+
+                let requirements = vec![crate::models::TableRequirement::AssertCurrentSchemaId {
+                    current_schema_id,
+                }];
+
+                let request = crate::models::CommitTableRequest {
+                    identifier: Some(Box::new(crate::models::TableIdentifier::new(
+                        Vec::<String>::from(database.clone()),
+                        table.to_string(),
+                    ))),
+                    requirements,
+                    updates,
+                };
+
+                client
+                    .catalog_api_api()
+                    .update_table(&namespace, table, request, catalog_config.prefix())
+                    .await
+                    .map_err(|e| match e {
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content: _, ..
+                        }) if status == reqwest::StatusCode::NOT_FOUND => CatalogError::NotFound(
+                            CatalogObject::Table,
+                            format!(
+                                "{}.{}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ),
+                        ),
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::CONFLICT => {
+                            CatalogError::Conflict(format!(
+                                "Iceberg REST catalog alter table conflict for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::UNAUTHORIZED => {
+                            CatalogError::Unauthorized(format!(
+                                "Iceberg REST catalog alter table unauthorized for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::FORBIDDEN => {
+                            CatalogError::Forbidden(format!(
+                                "Iceberg REST catalog alter table forbidden for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                            CatalogError::RateLimited(format!(
+                                "Iceberg REST catalog alter table rate limited for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) => CatalogError::External(format!(
+                            "Failed to alter table {}.{}: status {status}: {content}",
+                            quote_namespace_if_needed(database),
+                            quote_name_if_needed(table)
+                        )),
+                        e => CatalogError::External(format!("Failed to alter table: {e}")),
+                    })?;
+
+                return Ok(());
+            }
             AlterTableOptions::SetTableProperties { properties } => {
                 let map: std::collections::HashMap<String, String> =
                     properties.into_iter().collect();
-                vec![crate::models::TableUpdate::SetPropertiesUpdate { updates: map }]
+                let updates =
+                    vec![crate::models::TableUpdate::SetPropertiesUpdate { updates: map }];
+
+                let request = crate::models::CommitTableRequest {
+                    identifier: Some(Box::new(crate::models::TableIdentifier::new(
+                        Vec::<String>::from(database.clone()),
+                        table.to_string(),
+                    ))),
+                    requirements: vec![],
+                    updates,
+                };
+
+                client
+                    .catalog_api_api()
+                    .update_table(&namespace, table, request, catalog_config.prefix())
+                    .await
+                    .map_err(|e| match e {
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content: _, ..
+                        }) if status == reqwest::StatusCode::NOT_FOUND => CatalogError::NotFound(
+                            CatalogObject::Table,
+                            format!(
+                                "{}.{}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ),
+                        ),
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::CONFLICT => {
+                            CatalogError::Conflict(format!(
+                                "Iceberg REST catalog alter table conflict for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::UNAUTHORIZED => {
+                            CatalogError::Unauthorized(format!(
+                                "Iceberg REST catalog alter table unauthorized for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::FORBIDDEN => {
+                            CatalogError::Forbidden(format!(
+                                "Iceberg REST catalog alter table forbidden for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                            CatalogError::RateLimited(format!(
+                                "Iceberg REST catalog alter table rate limited for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) => CatalogError::External(format!(
+                            "Failed to alter table {}.{}: status {status}: {content}",
+                            quote_namespace_if_needed(database),
+                            quote_name_if_needed(table)
+                        )),
+                        e => CatalogError::External(format!("Failed to alter table: {e}")),
+                    })?;
+
+                return Ok(());
             }
             AlterTableOptions::UnsetTableProperties { keys, if_exists: _ } => {
-                vec![crate::models::TableUpdate::RemovePropertiesUpdate { removals: keys }]
+                let updates =
+                    vec![crate::models::TableUpdate::RemovePropertiesUpdate { removals: keys }];
+
+                let request = crate::models::CommitTableRequest {
+                    identifier: Some(Box::new(crate::models::TableIdentifier::new(
+                        Vec::<String>::from(database.clone()),
+                        table.to_string(),
+                    ))),
+                    requirements: vec![],
+                    updates,
+                };
+
+                client
+                    .catalog_api_api()
+                    .update_table(&namespace, table, request, catalog_config.prefix())
+                    .await
+                    .map_err(|e| match e {
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content: _, ..
+                        }) if status == reqwest::StatusCode::NOT_FOUND => CatalogError::NotFound(
+                            CatalogObject::Table,
+                            format!(
+                                "{}.{}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ),
+                        ),
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::CONFLICT => {
+                            CatalogError::Conflict(format!(
+                                "Iceberg REST catalog alter table conflict for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::UNAUTHORIZED => {
+                            CatalogError::Unauthorized(format!(
+                                "Iceberg REST catalog alter table unauthorized for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::FORBIDDEN => {
+                            CatalogError::Forbidden(format!(
+                                "Iceberg REST catalog alter table forbidden for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                            CatalogError::RateLimited(format!(
+                                "Iceberg REST catalog alter table rate limited for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status, content, ..
+                        }) => CatalogError::External(format!(
+                            "Failed to alter table {}.{}: status {status}: {content}",
+                            quote_namespace_if_needed(database),
+                            quote_name_if_needed(table)
+                        )),
+                        e => CatalogError::External(format!("Failed to alter table: {e}")),
+                    })?;
+
+                return Ok(());
             }
             other => {
                 return Err(CatalogError::NotSupported(format!(
                     "Iceberg REST catalog does not support alter table operation {other:?}",
                 )));
             }
-        };
-
-        let request = crate::models::CommitTableRequest {
-            identifier: Some(Box::new(crate::models::TableIdentifier::new(
-                Vec::<String>::from(database.clone()),
-                table.to_string(),
-            ))),
-            requirements: vec![],
-            updates,
-        };
-
-        client
-            .catalog_api_api()
-            .update_table(&namespace, table, request, catalog_config.prefix())
-            .await
-            .map_err(|e| match e {
-                apis::Error::ResponseError(apis::ResponseContent {
-                    status, content: _, ..
-                }) if status == reqwest::StatusCode::NOT_FOUND => CatalogError::NotFound(
-                    CatalogObject::Table,
-                    format!(
-                        "{}.{}",
-                        quote_namespace_if_needed(database),
-                        quote_name_if_needed(table)
-                    ),
-                ),
-                apis::Error::ResponseError(apis::ResponseContent {
-                    status, content, ..
-                }) if status == reqwest::StatusCode::CONFLICT => CatalogError::Conflict(format!(
-                    "Iceberg REST catalog alter table conflict for {}.{}: {content}",
-                    quote_namespace_if_needed(database),
-                    quote_name_if_needed(table)
-                )),
-                apis::Error::ResponseError(apis::ResponseContent {
-                    status, content, ..
-                }) if status == reqwest::StatusCode::UNAUTHORIZED => {
-                    CatalogError::Unauthorized(format!(
-                        "Iceberg REST catalog alter table unauthorized for {}.{}: {content}",
-                        quote_namespace_if_needed(database),
-                        quote_name_if_needed(table)
-                    ))
-                }
-                apis::Error::ResponseError(apis::ResponseContent {
-                    status, content, ..
-                }) if status == reqwest::StatusCode::FORBIDDEN => CatalogError::Forbidden(format!(
-                    "Iceberg REST catalog alter table forbidden for {}.{}: {content}",
-                    quote_namespace_if_needed(database),
-                    quote_name_if_needed(table)
-                )),
-                apis::Error::ResponseError(apis::ResponseContent {
-                    status, content, ..
-                }) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                    CatalogError::RateLimited(format!(
-                        "Iceberg REST catalog alter table rate limited for {}.{}: {content}",
-                        quote_namespace_if_needed(database),
-                        quote_name_if_needed(table)
-                    ))
-                }
-                apis::Error::ResponseError(apis::ResponseContent {
-                    status, content, ..
-                }) => CatalogError::External(format!(
-                    "Failed to alter table {}.{}: status {status}: {content}",
-                    quote_namespace_if_needed(database),
-                    quote_name_if_needed(table)
-                )),
-                e => CatalogError::External(format!("Failed to alter table: {e}")),
-            })?;
-
-        Ok(())
+        }
     }
 
     async fn commit_lakehouse_table(
@@ -3647,7 +4131,10 @@ mod tests {
             .alter_table(
                 &namespace,
                 "table1",
-                AlterTableOptions::AddColumns { columns: vec![] },
+                AlterTableOptions::AlterColumnType {
+                    name: vec!["col1".to_string()],
+                    data_type: DataType::Int64,
+                },
             )
             .await
             .unwrap_err();
@@ -3685,5 +4172,163 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, CatalogError::Conflict(_)));
+    }
+
+    fn load_table_response() -> serde_json::Value {
+        serde_json::json!({
+            "metadata-location": "s3://bucket/table/metadata/00001-uuid.metadata.json",
+            "metadata": {
+                "format-version": 2,
+                "table-uuid": "12345678-1234-1234-1234-123456789012",
+                "location": "s3://bucket/table",
+                "last-column-id": 3,
+                "current-schema-id": 0,
+                "schemas": [{
+                    "type": "struct",
+                    "schema-id": 0,
+                    "fields": [
+                        {"id": 1, "name": "id", "required": true, "type": "int"},
+                        {"id": 2, "name": "name", "required": false, "type": "string"},
+                        {"id": 3, "name": "score", "required": false, "type": "double"}
+                    ]
+                }],
+                "partition-specs": [{
+                    "spec-id": 0,
+                    "fields": []
+                }],
+                "default-spec-id": 0,
+                "last-partition-id": 0,
+                "properties": {},
+                "current-snapshot-id": null,
+                "snapshots": [],
+                "snapshot-log": [],
+                "metadata-log": []
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_add_columns() {
+        let ctx = TestContext::new(Some("test")).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        // Mock GET /v1/namespaces/db1/tables/table1 for load_table
+        ctx.mock_get_json(
+            &ctx.path("/namespaces/db1/tables/table1"),
+            load_table_response(),
+        )
+        .await;
+
+        // Mock POST /v1/namespaces/db1/tables/table1 for commit_table
+        ctx.mock_post_json(
+            &ctx.path("/namespaces/db1/tables/table1"),
+            alter_table_response(),
+        )
+        .await;
+
+        ctx.catalog
+            .alter_table(
+                &namespace,
+                "table1",
+                AlterTableOptions::AddColumns {
+                    columns: vec![sail_catalog::provider::AddColumn {
+                        name: vec!["new_col".to_string()],
+                        data_type: DataType::Utf8,
+                        nullable: true,
+                        default: None,
+                        comment: Some("a new column".to_string()),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_drop_columns() {
+        let ctx = TestContext::new(Some("test")).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        // Mock GET /v1/namespaces/db1/tables/table1 for load_table
+        ctx.mock_get_json(
+            &ctx.path("/namespaces/db1/tables/table1"),
+            load_table_response(),
+        )
+        .await;
+
+        // Mock POST /v1/namespaces/db1/tables/table1 for commit_table
+        ctx.mock_post_json(
+            &ctx.path("/namespaces/db1/tables/table1"),
+            alter_table_response(),
+        )
+        .await;
+
+        ctx.catalog
+            .alter_table(
+                &namespace,
+                "table1",
+                AlterTableOptions::DropColumns {
+                    names: vec!["id".to_string()],
+                    if_exists: false,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_drop_columns_if_exists() {
+        let ctx = TestContext::new(Some("test")).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        // Mock GET /v1/namespaces/db1/tables/table1 for load_table
+        ctx.mock_get_json(
+            &ctx.path("/namespaces/db1/tables/table1"),
+            load_table_response(),
+        )
+        .await;
+
+        // Mock POST /v1/namespaces/db1/tables/table1 for commit_table
+        ctx.mock_post_json(
+            &ctx.path("/namespaces/db1/tables/table1"),
+            alter_table_response(),
+        )
+        .await;
+
+        ctx.catalog
+            .alter_table(
+                &namespace,
+                "table1",
+                AlterTableOptions::DropColumns {
+                    names: vec!["nonexistent_col".to_string()],
+                    if_exists: true,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_rename() {
+        let ctx = TestContext::new(Some("test")).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        // Mock POST /v1/tables/rename for the rename endpoint
+        Mock::given(method("POST"))
+            .and(path("/v1/tables/rename"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&ctx.server)
+            .await;
+
+        ctx.catalog
+            .alter_table(
+                &namespace,
+                "table1",
+                AlterTableOptions::RenameTable {
+                    new_name: vec!["db1".to_string(), "table_renamed".to_string()],
+                },
+            )
+            .await
+            .unwrap();
     }
 }

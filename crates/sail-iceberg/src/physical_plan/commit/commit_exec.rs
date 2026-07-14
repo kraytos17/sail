@@ -1036,6 +1036,26 @@ impl ExecutionPlan for IcebergCommitExec {
                     &table_url
                 );
 
+                // Write version-hint.text first — if the metadata write
+                // or conflict-check below triggers a retry, the hint
+                // already points to the new version.
+                let hint = if use_uuid_metadata_file {
+                    new_meta_rel
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(new_meta_rel.as_str())
+                        .to_string()
+                } else {
+                    next_version.to_string()
+                };
+                let hint_bytes = Bytes::from(hint.into_bytes());
+                let hint_path = object_store::path::Path::from("metadata/version-hint.text");
+                store_ctx
+                    .prefixed
+                    .put(&hint_path, object_store::PutPayload::from(hint_bytes))
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
                 let new_meta_path = object_store::path::Path::from(new_meta_rel.as_str());
                 let put_opts = object_store::PutOptions {
                     mode: object_store::PutMode::Create,
@@ -1088,23 +1108,6 @@ impl ExecutionPlan for IcebergCommitExec {
                     continue;
                 }
                 log::trace!("Metadata written successfully");
-
-                let hint = if use_uuid_metadata_file {
-                    new_meta_rel
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(new_meta_rel.as_str())
-                        .to_string()
-                } else {
-                    next_version.to_string()
-                };
-                let hint_bytes = Bytes::from(hint.into_bytes());
-                let hint_path = object_store::path::Path::from("metadata/version-hint.text");
-                store_ctx
-                    .prefixed
-                    .put(&hint_path, object_store::PutPayload::from(hint_bytes))
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 if let Some(catalog_table) = catalog_metadata_update_table {
                     Self::update_catalog_metadata_location(

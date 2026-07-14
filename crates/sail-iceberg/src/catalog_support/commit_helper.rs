@@ -197,6 +197,25 @@ pub(crate) async fn commit_iceberg_changes(
     };
     let new_metadata_location = table_metadata_location(table_url, &new_meta_rel)?;
 
+    // Write version-hint.text first — if this fails, nothing is on S3 and
+    // the caller can retry cleanly.  The metadata JSON write follows after.
+    let hint = if use_uuid_metadata_file {
+        new_meta_rel
+            .rsplit('/')
+            .next()
+            .unwrap_or(&new_meta_rel)
+            .to_string()
+    } else {
+        next_version.to_string()
+    };
+    let hint_bytes = Bytes::from(hint.into_bytes());
+    let hint_path = object_store::path::Path::from("metadata/version-hint.text");
+    store_ctx
+        .prefixed
+        .put(&hint_path, object_store::PutPayload::from(hint_bytes))
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
     let new_meta_bytes = encode_metadata_file(&new_meta_rel, &new_meta_json)
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let new_meta_path = object_store::path::Path::from(new_meta_rel.as_str());
@@ -218,24 +237,6 @@ pub(crate) async fn commit_iceberg_changes(
         }
         Err(e) => return Err(DataFusionError::External(Box::new(e))),
     }
-
-    // Write version-hint.text
-    let hint = if use_uuid_metadata_file {
-        new_meta_rel
-            .rsplit('/')
-            .next()
-            .unwrap_or(&new_meta_rel)
-            .to_string()
-    } else {
-        next_version.to_string()
-    };
-    let hint_bytes = Bytes::from(hint.into_bytes());
-    let hint_path = object_store::path::Path::from("metadata/version-hint.text");
-    store_ctx
-        .prefixed
-        .put(&hint_path, object_store::PutPayload::from(hint_bytes))
-        .await
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     // Update catalog metadata location if needed
     if let (Some(catalog_table), Some(ctx)) = (catalog_metadata_update_table, context) {

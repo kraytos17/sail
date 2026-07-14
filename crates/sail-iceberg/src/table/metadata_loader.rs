@@ -222,24 +222,52 @@ pub async fn find_latest_metadata_file_with_catalog_fallback(
             });
 
             if let Some(fname) = hinted_filename {
-                if let Some((version, path, _)) =
+                if let Some((hinted_version, hinted_path, hinted_ts)) =
                     files.iter().rev().find(|(_, p, _)| p.ends_with(&fname))
                 {
+                    // If the listing has a higher-version file that was
+                    // written at or after the hinted file, it is a ghost
+                    // from the same commit attempt — prefer it over the
+                    // stale hint so that retry loops don't get stuck.
+                    if let Some((highest_version, highest_path, highest_ts)) = files.last() {
+                        if *highest_version > *hinted_version && *highest_ts >= *hinted_ts {
+                            log::trace!(
+                                "find_latest_metadata_file: hint version {} overridden by higher version {} path={}",
+                                hinted_version,
+                                highest_version,
+                                highest_path
+                            );
+                            return Ok(highest_path.clone());
+                        }
+                    }
                     log::trace!(
                         "find_latest_metadata_file: selected by filename hint version {} path={}",
-                        version,
-                        &path
+                        hinted_version,
+                        &hinted_path
                     );
-                    return Ok(path.clone());
+                    return Ok(hinted_path.clone());
                 }
             } else if let Some(hint) = hinted_version {
-                if let Some((version, path, _)) = files.iter().rev().find(|(v, _, _)| *v == hint) {
+                if let Some((hinted_version, hinted_path, hinted_ts)) =
+                    files.iter().rev().find(|(v, _, _)| *v == hint)
+                {
+                    if let Some((highest_version, highest_path, highest_ts)) = files.last() {
+                        if *highest_version > *hinted_version && *highest_ts >= *hinted_ts {
+                            log::trace!(
+                                "find_latest_metadata_file: hint version {} overridden by higher version {} path={}",
+                                hinted_version,
+                                highest_version,
+                                highest_path
+                            );
+                            return Ok(highest_path.clone());
+                        }
+                    }
                     log::trace!(
                         "find_latest_metadata_file: selected by numeric hint version {} path={}",
-                        version,
-                        &path
+                        hinted_version,
+                        &hinted_path
                     );
-                    return Ok(path.clone());
+                    return Ok(hinted_path.clone());
                 }
             }
 
