@@ -12,6 +12,8 @@ use sail_common::spec;
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::session::job::JobService;
 use sail_plan::resolve_and_execute_plan;
+use sail_sql_analyzer::parser::parse_one_statement;
+use sail_sql_analyzer::statement::from_ast_statement;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use tonic::codegen::tokio_stream::Stream;
 use tonic::Status;
@@ -228,10 +230,21 @@ pub(crate) async fn handle_execute_sql_command(
 ) -> SparkResult<ExecutePlanResponseStream> {
     let spark = ctx.extension::<SparkSession>()?;
     let service = ctx.extension::<JobService>()?;
-    let relation = if let Some(input) = sql.input {
-        input
+    let (relation, plan): (Option<Relation>, spec::Plan) = if let Some(input) = sql.input {
+        let plan = input.clone().try_into()?;
+        (Some(input), plan)
     } else {
-        Relation {
+        #[expect(deprecated)]
+        let sql_text = sql.sql.clone();
+        let plan = from_ast_statement(parse_one_statement(&sql_text)?)?;
+        (None, plan)
+    };
+    let relation = match plan {
+        spec::Plan::Query(_) if relation.is_some() => {
+            // For queries, the SQL relation is sent back to PySpark for further processing.
+            relation.unwrap()
+        }
+        spec::Plan::Query(_) => Relation {
             common: None,
             #[expect(deprecated)]
             rel_type: Some(relation::RelType::Sql(crate::spark::connect::Sql {
@@ -241,11 +254,7 @@ pub(crate) async fn handle_execute_sql_command(
                 named_arguments: sql.named_arguments,
                 pos_arguments: sql.pos_arguments,
             })),
-        }
-    };
-    let plan: spec::Plan = relation.clone().try_into()?;
-    let relation = match plan {
-        spec::Plan::Query(_) => relation,
+        },
         command @ spec::Plan::Command(_) => {
             let (plan, _) = resolve_and_execute_plan(ctx, spark.plan_config()?, command).await?;
             let stream = service.runner().execute(ctx, plan).await?;
