@@ -231,7 +231,14 @@ pub(crate) async fn handle_execute_sql_command(
     let spark = ctx.extension::<SparkSession>()?;
     let service = ctx.extension::<JobService>()?;
     let (relation, plan): (Option<Relation>, spec::Plan) = if let Some(input) = sql.input {
-        let plan = input.clone().try_into()?;
+        // If the input relation carries SQL text directly, parse it
+        // here rather than going through the fallback RelType conversion
+        // which can produce an empty query string.
+        let plan = if let Some(relation::RelType::Sql(ref inner)) = input.rel_type {
+            from_ast_statement(parse_one_statement(inner.query.as_str())?)?
+        } else {
+            input.clone().try_into()?
+        };
         (Some(input), plan)
     } else {
         #[expect(deprecated)]
