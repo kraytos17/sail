@@ -108,6 +108,10 @@ impl IcebergUpdateExec {
         self.table_schema.as_ref()
     }
 
+    pub fn session_state(&self) -> &datafusion::execution::SessionState {
+        &self.session_state
+    }
+
     fn compute_properties(schema: SchemaRef) -> Arc<PlanProperties> {
         Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),

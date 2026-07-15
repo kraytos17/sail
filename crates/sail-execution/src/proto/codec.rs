@@ -1352,6 +1352,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
             NodeKind::IcebergDelete(gen::IcebergDeleteExecNode {
                 table_url,
                 condition_source,
+                condition_physical,
                 schema: schema_bytes,
                 lakehouse_table_json,
                 properties,
@@ -1362,7 +1363,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     let schema = if !table_schema_bytes.is_empty() {
                         try_decode_schema(&table_schema_bytes)?
                     } else {
-                        decoded_schema
+                        decoded_schema.clone()
                     };
                     schema
                         .fields()
@@ -1370,9 +1371,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                         .map(|f| (f.name().to_lowercase(), f.data_type().clone()))
                         .collect()
                 };
-                let condition = if condition_source.is_empty() {
-                    None
-                } else {
+                let condition = if !condition_source.is_empty() {
                     let ast = sail_sql_analyzer::parser::parse_expression(&condition_source)
                         .map_err(|e| plan_datafusion_err!("{e}"))?;
                     let spec_expr = sail_sql_analyzer::expression::from_ast_expression(ast)
@@ -1382,6 +1381,19 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                         expr,
                         source: Some(condition_source),
                     })
+                } else if !condition_physical.is_empty() {
+                    let schema = if !table_schema_bytes.is_empty() {
+                        try_decode_schema(&table_schema_bytes)?
+                    } else {
+                        decoded_schema.clone()
+                    };
+                    let arrow_schema = Arc::new(schema);
+                    let phys =
+                        try_decode_physical_expr(ctx, self, &condition_physical, &arrow_schema)?;
+                    let expr = RemoteExecutionCodec::expr_from_physical(&phys, &arrow_schema)?;
+                    Some(ExprWithSource { expr, source: None })
+                } else {
+                    None
                 };
                 let lakehouse_table = self.try_decode_lakehouse_table(&lakehouse_table_json)?;
                 let table_properties = properties.into_iter().map(|p| (p.key, p.value)).collect();
@@ -1408,6 +1420,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
             NodeKind::IcebergUpdate(gen::IcebergUpdateExecNode {
                 table_url,
                 condition_source,
+                condition_physical,
                 schema: schema_bytes,
                 lakehouse_table_json,
                 assignments,
@@ -1419,7 +1432,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     let schema = if !table_schema_bytes.is_empty() {
                         try_decode_schema(&table_schema_bytes)?
                     } else {
-                        decoded_schema
+                        decoded_schema.clone()
                     };
                     schema
                         .fields()
@@ -1427,9 +1440,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                         .map(|f| (f.name().to_lowercase(), f.data_type().clone()))
                         .collect()
                 };
-                let condition = if condition_source.is_empty() {
-                    None
-                } else {
+                let condition = if !condition_source.is_empty() {
                     let ast = sail_sql_analyzer::parser::parse_expression(&condition_source)
                         .map_err(|e| plan_datafusion_err!("{e}"))?;
                     let spec_expr = sail_sql_analyzer::expression::from_ast_expression(ast)
@@ -1439,6 +1450,19 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                         expr,
                         source: Some(condition_source),
                     })
+                } else if !condition_physical.is_empty() {
+                    let schema = if !table_schema_bytes.is_empty() {
+                        try_decode_schema(&table_schema_bytes)?
+                    } else {
+                        decoded_schema.clone()
+                    };
+                    let arrow_schema = Arc::new(schema);
+                    let phys =
+                        try_decode_physical_expr(ctx, self, &condition_physical, &arrow_schema)?;
+                    let expr = RemoteExecutionCodec::expr_from_physical(&phys, &arrow_schema)?;
+                    Some(ExprWithSource { expr, source: None })
+                } else {
+                    None
                 };
                 let lakehouse_table = self.try_decode_lakehouse_table(&lakehouse_table_json)?;
                 let table_properties = properties.into_iter().map(|p| (p.key, p.value)).collect();
@@ -1447,21 +1471,33 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 } else {
                     None
                 };
+                let arrow_schema = decoded_table_schema
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(decoded_schema));
                 let resolved_assignments = assignments
                     .into_iter()
                     .map(|a| {
-                        let ast = sail_sql_analyzer::parser::parse_expression(&a.expr_source)
-                            .map_err(|e| plan_datafusion_err!("{e}"))?;
-                        let spec_expr = sail_sql_analyzer::expression::from_ast_expression(ast)
-                            .map_err(|e| plan_datafusion_err!("{e}"))?;
-                        let expr = spec_expr_to_datafusion_expr(spec_expr, &column_types)?;
-                        Ok((
-                            a.column,
-                            ExprWithSource {
-                                expr,
-                                source: Some(a.expr_source),
-                            },
-                        ))
+                        let expr = if !a.expr_source.is_empty() {
+                            let ast = sail_sql_analyzer::parser::parse_expression(&a.expr_source)
+                                .map_err(|e| plan_datafusion_err!("{e}"))?;
+                            let spec_expr = sail_sql_analyzer::expression::from_ast_expression(ast)
+                                .map_err(|e| plan_datafusion_err!("{e}"))?;
+                            spec_expr_to_datafusion_expr(spec_expr, &column_types)?
+                        } else if !a.expr_physical.is_empty() {
+                            let phys = try_decode_physical_expr(
+                                ctx,
+                                self,
+                                &a.expr_physical,
+                                &arrow_schema,
+                            )?;
+                            RemoteExecutionCodec::expr_from_physical(&phys, &arrow_schema)?
+                        } else {
+                            return Err(plan_datafusion_err!(
+                                "Assignment expression source is empty for column '{}'",
+                                a.column
+                            ));
+                        };
+                        Ok((a.column, ExprWithSource { expr, source: None }))
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let session_state =
@@ -2233,11 +2269,26 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
             })
         } else if let Some(delete_exec) = node.downcast_ref::<IcebergDeleteExec>() {
             let schema = try_encode_schema(delete_exec.schema().as_ref())?;
-            let condition_source = delete_exec
+            let (condition_source, condition_physical) = match delete_exec
                 .condition()
                 .as_ref()
-                .and_then(|c| c.source.clone().or_else(|| Some(format!("{}", c.expr))))
-                .unwrap_or_default();
+                .and_then(|c| c.source.clone())
+            {
+                Some(src) => (src, vec![]),
+                None => {
+                    let exec_schema = delete_exec
+                        .table_schema()
+                        .cloned()
+                        .unwrap_or_else(|| delete_exec.schema());
+                    let phys_expr = Self::encode_expr_as_physical(
+                        self,
+                        delete_exec.condition().as_ref().unwrap(),
+                        delete_exec.session_state(),
+                        &exec_schema,
+                    )?;
+                    (String::new(), phys_expr)
+                }
+            };
             let lakehouse_table_json =
                 self.try_encode_lakehouse_table(delete_exec.lakehouse_table())?;
             let properties = delete_exec
@@ -2259,14 +2310,30 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     .map(|s| try_encode_schema(s.as_ref()))
                     .transpose()?
                     .unwrap_or_default(),
+                condition_physical,
             })
         } else if let Some(update_exec) = node.downcast_ref::<IcebergUpdateExec>() {
             let schema = try_encode_schema(update_exec.schema().as_ref())?;
-            let condition_source = update_exec
+            let (condition_source, condition_physical) = match update_exec
                 .condition()
                 .as_ref()
-                .and_then(|c| c.source.clone().or_else(|| Some(format!("{}", c.expr))))
-                .unwrap_or_default();
+                .and_then(|c| c.source.clone())
+            {
+                Some(src) => (src, vec![]),
+                None => {
+                    let exec_schema = update_exec
+                        .table_schema()
+                        .cloned()
+                        .unwrap_or_else(|| update_exec.schema());
+                    let phys_expr = Self::encode_expr_as_physical(
+                        self,
+                        update_exec.condition().as_ref().unwrap(),
+                        update_exec.session_state(),
+                        &exec_schema,
+                    )?;
+                    (String::new(), phys_expr)
+                }
+            };
             let lakehouse_table_json =
                 self.try_encode_lakehouse_table(update_exec.lakehouse_table())?;
             let properties = update_exec
@@ -2277,18 +2344,34 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     value: v.clone(),
                 })
                 .collect();
+            let exec_schema = update_exec
+                .table_schema()
+                .cloned()
+                .unwrap_or_else(|| update_exec.schema());
+            let this = self;
             let assignments = update_exec
                 .assignments()
                 .iter()
-                .map(|(col, expr)| gen::AssignmentNode {
-                    column: col.clone(),
-                    expr_source: expr
-                        .source
-                        .clone()
-                        .or_else(|| Some(format!("{}", expr.expr)))
-                        .unwrap_or_default(),
+                .map(|(col, expr)| {
+                    let (expr_source, expr_physical) = match expr.source.clone() {
+                        Some(src) => (src, vec![]),
+                        None => {
+                            let phys_expr = Self::encode_expr_as_physical(
+                                this,
+                                expr,
+                                update_exec.session_state(),
+                                &exec_schema,
+                            )?;
+                            (String::new(), phys_expr)
+                        }
+                    };
+                    Ok(gen::AssignmentNode {
+                        column: col.clone(),
+                        expr_source,
+                        expr_physical,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             NodeKind::IcebergUpdate(gen::IcebergUpdateExecNode {
                 table_url: update_exec.table_url().to_string(),
                 condition_source,
@@ -2301,6 +2384,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     .map(|s| try_encode_schema(s.as_ref()))
                     .transpose()?
                     .unwrap_or_default(),
+                condition_physical,
             })
         } else if let Some(compact_exec) = node.downcast_ref::<IcebergCompactExec>() {
             let schema = try_encode_schema(compact_exec.schema().as_ref())?;
@@ -2710,6 +2794,59 @@ fn spec_data_type_to_arrow(dt: &spec::DataType) -> Result<datafusion::arrow::dat
 }
 
 impl RemoteExecutionCodec {
+    /// Encode a logical expression to physical expression bytes using the exec's own session state.
+    /// This is used as a fallback when the expression source string is not available.
+    fn encode_expr_as_physical(
+        codec: &dyn PhysicalExtensionCodec,
+        expr: &ExprWithSource,
+        session_state: &datafusion::execution::session_state::SessionState,
+        schema: &datafusion::arrow::datatypes::Schema,
+    ) -> Result<Vec<u8>> {
+        use datafusion::common::ToDFSchema;
+        let df_schema = schema.clone().to_dfschema().map_err(|e| {
+            plan_datafusion_err!("Failed to convert schema for expression encoding: {e}")
+        })?;
+        let phys_expr = session_state
+            .create_physical_expr(expr.expr.clone(), &df_schema)
+            .map_err(|e| {
+                plan_datafusion_err!("Failed to create physical expression for encoding: {e}")
+            })?;
+        try_encode_physical_expr(codec, &phys_expr)
+    }
+
+    /// Convert a physical expression back to a logical datafusion_expr::Expr.
+    /// Supports Column, Literal, and BinaryExpr physical nodes.
+    fn expr_from_physical(
+        phys: &Arc<dyn PhysicalExpr>,
+        _schema: &Arc<Schema>,
+    ) -> Result<datafusion::logical_expr::Expr> {
+        use datafusion::logical_expr::Expr;
+        use datafusion::physical_expr::expressions as pe;
+        let phys_ref: &dyn PhysicalExpr = phys.as_ref();
+        if let Some(col) = phys_ref.downcast_ref::<pe::Column>() {
+            return Ok(Expr::Column(datafusion::common::Column::new_unqualified(
+                col.name(),
+            )));
+        }
+        if let Some(lit) = phys_ref.downcast_ref::<pe::Literal>() {
+            return Ok(Expr::Literal(lit.value().clone(), None));
+        }
+        if let Some(bin) = phys_ref.downcast_ref::<pe::BinaryExpr>() {
+            let left = RemoteExecutionCodec::expr_from_physical(bin.left(), _schema)?;
+            let right = RemoteExecutionCodec::expr_from_physical(bin.right(), _schema)?;
+            let op = bin.op().clone();
+            return Ok(Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
+                Box::new(left),
+                op,
+                Box::new(right),
+            )));
+        }
+        plan_err!(
+            "Unsupported physical expression type for conversion: {}",
+            phys
+        )
+    }
+
     fn try_decode_udf(&self, name: &str, buf: &[u8]) -> Result<Arc<ScalarUDF>> {
         // TODO: Implement custom registry to avoid codec for built-in functions.
         // The `match name` below has no session-registry fallback, so every
@@ -4757,14 +4894,19 @@ impl RemoteExecutionCodec {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use datafusion::arrow::array::{Array, ArrayRef, RecordBatch};
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::common::ScalarValue;
+    use datafusion::execution::runtime_env::RuntimeEnv;
     use datafusion::execution::session_state::SessionStateBuilder;
+    use datafusion::execution::TaskContext;
     use datafusion::logical_expr::{col, lit, BinaryExpr, Expr, Operator};
     use datafusion::physical_expr::HigherOrderFunctionExpr;
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::prelude::SessionConfig;
 
     use super::*;
 
@@ -6644,13 +6786,13 @@ mod tests {
         match plan_node.node_kind.unwrap() {
             gen::extended_physical_plan_node::NodeKind::IcebergUpdate(n) => {
                 assert!(
-                    !n.condition_source.is_empty(),
-                    "condition_source must be non-empty (fallback from format!)"
+                    !n.condition_physical.is_empty(),
+                    "condition_physical must be non-empty (fallback from physical encoding)"
                 );
                 assert_eq!(n.assignments.len(), 1);
                 assert!(
-                    !n.assignments[0].expr_source.is_empty(),
-                    "expr_source must be non-empty (fallback from format!)"
+                    !n.assignments[0].expr_physical.is_empty(),
+                    "expr_physical must be non-empty (fallback from physical encoding)"
                 );
             }
             other => panic!("expected IcebergUpdate, got {other:?}"),
@@ -6659,7 +6801,7 @@ mod tests {
 
     #[test]
     fn test_iceberg_delete_codec_encode_without_source() {
-        // When source is None, the codec should fall back to format!("{}", expr)
+        // When source is None, the codec should fall back to physical expression encoding
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let table_schema = Some(schema);
         let condition = Some(ExprWithSource {
@@ -6683,11 +6825,226 @@ mod tests {
         match plan_node.node_kind.unwrap() {
             gen::extended_physical_plan_node::NodeKind::IcebergDelete(n) => {
                 assert!(
-                    !n.condition_source.is_empty(),
-                    "condition_source must be non-empty (fallback from format!)"
+                    !n.condition_physical.is_empty(),
+                    "condition_physical must be non-empty (fallback from physical encoding)"
                 );
             }
             other => panic!("expected IcebergDelete, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_iceberg_update_round_trip_without_source() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("score", DataType::Float64, true),
+        ]));
+        let table_schema = Some(schema);
+        let condition = Some(ExprWithSource {
+            expr: col("id").gt(lit(5i32)),
+            source: None,
+        });
+        let update_exec = Arc::new(IcebergUpdateExec::new(
+            "s3://bucket/table".to_string(),
+            vec![(
+                "score".to_string(),
+                ExprWithSource {
+                    expr: lit(99.0),
+                    source: None,
+                },
+            )],
+            condition,
+            SessionStateBuilder::new().with_default_features().build(),
+            None,
+            vec![],
+            table_schema,
+        ));
+
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        codec.try_encode(update_exec.clone(), &mut buf).unwrap();
+
+        let config = SessionConfig::new();
+        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+            .build_arc()
+            .unwrap();
+        let ctx = Arc::new(TaskContext::new(
+            None,
+            "test_session".to_string(),
+            config,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            runtime,
+        ));
+        let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
+
+        let decoded_update = decoded
+            .as_ref()
+            .downcast_ref::<IcebergUpdateExec>()
+            .unwrap();
+        assert_eq!(decoded_update.table_url(), "s3://bucket/table");
+        assert!(decoded_update.condition().is_some());
+        assert_eq!(decoded_update.assignments().len(), 1);
+    }
+
+    #[test]
+    fn test_iceberg_delete_round_trip_without_source() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table_schema = Some(schema);
+        let condition = Some(ExprWithSource {
+            expr: col("id").eq(lit(10i32)),
+            source: None,
+        });
+        let delete_exec = Arc::new(IcebergDeleteExec::new(
+            "s3://bucket/table".to_string(),
+            condition,
+            SessionStateBuilder::new().with_default_features().build(),
+            None,
+            vec![],
+            table_schema,
+        ));
+
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        codec.try_encode(delete_exec.clone(), &mut buf).unwrap();
+
+        let config = SessionConfig::new();
+        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+            .build_arc()
+            .unwrap();
+        let ctx = Arc::new(TaskContext::new(
+            None,
+            "test_session".to_string(),
+            config,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            runtime,
+        ));
+        let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
+
+        let decoded_delete = decoded
+            .as_ref()
+            .downcast_ref::<IcebergDeleteExec>()
+            .unwrap();
+        assert_eq!(decoded_delete.table_url(), "s3://bucket/table");
+        assert!(decoded_delete.condition().is_some());
+    }
+
+    #[test]
+    fn test_iceberg_update_round_trip_complex_condition() {
+        // Test with a complex BinaryExpr condition: id > 5 AND score < 50.0
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("score", DataType::Float64, true),
+        ]));
+        let table_schema = Some(schema);
+        let condition = Some(ExprWithSource {
+            expr: col("id").gt(lit(5i32)).and(col("score").lt(lit(50.0))),
+            source: None,
+        });
+        let update_exec = Arc::new(IcebergUpdateExec::new(
+            "s3://bucket/table".to_string(),
+            vec![(
+                "score".to_string(),
+                ExprWithSource {
+                    expr: lit(100.0),
+                    source: None,
+                },
+            )],
+            condition,
+            SessionStateBuilder::new().with_default_features().build(),
+            None,
+            vec![],
+            table_schema,
+        ));
+
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        codec.try_encode(update_exec.clone(), &mut buf).unwrap();
+
+        let config = SessionConfig::new();
+        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+            .build_arc()
+            .unwrap();
+        let ctx = Arc::new(TaskContext::new(
+            None,
+            "test_session".to_string(),
+            config,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            runtime,
+        ));
+        let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
+
+        let decoded_update = decoded
+            .as_ref()
+            .downcast_ref::<IcebergUpdateExec>()
+            .unwrap();
+        assert_eq!(decoded_update.table_url(), "s3://bucket/table");
+        assert!(decoded_update.condition().is_some());
+        assert_eq!(decoded_update.assignments().len(), 1);
+    }
+
+    #[test]
+    fn test_iceberg_update_round_trip_binary_expr_assignment() {
+        // Test with assignment value as a BinaryExpr: SET score = score + 10
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("score", DataType::Float64, true),
+        ]));
+        let table_schema = Some(schema);
+        let condition = Some(ExprWithSource {
+            expr: col("id").gt(lit(0i32)),
+            source: None,
+        });
+        let update_exec = Arc::new(IcebergUpdateExec::new(
+            "s3://bucket/table".to_string(),
+            vec![(
+                "score".to_string(),
+                ExprWithSource {
+                    expr: col("score") + lit(10.0),
+                    source: None,
+                },
+            )],
+            condition,
+            SessionStateBuilder::new().with_default_features().build(),
+            None,
+            vec![],
+            table_schema,
+        ));
+
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        codec.try_encode(update_exec.clone(), &mut buf).unwrap();
+
+        let config = SessionConfig::new();
+        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+            .build_arc()
+            .unwrap();
+        let ctx = Arc::new(TaskContext::new(
+            None,
+            "test_session".to_string(),
+            config,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            runtime,
+        ));
+        let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
+
+        let decoded_update = decoded
+            .as_ref()
+            .downcast_ref::<IcebergUpdateExec>()
+            .unwrap();
+        assert_eq!(decoded_update.table_url(), "s3://bucket/table");
+        assert!(decoded_update.condition().is_some());
+        assert_eq!(decoded_update.assignments().len(), 1);
     }
 }

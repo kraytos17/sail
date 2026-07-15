@@ -1015,6 +1015,7 @@ message StringPair {
 message AssignmentNode {
   string column = 1;
   string expr_source = 2;
+  bytes expr_physical = 3;
 }
 
 message IcebergDeleteExecNode {
@@ -1024,6 +1025,7 @@ message IcebergDeleteExecNode {
   string lakehouse_table_json = 4;
   repeated StringPair properties = 5;
   bytes table_schema = 6;
+  bytes condition_physical = 7;
 }
 
 message IcebergUpdateExecNode {
@@ -1034,6 +1036,7 @@ message IcebergUpdateExecNode {
   repeated AssignmentNode assignments = 5;
   repeated StringPair properties = 6;
   bytes table_schema = 7;
+  bytes condition_physical = 8;
 }
 
 message IcebergCompactExecNode {
