@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use datafusion_common::{DFSchemaRef, ToDFSchema};
-use datafusion_expr::LogicalPlan;
+use datafusion_expr::{ExprSchemable, LogicalPlan};
 use sail_catalog::manager::CatalogManager;
 use sail_common::spec;
 use sail_common_datafusion::catalog::{
@@ -62,7 +62,24 @@ impl PlanResolver<'_> {
                 &original_arrow_schema,
                 true,
             )?;
-            resolved_assignments.push((col_name_str, ExprWithSource::new(rewritten_value, None)));
+            // Cast the assignment value to the target column's data type to avoid
+            // type mismatches at execution time (e.g., literal Float64 vs column Float32).
+            let target_field_name = col_name
+                .parts()
+                .last()
+                .map(|id| id.as_ref())
+                .unwrap_or(&col_name_str);
+            let cast_value = original_arrow_schema
+                .field_with_name(target_field_name)
+                .ok()
+                .map(|field| {
+                    rewritten_value
+                        .clone()
+                        .cast_to(field.data_type(), df_schema_for_resolution.as_ref())
+                })
+                .transpose()?
+                .unwrap_or(rewritten_value);
+            resolved_assignments.push((col_name_str, ExprWithSource::new(cast_value, None)));
         }
 
         // Convert the condition expression if present

@@ -7400,4 +7400,165 @@ mod tests {
         assert!(decoded_update.condition().is_some());
         assert_eq!(decoded_update.assignments().len(), 1);
     }
+
+    #[test]
+    fn test_iceberg_update_round_trip_type_coercion_float64_to_float32() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("score", DataType::Float32, true),
+        ]));
+        let table_schema = Some(schema);
+        let condition = Some(ExprWithSource {
+            expr: col("id").gt(lit(0i32)),
+            source: None,
+        });
+        let update_exec = Arc::new(IcebergUpdateExec::new(
+            "s3://bucket/table".to_string(),
+            vec![(
+                "score".to_string(),
+                ExprWithSource {
+                    expr: lit(100.0),
+                    source: None,
+                },
+            )],
+            condition,
+            SessionStateBuilder::new().with_default_features().build(),
+            None,
+            vec![],
+            table_schema,
+        ));
+
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        codec.try_encode(update_exec.clone(), &mut buf).unwrap();
+
+        let config = SessionConfig::new();
+        let runtime = RuntimeEnvBuilder::new().build_arc().unwrap();
+        let ctx = Arc::new(TaskContext::new(
+            None,
+            "test_session".to_string(),
+            config,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            runtime,
+        ));
+        let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
+
+        let decoded_update = decoded
+            .as_ref()
+            .downcast_ref::<IcebergUpdateExec>()
+            .unwrap();
+        assert_eq!(decoded_update.table_url(), "s3://bucket/table");
+        assert!(decoded_update.condition().is_some());
+        assert_eq!(decoded_update.assignments().len(), 1);
+    }
+
+    #[test]
+    fn test_iceberg_update_round_trip_type_coercion_int32_to_int64() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let table_schema = Some(schema);
+        let condition = Some(ExprWithSource {
+            expr: col("name").eq(lit("test")),
+            source: None,
+        });
+        let update_exec = Arc::new(IcebergUpdateExec::new(
+            "s3://bucket/table".to_string(),
+            vec![(
+                "id".to_string(),
+                ExprWithSource {
+                    expr: lit(42i32),
+                    source: None,
+                },
+            )],
+            condition,
+            SessionStateBuilder::new().with_default_features().build(),
+            None,
+            vec![],
+            table_schema,
+        ));
+
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        codec.try_encode(update_exec.clone(), &mut buf).unwrap();
+
+        let config = SessionConfig::new();
+        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+            .build_arc()
+            .unwrap();
+        let ctx = Arc::new(TaskContext::new(
+            None,
+            "test_session".to_string(),
+            config,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            runtime,
+        ));
+        let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
+
+        let decoded_update = decoded
+            .as_ref()
+            .downcast_ref::<IcebergUpdateExec>()
+            .unwrap();
+        assert_eq!(decoded_update.table_url(), "s3://bucket/table");
+        assert!(decoded_update.condition().is_some());
+        assert_eq!(decoded_update.assignments().len(), 1);
+    }
+
+    #[test]
+    fn test_iceberg_delete_round_trip_date32_condition_type_coercion() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("event_date", DataType::Date32, true),
+        ]));
+        let table_schema = Some(schema);
+        let condition = Some(ExprWithSource {
+            expr: col("event_date").eq(Expr::Literal(
+                ScalarValue::Utf8(Some("2024-01-15".to_string())),
+                None,
+            )),
+            source: None,
+        });
+        let delete_exec = Arc::new(IcebergDeleteExec::new(
+            "s3://bucket/table".to_string(),
+            condition,
+            SessionStateBuilder::new().with_default_features().build(),
+            None,
+            vec![],
+            table_schema,
+        ));
+
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        codec.try_encode(delete_exec.clone(), &mut buf).unwrap();
+
+        let config = SessionConfig::new();
+        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+            .build_arc()
+            .unwrap();
+        let ctx = Arc::new(TaskContext::new(
+            None,
+            "test_session".to_string(),
+            config,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            runtime,
+        ));
+        let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
+
+        let decoded_delete = decoded
+            .as_ref()
+            .downcast_ref::<IcebergDeleteExec>()
+            .unwrap();
+        assert_eq!(decoded_delete.table_url(), "s3://bucket/table");
+        assert!(decoded_delete.condition().is_some());
+    }
 }

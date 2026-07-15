@@ -573,6 +573,19 @@ impl IcebergUpdateExec {
                             col_name
                         ))
                     })?;
+                use datafusion::arrow::compute::kernels::cast;
+                let new_values = if new_values.data_type() != columns[col_idx].data_type() {
+                    cast::cast(&new_values, columns[col_idx].data_type())
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Type cast failed for '{}': {e}",
+                                col_name
+                            ))
+                        })?
+                        .into()
+                } else {
+                    new_values
+                };
 
                 // Combine: for matching rows use new_values, for others use original
                 let combined = zip(decision_mask, &new_values, &columns[col_idx]).map_err(|e| {
@@ -667,7 +680,7 @@ impl IcebergUpdateExec {
 mod tests {
     use std::sync::Arc;
 
-    use datafusion::arrow::array::{BooleanArray, Int32Array, StringArray};
+    use datafusion::arrow::array::{BooleanArray, Float32Array, Int32Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::ToDFSchema;
@@ -757,6 +770,51 @@ mod tests {
         assert_eq!(
             matching, 2,
             "alice and bob should match event_date = 2024-01-15"
+        );
+    }
+
+    #[test]
+    fn test_update_count_float32_condition_with_int32_literal() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "score",
+            DataType::Float32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Float32Array::from(vec![
+                Some(1.0),
+                Some(2.5),
+                Some(3.0),
+                Some(4.0),
+                Some(5.0),
+            ]))],
+        )
+        .unwrap();
+        let matching = count_matching_rows(&batch, col("score").gt(lit(3i32)));
+        assert_eq!(matching, 2, "score 4.0 and 5.0 should match > 3");
+    }
+
+    #[test]
+    fn test_update_count_float64_condition_with_float32_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "score",
+            DataType::Float32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Float32Array::from(vec![
+                Some(1.0),
+                Some(2.0),
+                Some(3.0),
+            ]))],
+        )
+        .unwrap();
+        let matching = count_matching_rows(&batch, col("score").eq(lit(2.0)));
+        assert_eq!(
+            matching, 1,
+            "score 2.0 should match equality with Float64 literal"
         );
     }
 }

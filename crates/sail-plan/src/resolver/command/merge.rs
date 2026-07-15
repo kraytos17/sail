@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use datafusion_common::{JoinType, TableReference};
 use datafusion_expr::utils::{expr_to_columns, split_conjunction};
-use datafusion_expr::{Expr, LogicalPlan, SubqueryAlias, build_join_schema};
+use datafusion_expr::{Expr, ExprSchemable, LogicalPlan, SubqueryAlias, build_join_schema};
 use sail_catalog::manager::CatalogManager;
 use sail_common::spec;
 use sail_common_datafusion::catalog::{LakehouseOperation, TableKind};
@@ -412,6 +412,16 @@ impl PlanResolver<'_> {
                 source_schema,
             );
             let resolved_value = self.resolve_expression(value, merge_schema, state).await?;
+            let resolved_value = target_schema
+                .field_with_name(None, &resolved_column)
+                .ok()
+                .map(|field| {
+                    resolved_value
+                        .clone()
+                        .cast_to(field.data_type(), merge_schema.as_ref())
+                })
+                .transpose()?
+                .unwrap_or(resolved_value);
             out.push(MergeAssignment {
                 column: resolved_column,
                 value: resolved_value,
