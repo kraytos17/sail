@@ -1,6 +1,6 @@
 mod instruments;
 
-mod gen {
+mod gen_ {
     include!(concat!(env!("OUT_DIR"), "/metric_registry.rs"));
     include!(concat!(env!("OUT_DIR"), "/metric_attributes.rs"));
 }
@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use gen::{MetricAttribute, MetricRegistry};
+pub use gen_::{MetricAttribute, MetricRegistry};
 pub use instruments::*;
 
 /// Encapsulates a [`MetricRegistry`] together with the metrics collection interval.

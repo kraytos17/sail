@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{DataSourceError, DataSourceResult};
 
-pub mod gen {
+pub mod gen_ {
     include!(concat!(env!("OUT_DIR"), "/options/delta.rs"));
 }
 
@@ -65,9 +65,9 @@ fn non_zero_usize(value: usize) -> NonZeroUsize {
     }
 }
 
-impl ResolveOptions for gen::DeltaReadOptions {
+impl ResolveOptions for gen_::DeltaReadOptions {
     fn resolve(_ctx: &dyn Session, options: Vec<OptionLayer>) -> DataSourceResult<Self> {
-        let mut partial = gen::DeltaReadPartialOptions::initialize();
+        let mut partial = gen_::DeltaReadPartialOptions::initialize();
         for layer in options {
             partial.merge(layer.build_partial_options()?);
         }
@@ -75,9 +75,9 @@ impl ResolveOptions for gen::DeltaReadOptions {
     }
 }
 
-impl ResolveOptions for gen::DeltaWriteOptions {
+impl ResolveOptions for gen_::DeltaWriteOptions {
     fn resolve(_ctx: &dyn Session, options: Vec<OptionLayer>) -> DataSourceResult<Self> {
-        let mut partial = gen::DeltaWritePartialOptions::initialize();
+        let mut partial = gen_::DeltaWritePartialOptions::initialize();
         for layer in options {
             partial.merge(layer.build_partial_options()?);
         }

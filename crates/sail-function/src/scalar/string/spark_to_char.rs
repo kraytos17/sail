@@ -4,9 +4,9 @@ use datafusion::arrow::array::{
     Array, ArrayRef, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int64Array,
     StringArray, UInt64Array,
 };
-use datafusion::arrow::compute::{cast_with_options, CastOptions};
-use datafusion::arrow::datatypes::{i256, DataType};
-use datafusion_common::{exec_err, internal_err, Result};
+use datafusion::arrow::compute::{CastOptions, cast_with_options};
+use datafusion::arrow::datatypes::{DataType, i256};
+use datafusion_common::{Result, exec_err, internal_err};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 
 use crate::error::{invalid_arg_count_exec_err, unsupported_data_type_exec_err};
@@ -49,7 +49,7 @@ impl Default for SparkToChar {
 }
 
 impl ScalarUDFImpl for SparkToChar {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "spark_to_char"
     }
 
@@ -130,10 +130,7 @@ fn spark_to_char_impl(args: &[ArrayRef], ansi_mode: bool) -> Result<ArrayRef> {
     let values = decimal_string_values(&args[0], ansi_mode)?;
     let result: Result<Vec<Option<String>>> = values
         .into_iter()
-        .map(|value| match value {
-            None => Ok(None),
-            Some(value) => number_format.format(&value).map(Some),
-        })
+        .map(|value| value.map_or_else(|| Ok(None), |value| number_format.format(&value).map(Some)))
         .collect();
     Ok(Arc::new(StringArray::from(result?)))
 }
@@ -274,9 +271,11 @@ fn decimal_string_values(array: &ArrayRef, ansi_mode: bool) -> Result<Vec<Option
             let values = downcast_arg!(array, Float32Array);
             values
                 .iter()
-                .map(|v| match v {
-                    None => Ok(None),
-                    Some(v) => DecimalString::try_from_float(v as f64, 14, 7, ansi_mode),
+                .map(|v| {
+                    v.map_or_else(
+                        || Ok(None),
+                        |v| DecimalString::try_from_float(f64::from(v), 14, 7, ansi_mode),
+                    )
                 })
                 .collect()
         }
@@ -284,9 +283,11 @@ fn decimal_string_values(array: &ArrayRef, ansi_mode: bool) -> Result<Vec<Option
             let values = downcast_arg!(array, Float64Array);
             values
                 .iter()
-                .map(|v| match v {
-                    None => Ok(None),
-                    Some(v) => DecimalString::try_from_float(v, 30, 15, ansi_mode),
+                .map(|v| {
+                    v.map_or_else(
+                        || Ok(None),
+                        |v| DecimalString::try_from_float(v, 30, 15, ansi_mode),
+                    )
                 })
                 .collect()
         }
@@ -531,10 +532,10 @@ impl NumberFormat {
                 FormatToken::DecimalPoint => {
                     // If the last character so far is a space, change it to a zero:
                     // the value has no integer part.
-                    if let Some(last) = result.last_mut() {
-                        if *last == b' ' {
-                            *last = b'0';
-                        }
+                    if let Some(last) = result.last_mut()
+                        && *last == b' '
+                    {
+                        *last = b'0';
                     }
                     result.push(b'.');
                     reached_decimal_point = true;
@@ -859,9 +860,9 @@ fn add_space_checking_trailing_characters(result: &mut Vec<u8>) {
 /// If the result contains a decimal point with nothing after it, replace the decimal
 /// point with a space.
 fn strip_trailing_lone_decimal_point(result: &mut [u8]) {
-    if let Some(i) = result.iter().position(|c| *c == b'.') {
-        if i == result.len() - 1 || result[i + 1] == b' ' {
-            result[i] = b' ';
-        }
+    if let Some(i) = result.iter().position(|c| *c == b'.')
+        && (i == result.len() - 1 || result[i + 1] == b' ')
+    {
+        result[i] = b' ';
     }
 }

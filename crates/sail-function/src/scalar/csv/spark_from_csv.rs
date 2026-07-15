@@ -6,7 +6,7 @@ use datafusion::arrow::array::timezone::Tz;
 use datafusion::arrow::array::*;
 use datafusion::arrow::datatypes::*;
 use datafusion::error::{DataFusionError, Result};
-use datafusion_common::{exec_err, plan_err, ScalarValue};
+use datafusion_common::{ScalarValue, exec_err, plan_err};
 use datafusion_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature,
 };
@@ -131,9 +131,11 @@ impl ScalarUDFImpl for SparkFromCSV {
         } = args;
         let schema_str = if let Some(schema) = scalar_arguments.get(1) {
             match schema {
-                Some(ScalarValue::Utf8(Some(s)))
-                | Some(ScalarValue::LargeUtf8(Some(s)))
-                | Some(ScalarValue::Utf8View(Some(s))) => s.as_str(),
+                Some(
+                    ScalarValue::Utf8(Some(s))
+                    | ScalarValue::LargeUtf8(Some(s))
+                    | ScalarValue::Utf8View(Some(s)),
+                ) => s.as_str(),
                 None | Some(_) => {
                     return plan_err!(
                         "`{}` function requires the schema argument to be a string literal",
@@ -165,16 +167,18 @@ impl ScalarUDFImpl for SparkFromCSV {
 
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
         match arg_types {
-            [DataType::Utf8, DataType::Utf8] | [DataType::LargeUtf8, DataType::Utf8] => {
+            [DataType::Utf8 | DataType::LargeUtf8, DataType::Utf8] => {
                 Ok(vec![arg_types[0].clone(), arg_types[1].clone()])
             }
-            [DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8, DataType::Map(_, _)] => {
-                Ok(vec![
-                    arg_types[0].clone(),
-                    arg_types[1].clone(),
-                    arg_types[2].clone(),
-                ])
-            }
+            [
+                DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8,
+                DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8,
+                DataType::Map(_, _),
+            ] => Ok(vec![
+                arg_types[0].clone(),
+                arg_types[1].clone(),
+                arg_types[2].clone(),
+            ]),
             _ => plan_err!(
                 "`{}` function requires 2 or 3 arguments, got {}",
                 Self::FROM_CSV_NAME,

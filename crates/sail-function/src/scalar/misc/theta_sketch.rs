@@ -1,18 +1,18 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    new_null_array, Array, ArrayRef, BinaryArray, BinaryBuilder, Int32Array, Int64Builder,
+    Array, ArrayRef, BinaryArray, BinaryBuilder, Int32Array, Int64Builder, new_null_array,
 };
 use arrow::datatypes::DataType;
-use datafusion_common::{exec_err, Result};
+use datafusion_common::{Result, exec_err};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::signature::{Signature, TypeSignature, Volatility};
 
 use crate::functions_utils::make_scalar_function;
 use crate::theta_sketch::{
-    difference_sketch_bytes, estimate_sketch, intersect_sketch_bytes, union_sketch_bytes,
-    validate_lg_nom_entries, DEFAULT_LG_NOM_ENTRIES,
+    DEFAULT_LG_NOM_ENTRIES, difference_sketch_bytes, estimate_sketch, intersect_sketch_bytes,
+    union_sketch_bytes, validate_lg_nom_entries,
 };
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -41,7 +41,7 @@ impl ThetaSketchEstimateFunction {
 }
 
 impl ScalarUDFImpl for ThetaSketchEstimateFunction {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "theta_sketch_estimate"
     }
 
@@ -99,7 +99,7 @@ impl ThetaUnionFunction {
 }
 
 impl ScalarUDFImpl for ThetaUnionFunction {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "theta_union"
     }
 
@@ -154,7 +154,7 @@ impl ThetaIntersectionFunction {
 }
 
 impl ScalarUDFImpl for ThetaIntersectionFunction {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "theta_intersection"
     }
 
@@ -207,7 +207,7 @@ impl ThetaDifferenceFunction {
 }
 
 impl ScalarUDFImpl for ThetaDifferenceFunction {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "theta_difference"
     }
 

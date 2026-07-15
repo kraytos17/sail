@@ -9,8 +9,8 @@ use url::Url;
 use crate::delta_log::StorageConfig;
 use crate::snapshot::DeltaSnapshotConfig;
 use crate::table::{
-    create_logstore_with_object_store, load_catalog_managed_commits_for_snapshot, DeltaSnapshot,
-    DeltaTable,
+    DeltaSnapshot, DeltaTable, create_logstore_with_object_store,
+    load_catalog_managed_commits_for_snapshot,
 };
 
 const DEFAULT_MAX_ENTRIES: u64 = 1024;

@@ -3,9 +3,9 @@ use std::sync::Arc;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::functions::encoding::expr_fn::decode;
 use datafusion::functions::encoding::inner::DecodeFunc;
-use datafusion_common::{exec_err, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, exec_err};
 use datafusion_expr::simplify::{ExprSimplifyResult, SimplifyContext};
-use datafusion_expr::{expr, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl};
+use datafusion_expr::{Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, expr};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::signature::{Signature, TypeSignature, Volatility};
 use sail_common_datafusion::utils::items::ItemTaker;
@@ -36,7 +36,7 @@ impl SparkToBinary {
 }
 
 impl ScalarUDFImpl for SparkToBinary {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "spark_to_binary"
     }
 
@@ -60,18 +60,18 @@ impl ScalarUDFImpl for SparkToBinary {
             SparkUnHex::new().invoke_with_args(args)
         } else {
             match &args.args[1] {
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
-                | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s)))
-                | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(s)))
-                    if s.trim().to_lowercase() == "utf-8" || s.trim().to_lowercase() == "utf8" =>
-                {
+                ColumnarValue::Scalar(
+                    ScalarValue::Utf8(Some(s))
+                    | ScalarValue::LargeUtf8(Some(s))
+                    | ScalarValue::Utf8View(Some(s)),
+                ) if s.trim().to_lowercase() == "utf-8" || s.trim().to_lowercase() == "utf8" => {
                     args.args[0].cast_to(&DataType::Binary, None)
                 }
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
-                | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s)))
-                | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(s)))
-                    if s.trim().to_lowercase() == "hex" =>
-                {
+                ColumnarValue::Scalar(
+                    ScalarValue::Utf8(Some(s))
+                    | ScalarValue::LargeUtf8(Some(s))
+                    | ScalarValue::Utf8View(Some(s)),
+                ) if s.trim().to_lowercase() == "hex" => {
                     let ScalarFunctionArgs {
                         args,
                         arg_fields,
@@ -88,11 +88,11 @@ impl ScalarUDFImpl for SparkToBinary {
                     };
                     SparkUnHex::new().invoke_with_args(args)
                 }
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
-                | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s)))
-                | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(s)))
-                    if s.trim().to_lowercase() == "base64" =>
-                {
+                ColumnarValue::Scalar(
+                    ScalarValue::Utf8(Some(s))
+                    | ScalarValue::LargeUtf8(Some(s))
+                    | ScalarValue::Utf8View(Some(s)),
+                ) if s.trim().to_lowercase() == "base64" => {
                     let ScalarFunctionArgs {
                         args,
                         arg_fields,
@@ -132,40 +132,39 @@ impl ScalarUDFImpl for SparkToBinary {
         } else {
             let (expr, format) = args.two()?;
             match &format {
-                Expr::Literal(ScalarValue::Utf8(Some(s)), _metadata)
-                | Expr::Literal(ScalarValue::Utf8View(Some(s)), _metadata)
-                | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _metadata)
-                    if s.trim().to_lowercase() == "utf-8" || s.trim().to_lowercase() == "utf8" =>
-                {
+                Expr::Literal(
+                    ScalarValue::Utf8(Some(s))
+                    | ScalarValue::Utf8View(Some(s))
+                    | ScalarValue::LargeUtf8(Some(s)),
+                    _metadata,
+                ) if s.trim().to_lowercase() == "utf-8" || s.trim().to_lowercase() == "utf8" => {
                     Ok(ExprSimplifyResult::Simplified(Expr::Cast(expr::Cast::new(
                         Box::new(expr),
                         DataType::Binary,
                     ))))
                 }
-                Expr::Literal(ScalarValue::Utf8(Some(s)), _metadata)
-                | Expr::Literal(ScalarValue::Utf8View(Some(s)), _metadata)
-                | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _metadata)
-                    if s.trim().to_lowercase() == "hex" =>
-                {
-                    Ok(ExprSimplifyResult::Simplified(Expr::ScalarFunction(
-                        expr::ScalarFunction {
-                            func: Arc::new(ScalarUDF::from(SparkUnHex::new())),
-                            args: vec![expr],
-                        },
-                    )))
-                }
-                Expr::Literal(ScalarValue::Utf8(Some(s)), _metadata)
-                | Expr::Literal(ScalarValue::Utf8View(Some(s)), _metadata)
-                | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _metadata)
-                    if s.trim().to_lowercase() == "base64" =>
-                {
-                    Ok(ExprSimplifyResult::Simplified(Expr::ScalarFunction(
-                        expr::ScalarFunction {
-                            func: Arc::new(ScalarUDF::from(SparkUnbase64::new())),
-                            args: vec![expr],
-                        },
-                    )))
-                }
+                Expr::Literal(
+                    ScalarValue::Utf8(Some(s))
+                    | ScalarValue::Utf8View(Some(s))
+                    | ScalarValue::LargeUtf8(Some(s)),
+                    _metadata,
+                ) if s.trim().to_lowercase() == "hex" => Ok(ExprSimplifyResult::Simplified(
+                    Expr::ScalarFunction(expr::ScalarFunction {
+                        func: Arc::new(ScalarUDF::from(SparkUnHex::new())),
+                        args: vec![expr],
+                    }),
+                )),
+                Expr::Literal(
+                    ScalarValue::Utf8(Some(s))
+                    | ScalarValue::Utf8View(Some(s))
+                    | ScalarValue::LargeUtf8(Some(s)),
+                    _metadata,
+                ) if s.trim().to_lowercase() == "base64" => Ok(ExprSimplifyResult::Simplified(
+                    Expr::ScalarFunction(expr::ScalarFunction {
+                        func: Arc::new(ScalarUDF::from(SparkUnbase64::new())),
+                        args: vec![expr],
+                    }),
+                )),
                 _ => Ok(ExprSimplifyResult::Simplified(decode(expr, format))),
             }
         }
@@ -195,7 +194,7 @@ impl SparkTryToBinary {
 }
 
 impl ScalarUDFImpl for SparkTryToBinary {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "spark_try_to_binary"
     }
 
@@ -209,9 +208,6 @@ impl ScalarUDFImpl for SparkTryToBinary {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let result = SparkToBinary::new().invoke_with_args(args);
-        match result {
-            Ok(result) => Ok(result),
-            Err(_) => Ok(ColumnarValue::Scalar(ScalarValue::Binary(None))),
-        }
+        result.map_or_else(|_| Ok(ColumnarValue::Scalar(ScalarValue::Binary(None))), Ok)
     }
 }

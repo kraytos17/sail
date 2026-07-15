@@ -3,7 +3,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{ArrayRef, GenericStringArray, OffsetSizeTrait, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use datafusion_common::cast::{as_generic_string_array, as_string_view_array};
-use datafusion_common::{exec_err, Result};
+use datafusion_common::{Result, exec_err};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 
 use crate::functions_utils::make_scalar_function;
@@ -28,7 +28,7 @@ impl Soundex {
 }
 
 impl ScalarUDFImpl for Soundex {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "soundex"
     }
 
@@ -67,7 +67,7 @@ enum SoundexChar {
 }
 
 /// Classifies a character for Soundex processing.
-fn classify_char(c: char) -> SoundexChar {
+const fn classify_char(c: char) -> SoundexChar {
     match c.to_ascii_uppercase() {
         'B' | 'F' | 'P' | 'V' => SoundexChar::Code('1'),
         'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => SoundexChar::Code('2'),

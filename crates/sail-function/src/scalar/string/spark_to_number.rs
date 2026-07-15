@@ -6,7 +6,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{ArrayRef, StringArray, *};
 use datafusion::arrow::datatypes::{DataType, *};
 use datafusion_common::{
-    exec_datafusion_err, exec_err, internal_err, DataFusionError, Result, ScalarValue,
+    DataFusionError, Result, ScalarValue, exec_datafusion_err, exec_err, internal_err,
 };
 use datafusion_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature,
@@ -160,24 +160,26 @@ fn spark_to_number_impl(args: &[ArrayRef], safe: bool) -> Result<ArrayRef> {
 
     let scalars: Result<Vec<ScalarValue>> = values
         .iter()
-        .map(|value| match value {
-            None => Ok(ScalarValue::Decimal256(None, precision, scale)),
-            Some(value) => {
-                let result = ParsedNumber::try_from_value(
-                    value,
-                    &format_spec,
-                    &value_regex,
-                    &number_components,
-                )
-                .map(|parsed| {
-                    ScalarValue::Decimal256(Some(parsed.value), parsed.precision, parsed.scale)
-                });
-                if safe {
-                    Ok(result.unwrap_or(ScalarValue::Decimal256(None, precision, scale)))
-                } else {
-                    result.map_err(|e| exec_datafusion_err!("{}", e))
-                }
-            }
+        .map(|value| {
+            value.map_or_else(
+                || Ok(ScalarValue::Decimal256(None, precision, scale)),
+                |value| {
+                    let result = ParsedNumber::try_from_value(
+                        value,
+                        &format_spec,
+                        &value_regex,
+                        &number_components,
+                    )
+                    .map(|parsed| {
+                        ScalarValue::Decimal256(Some(parsed.value), parsed.precision, parsed.scale)
+                    });
+                    if safe {
+                        Ok(result.unwrap_or(ScalarValue::Decimal256(None, precision, scale)))
+                    } else {
+                        result.map_err(|e| exec_datafusion_err!("{}", e))
+                    }
+                },
+            )
         })
         .collect();
 
@@ -198,8 +200,8 @@ impl TryFrom<&RegexSpec> for NumberComponents {
     fn try_from(format_spec: &RegexSpec) -> Result<Self, Self::Error> {
         let numbers: String = format_spec.numbers.replace(",", "").replace("G", "");
         let decimals: Option<String> = format_spec.decimals.clone();
-        let scale = decimals.as_ref().map_or(0, |d| d.len()) as i8;
-        let precision = numbers.len() as u8 + scale as u8;
+        let scale = decimals.as_ref().map_or(0, String::len) as i8;
+        let precision = numbers.len() as u8 + scale.cast_unsigned();
 
         Ok(Self {
             numbers,
@@ -219,8 +221,7 @@ impl TryFrom<&Captures<'_>> for NumberComponents {
         // However, in this case, we will use just numbers and decimals parts. So, it's ok.
         // Just keep in mind this in the future.
         let spec = RegexSpec::try_from(captures)?;
-        let spec: NumberComponents = NumberComponents::try_from(&spec)?;
-        Ok(spec)
+        Self::try_from(&spec)
     }
 }
 
@@ -314,7 +315,7 @@ impl TryFrom<&str> for RegexSpec {
         // (G, D, L, MI, PR, S) case-insensitive (e.g. `9g999` == `9G999`).
         let format = format.to_uppercase();
         let captures: Captures = match_regex(&format, &FORMAT_REGEX)?;
-        RegexSpec::try_from(&captures)
+        Self::try_from(&captures)
     }
 }
 
@@ -421,10 +422,7 @@ pub fn parse_number(
         );
     }
 
-    let right_zeros: String = Vec::from_iter(0..f_scale - v_scale)
-        .into_iter()
-        .map(|_| '0')
-        .collect::<String>();
+    let right_zeros: String = (0..f_scale - v_scale).map(|_| '0').collect();
 
     // Format the value with the decimals if present
     let value: String = if let Some(decimals) = v_decimals {
@@ -454,50 +452,50 @@ pub fn parse_number(
 
 #[derive(Debug, Clone)]
 pub enum PatternExpression {
-    LeftSign(bool),                   // only_negative
-    RightSign(bool),                  // only_negative
-    Currency(String),                 // currency character
-    Brackets(Box<PatternExpression>), // repr: <expression>
+    LeftSign(bool),      // only_negative
+    RightSign(bool),     // only_negative
+    Currency(String),    // currency character
+    Brackets(Box<Self>), // repr: <expression>
     Number,
     Dot(String), // decimal separator character
     Decimal,
-    Group(Vec<PatternExpression>), // repr: [expression]
-    Empty,                         // empty expression
+    Group(Vec<Self>), // repr: [expression]
+    Empty,            // empty expression
 }
 
 impl PatternExpression {
-    pub fn append(self, expr: PatternExpression) -> Result<Self> {
+    pub fn append(self, expr: Self) -> Self {
         match self {
-            PatternExpression::Group(mut group) => {
+            Self::Group(mut group) => {
                 group.push(expr);
-                Ok(PatternExpression::Group(group))
+                Self::Group(group)
             }
-            _ => Ok(PatternExpression::Group(vec![self, expr])),
+            _ => Self::Group(vec![self, expr]),
         }
     }
 
-    pub fn prepend(self, expr: PatternExpression) -> Result<Self> {
+    pub fn prepend(self, expr: Self) -> Self {
         match self {
-            PatternExpression::Group(mut group) => {
+            Self::Group(mut group) => {
                 group.insert(0, expr);
-                Ok(PatternExpression::Group(group))
+                Self::Group(group)
             }
-            _ => Ok(PatternExpression::Group(vec![expr, self])),
+            _ => Self::Group(vec![expr, self]),
         }
     }
     pub fn try_from(format: &RegexSpec) -> Result<Self> {
-        let expr: PatternExpression = PatternExpression::Number;
-        let expr: PatternExpression = handle_decimal(format)?.prepend(expr)?;
-        let expr: PatternExpression = handle_currency(format, &expr)?;
-        let expr: PatternExpression = handle_sign(format, &expr)?;
-        handle_brackets(format, &expr)
+        let expr: Self = Self::Number;
+        let expr: Self = handle_decimal(format)?.prepend(expr);
+        let expr: Self = handle_currency(format, &expr)?;
+        let expr: Self = handle_sign(format, &expr);
+        Ok(handle_brackets(format, &expr))
     }
 }
 
 impl Display for PatternExpression {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PatternExpression::LeftSign(only_negative) => {
+            Self::LeftSign(only_negative) => {
                 if *only_negative {
                     // MI: minus or space (space = positive)
                     write!(f, "(?<sign_left>[- ])?")
@@ -505,24 +503,24 @@ impl Display for PatternExpression {
                     write!(f, "(?<sign_left>[+-])?")
                 }
             }
-            PatternExpression::RightSign(only_negative) => {
+            Self::RightSign(only_negative) => {
                 if *only_negative {
                     write!(f, "(?<sign_right>[- ])?")
                 } else {
                     write!(f, "(?<sign_right>[+-])?")
                 }
             }
-            PatternExpression::Currency(currency) => write!(f, "(?<currency>[{currency}])"),
-            PatternExpression::Brackets(expr) => {
+            Self::Currency(currency) => write!(f, "(?<currency>[{currency}])"),
+            Self::Brackets(expr) => {
                 // PR format: <123> for negative, space-padded for positive
                 write!(f, "(?<angled_left>[< ])?{expr}(?<angled_right>[> ])?")
             }
             // `*` (not `+`) so values with no integer part (e.g. `.5` against
             // format `.99`) match; an entirely empty value is rejected downstream.
-            PatternExpression::Number => write!(f, "(?<numbers>[0-9,]*)"),
-            PatternExpression::Dot(_dot) => write!(f, "(?<dot>[.])?"),
-            PatternExpression::Decimal => write!(f, "(?<decimals>[0-9]+)?"),
-            PatternExpression::Group(group) => {
+            Self::Number => write!(f, "(?<numbers>[0-9,]*)"),
+            Self::Dot(_dot) => write!(f, "(?<dot>[.])?"),
+            Self::Decimal => write!(f, "(?<decimals>[0-9]+)?"),
+            Self::Group(group) => {
                 write!(
                     f,
                     "{}",
@@ -531,49 +529,47 @@ impl Display for PatternExpression {
                         .fold(String::new(), |acc, expr| { format!("{acc}{expr}") })
                 )
             }
-            PatternExpression::Empty => write!(f, ""),
+            Self::Empty => write!(f, ""),
         }
     }
 }
 
 /// Validates and adjusts a `PatternExpression` to include brackets if applicable.
-fn handle_brackets(format_spec: &RegexSpec, expr: &PatternExpression) -> Result<PatternExpression> {
+fn handle_brackets(format_spec: &RegexSpec, expr: &PatternExpression) -> PatternExpression {
     match format_spec.right_sign.clone() {
-        Some(sign) if sign.as_str() == "PR" => {
-            Ok(PatternExpression::Brackets(Box::new(expr.clone())))
-        }
-        _ => Ok(expr.clone()),
+        Some(sign) if sign.as_str() == "PR" => PatternExpression::Brackets(Box::new(expr.clone())),
+        _ => expr.clone(),
     }
 }
 
 /// Modifies a `PatternExpression` to incorporate sign information based on regex captures.
-fn handle_sign(format_spec: &RegexSpec, expr: &PatternExpression) -> Result<PatternExpression> {
+fn handle_sign(format_spec: &RegexSpec, expr: &PatternExpression) -> PatternExpression {
     match (
         format_spec.left_sign.clone(),
         format_spec.right_sign.clone(),
     ) {
         (Some(left_sign), Some(right_sign)) if right_sign.as_str() == "PR" => {
-            Ok(PatternExpression::LeftSign(left_sign.as_str() == "MI").append(expr.clone())?)
+            PatternExpression::LeftSign(left_sign.as_str() == "MI").append(expr.clone())
         }
         (Some(left_sign), Some(right_sign)) => {
             let expr: PatternExpression =
-                PatternExpression::RightSign(right_sign.as_str() == "MI").prepend(expr.clone())?;
-            Ok(PatternExpression::LeftSign(left_sign.as_str() == "MI").append(expr.clone())?)
+                PatternExpression::RightSign(right_sign.as_str() == "MI").prepend(expr.clone());
+            PatternExpression::LeftSign(left_sign.as_str() == "MI").append(expr)
         }
         (Some(sign), None) => {
-            Ok(PatternExpression::LeftSign(sign.as_str() == "MI").append(expr.clone())?)
+            PatternExpression::LeftSign(sign.as_str() == "MI").append(expr.clone())
         }
         (None, Some(sign)) if sign.as_str() != "PR" => {
-            Ok(PatternExpression::RightSign(sign.as_str() == "MI").prepend(expr.clone())?)
+            PatternExpression::RightSign(sign.as_str() == "MI").prepend(expr.clone())
         }
-        _ => Ok(expr.clone()),
+        _ => expr.clone(),
     }
 }
 
 /// Appends decimal handling to a `PatternExpression` based on regex information.
 pub fn handle_decimal(format_spec: &RegexSpec) -> Result<PatternExpression> {
     match (format_spec.dot.clone(), format_spec.decimals.clone()) {
-        (Some(dot), Some(_)) => PatternExpression::Dot(dot).append(PatternExpression::Decimal),
+        (Some(dot), Some(_)) => Ok(PatternExpression::Dot(dot).append(PatternExpression::Decimal)),
         (None, None) => Ok(PatternExpression::Empty),
         _ => exec_err!(
             "{}",
@@ -592,8 +588,8 @@ pub fn handle_currency(
         format_spec.currency_right.clone(),
     ) {
         (Some(_), Some(_)) => exec_err!("{}", "Currency group is not well formed".to_string()),
-        (Some(currency), None) => PatternExpression::Currency(currency).append(expr.clone()),
-        (None, Some(currency)) => PatternExpression::Currency(currency).prepend(expr.clone()),
+        (Some(currency), None) => Ok(PatternExpression::Currency(currency).append(expr.clone())),
+        (None, Some(currency)) => Ok(PatternExpression::Currency(currency).prepend(expr.clone())),
         _ => Ok(expr.clone()),
     }
 }
@@ -644,7 +640,9 @@ fn match_grouping(value_captures: &Captures, format_spec: &RegexSpec) -> Result<
     let has_comma = format_positions.iter().any(|(_, d)| *d == ',');
     let has_g = format_positions.iter().any(|(_, d)| *d == 'G');
     if has_comma && has_g {
-        return exec_err!("Malformed integer format related groupings: {format_numbers}. Cannot mix ',' and 'G' separators.");
+        return exec_err!(
+            "Malformed integer format related groupings: {format_numbers}. Cannot mix ',' and 'G' separators."
+        );
     }
 
     // Check if the groupings are in the correct order position

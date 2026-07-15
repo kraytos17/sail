@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{FieldRef, Schema};
-use datafusion::common::{plan_err, Result};
+use datafusion::common::{Result, plan_err};
 use datafusion::physical_expr::{HigherOrderFunctionExpr, PhysicalExpr};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::generated::datafusion_common as gen_datafusion_common;
@@ -15,8 +15,8 @@ use sail_function::scalar::array::spark_array_forall::SparkArrayForall;
 use sail_function::scalar::array::spark_array_sort::SparkArraySort;
 use sail_function::scalar::array::spark_array_transform::SparkArrayTransform;
 
-use crate::plan::gen;
-use crate::plan::gen::higher_order_udf::HigherOrderUdfKind;
+use crate::plan::gen_;
+use crate::plan::gen_::higher_order_udf::HigherOrderUdfKind;
 use crate::proto::converter::RemotePhysicalProtoConverter;
 
 pub fn try_encode_message<M>(message: M) -> Result<Vec<u8>>
@@ -67,32 +67,32 @@ pub fn physical_expr_to_proto(
     converter.physical_expr_to_proto(expr, codec)
 }
 
-pub fn try_encode_higher_order_udf(hof: &HigherOrderFunctionExpr) -> Result<gen::HigherOrderUdf> {
+pub fn try_encode_higher_order_udf(hof: &HigherOrderFunctionExpr) -> Result<gen_::HigherOrderUdf> {
     let udf_inner = hof.fun().inner().as_ref() as &dyn std::any::Any;
     let udf_kind = if let Some(filter) = udf_inner.downcast_ref::<SparkArrayFilter>() {
-        HigherOrderUdfKind::Filter(gen::SparkArrayFilterUdf {
+        HigherOrderUdfKind::Filter(gen_::SparkArrayFilterUdf {
             index_first: filter.is_index_first(),
         })
     } else if let Some(transform) = udf_inner.downcast_ref::<SparkArrayTransform>() {
-        HigherOrderUdfKind::Transform(gen::SparkArrayTransformUdf {
+        HigherOrderUdfKind::Transform(gen_::SparkArrayTransformUdf {
             index_first: transform.is_index_first(),
         })
     } else if let Some(aggregate) = udf_inner.downcast_ref::<SparkArrayAggregate>() {
-        HigherOrderUdfKind::Aggregate(gen::SparkArrayAggregateUdf {
+        HigherOrderUdfKind::Aggregate(gen_::SparkArrayAggregateUdf {
             element_first: aggregate.is_element_first(),
         })
     } else if udf_inner.is::<SparkArrayExists>() {
-        HigherOrderUdfKind::Exists(gen::SparkArrayExistsUdf {})
+        HigherOrderUdfKind::Exists(gen_::SparkArrayExistsUdf {})
     } else if udf_inner.is::<SparkArrayForall>() {
-        HigherOrderUdfKind::Forall(gen::SparkArrayForallUdf {})
+        HigherOrderUdfKind::Forall(gen_::SparkArrayForallUdf {})
     } else if let Some(sort) = udf_inner.downcast_ref::<SparkArraySort>() {
-        HigherOrderUdfKind::Sort(gen::SparkArraySortUdf {
+        HigherOrderUdfKind::Sort(gen_::SparkArraySortUdf {
             swapped: sort.is_swapped(),
         })
     } else {
         return plan_err!("unsupported higher-order function: {}", hof.name());
     };
-    Ok(gen::HigherOrderUdf {
+    Ok(gen_::HigherOrderUdf {
         higher_order_udf_kind: Some(udf_kind),
     })
 }

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use datafusion::arrow;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, RecordBatch, RecordBatchOptions};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::common::cast::{as_float64_array, as_string_array};
 use datafusion::common::ScalarValue;
+use datafusion::common::cast::{as_float64_array, as_string_array};
 use datafusion::error::Result;
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::{Accumulator, AggregateUDFImpl, Signature, Volatility};
@@ -1362,7 +1362,7 @@ impl Accumulator for MultiIntervalPercentileAccumulator {
                         return Err(DataFusionError::Execution(format!(
                             "Unexpected data type for interval percentile: {:?}",
                             self.data_type
-                        )))
+                        )));
                     }
                 };
 
@@ -1416,7 +1416,7 @@ impl Accumulator for MultiIntervalPercentileAccumulator {
                         return Err(DataFusionError::Execution(format!(
                             "Unexpected data type: {:?}",
                             self.data_type
-                        )))
+                        )));
                     }
                 };
                 results.push(null_scalar);
@@ -1532,7 +1532,7 @@ impl Accumulator for MultiIntervalPercentileAccumulator {
                         return Err(DataFusionError::Execution(format!(
                             "Unexpected data type for interval percentile: {:?}",
                             self.data_type
-                        )))
+                        )));
                     }
                 };
 
@@ -1656,7 +1656,7 @@ fn scalar_to_f64(scalar: &ScalarValue) -> Result<f64, DataFusionError> {
             return Err(DataFusionError::Execution(format!(
                 "Cannot convert percentile literal {:?} to f64",
                 scalar
-            )))
+            )));
         }
     };
     Ok(percentile)

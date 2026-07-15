@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, StructArray};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields};
-use datafusion_common::{exec_err, Result};
+use datafusion_common::{Result, exec_err};
 use datafusion_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
@@ -66,7 +66,7 @@ impl StructFunction {
 }
 
 impl ScalarUDFImpl for StructFunction {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "struct"
     }
 

@@ -41,7 +41,8 @@ pub enum Token<'a> {
 }
 
 impl Token<'_> {
-    pub fn is_whitespace(&self) -> bool {
+    #[must_use]
+    pub const fn is_whitespace(&self) -> bool {
         matches!(
             self,
             Token::Space { .. }
@@ -90,7 +91,7 @@ impl Display for Token<'_> {
 
 /// A SQL token label.
 /// This is useful in error messages to represent an expected class of token values.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenLabel {
     /// A keyword.
     Keyword(Keyword),
@@ -117,7 +118,7 @@ pub enum TokenLabel {
 }
 
 impl<'a> From<TokenLabel> for RichPattern<'a, Token<'a>> {
-    fn from(value: TokenLabel) -> RichPattern<'a, Token<'a>> {
+    fn from(value: TokenLabel) -> Self {
         match value {
             TokenLabel::Keyword(k) => RichPattern::Identifier(k.as_str().to_string()),
             TokenLabel::Operator(op) => {
@@ -137,7 +138,7 @@ impl<'a> From<TokenLabel> for RichPattern<'a, Token<'a>> {
 }
 
 /// A style of SQL string literal.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[expect(clippy::enum_variant_names)]
 pub enum StringStyle {
     /// A string literal surrounded by one single quote on each side
@@ -217,14 +218,14 @@ macro_rules! punctuation_enum {
         }
 
         impl Punctuation {
-            pub fn from_char(c: char) -> Option<Self> {
+            pub const fn from_char(c: char) -> Option<Self> {
                 match c {
                     $($ch => Some(Self::$p),)*
                     _ => None,
                 }
             }
 
-            pub fn to_char(self) -> char {
+            pub const fn to_char(self) -> char {
                 match self {
                     $(Self::$p => $ch,)*
                 }
@@ -244,7 +245,7 @@ macro_rules! keyword_enum {
         }
 
         impl Keyword {
-            pub fn as_str(&self) -> &'static str {
+            pub const fn as_str(&self) -> &'static str {
                 match self {
                     $(Self::$identifier => $string,)*
                 }
@@ -264,8 +265,9 @@ macro_rules! keyword_map_value {
 static KEYWORD_MAP: phf::Map<&'static str, Keyword> = keyword_map!(keyword_map_value);
 
 impl Keyword {
+    #[must_use]
     pub fn get(value: &str) -> Option<Self> {
-        KEYWORD_MAP.get(value.to_uppercase().as_str()).cloned()
+        KEYWORD_MAP.get(value.to_uppercase().as_str()).copied()
     }
 
     /// Whether the keyword is a reserved keyword in ANSI mode SQL parsing.
@@ -293,7 +295,8 @@ impl Keyword {
     /// See also:
     /// * <https://spark.apache.org/docs/latest/sql-ref-ansi-compliance.html>
     /// * <https://www.antlr.org/papers/allstar-techreport.pdf>
-    pub fn is_reserved_in_ansi_mode(&self) -> bool {
+    #[must_use]
+    pub const fn is_reserved_in_ansi_mode(&self) -> bool {
         matches!(
             self,
             Self::All
@@ -376,7 +379,8 @@ impl Keyword {
     /// Whether the keyword is reserved for use as a column alias.
     /// These keywords cannot be used as column aliases unless quoted.
     /// This list is adapted from `sqlparser-rs`.
-    pub fn is_reserved_for_column_alias(&self) -> bool {
+    #[must_use]
+    pub const fn is_reserved_for_column_alias(&self) -> bool {
         matches!(
             self,
             Self::Analyze
@@ -408,7 +412,8 @@ impl Keyword {
     /// These keywords cannot be used as table aliases unless quoted.
     /// This includes the "strict-non-reserved" keywords in Spark SQL
     /// default mode, as well as additional keywords from `sqlparser-rs`.
-    pub fn is_reserved_for_table_alias(&self) -> bool {
+    #[must_use]
+    pub const fn is_reserved_for_table_alias(&self) -> bool {
         matches!(
             self,
             // "strict-non-reserved" keywords in Spark SQL default mode

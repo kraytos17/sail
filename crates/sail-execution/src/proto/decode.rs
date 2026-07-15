@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{Field, FieldRef, Schema};
-use datafusion::common::{plan_datafusion_err, Result};
+use datafusion::common::{Result, plan_datafusion_err};
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::HigherOrderUDF;
 use datafusion::physical_expr::PhysicalExpr;
@@ -19,8 +19,8 @@ use sail_function::scalar::array::spark_array_forall::SparkArrayForall;
 use sail_function::scalar::array::spark_array_sort::SparkArraySort;
 use sail_function::scalar::array::spark_array_transform::SparkArrayTransform;
 
-use crate::plan::gen;
-use crate::plan::gen::higher_order_udf::HigherOrderUdfKind;
+use crate::plan::gen_;
+use crate::plan::gen_::higher_order_udf::HigherOrderUdfKind;
 use crate::proto::converter::RemotePhysicalProtoConverter;
 
 pub fn try_decode_message<M>(buf: &[u8]) -> Result<M>
@@ -80,14 +80,14 @@ pub fn proto_to_physical_expr(
     converter.proto_to_physical_expr(expr, schema, &PhysicalPlanDecodeContext::new(ctx, codec))
 }
 
-pub fn try_decode_higher_order_udf(udf: &gen::HigherOrderUdf) -> Result<Arc<HigherOrderUDF>> {
+pub fn try_decode_higher_order_udf(udf: &gen_::HigherOrderUdf) -> Result<Arc<HigherOrderUDF>> {
     let udf_kind = udf
         .higher_order_udf_kind
         .as_ref()
         .cloned()
         .ok_or_else(|| plan_datafusion_err!("missing higher-order function UDF"))?;
     Ok(match udf_kind {
-        HigherOrderUdfKind::Filter(gen::SparkArrayFilterUdf { index_first }) => {
+        HigherOrderUdfKind::Filter(gen_::SparkArrayFilterUdf { index_first }) => {
             if index_first {
                 Arc::new(HigherOrderUDF::new_from_impl(
                     SparkArrayFilter::new_index_first(),
@@ -96,7 +96,7 @@ pub fn try_decode_higher_order_udf(udf: &gen::HigherOrderUdf) -> Result<Arc<High
                 Arc::new(HigherOrderUDF::new_from_impl(SparkArrayFilter::new()))
             }
         }
-        HigherOrderUdfKind::Transform(gen::SparkArrayTransformUdf { index_first }) => {
+        HigherOrderUdfKind::Transform(gen_::SparkArrayTransformUdf { index_first }) => {
             if index_first {
                 Arc::new(HigherOrderUDF::new_from_impl(
                     SparkArrayTransform::new_index_first(),
@@ -105,7 +105,7 @@ pub fn try_decode_higher_order_udf(udf: &gen::HigherOrderUdf) -> Result<Arc<High
                 Arc::new(HigherOrderUDF::new_from_impl(SparkArrayTransform::new()))
             }
         }
-        HigherOrderUdfKind::Aggregate(gen::SparkArrayAggregateUdf { element_first }) => {
+        HigherOrderUdfKind::Aggregate(gen_::SparkArrayAggregateUdf { element_first }) => {
             if element_first {
                 Arc::new(HigherOrderUDF::new_from_impl(
                     SparkArrayAggregate::new_element_first(),
@@ -114,13 +114,13 @@ pub fn try_decode_higher_order_udf(udf: &gen::HigherOrderUdf) -> Result<Arc<High
                 Arc::new(HigherOrderUDF::new_from_impl(SparkArrayAggregate::new()))
             }
         }
-        HigherOrderUdfKind::Exists(gen::SparkArrayExistsUdf {}) => {
+        HigherOrderUdfKind::Exists(gen_::SparkArrayExistsUdf {}) => {
             Arc::new(HigherOrderUDF::new_from_impl(SparkArrayExists::new()))
         }
-        HigherOrderUdfKind::Forall(gen::SparkArrayForallUdf {}) => {
+        HigherOrderUdfKind::Forall(gen_::SparkArrayForallUdf {}) => {
             Arc::new(HigherOrderUDF::new_from_impl(SparkArrayForall::new()))
         }
-        HigherOrderUdfKind::Sort(gen::SparkArraySortUdf { swapped }) => {
+        HigherOrderUdfKind::Sort(gen_::SparkArraySortUdf { swapped }) => {
             if swapped {
                 Arc::new(HigherOrderUDF::new_from_impl(SparkArraySort::new_swapped()))
             } else {

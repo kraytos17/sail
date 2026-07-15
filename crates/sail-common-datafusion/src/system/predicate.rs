@@ -270,7 +270,7 @@ impl<U> PredicateFilterAsyncFlatMapTask<U> {
 mod tests {
     use std::sync::Arc;
 
-    use datafusion_common::{internal_err, Result};
+    use datafusion_common::{Result, internal_err};
 
     use super::{Predicate, PredicateExt};
 

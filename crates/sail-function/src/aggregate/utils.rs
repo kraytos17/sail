@@ -74,7 +74,7 @@ pub fn validate_percentile(expr: &Arc<dyn PhysicalExpr>) -> Result<f64> {
             return Err(DataFusionError::Plan(format!(
                 "Percentile value for 'PERCENTILE_DISC' must be Float32 or Float64 literal (got data type {})",
                 sv.data_type()
-            )))
+            )));
         }
     };
 
@@ -135,7 +135,7 @@ pub(crate) fn scalar_to_f64(scalar: &ScalarValue) -> Result<f64> {
         _ => {
             return Err(DataFusionError::Plan(format!(
                 "Cannot convert percentile literal {scalar:?} to f64"
-            )))
+            )));
         }
     };
     Ok(percentile)

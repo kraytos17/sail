@@ -5,8 +5,8 @@ use datafusion::arrow::array::UInt64Array;
 use datafusion::arrow::compute::concat_batches;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::execution::context::TaskContext;
 use datafusion::execution::SessionState;
+use datafusion::execution::context::TaskContext;
 use datafusion::physical_expr::{Distribution, EquivalenceProperties};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -19,7 +19,7 @@ use futures::stream::once;
 use object_store::ObjectStoreExt;
 use sail_common_datafusion::catalog::LakehouseExecutionContext;
 
-use crate::catalog_support::commit_helper::{commit_iceberg_changes, CommitResult};
+use crate::catalog_support::commit_helper::{CommitResult, commit_iceberg_changes};
 use crate::io::StoreContext;
 use crate::operations::snapshot::SnapshotProduceOperation;
 use crate::operations::write::arrow_parquet::ArrowParquetWriter;
@@ -393,7 +393,7 @@ pub(crate) async fn run_compaction(
         )
         .await
         {
-            Ok(CommitResult::Committed { .. }) => {
+            Ok(CommitResult::Committed) => {
                 return Ok(num_small_files);
             }
             Err(e) => {
@@ -470,7 +470,7 @@ impl IcebergCompactExec {
         for (_partition_key, group_files) in groups {
             // Sort by file size descending for better bin-packing
             let mut sorted = group_files;
-            sorted.sort_by(|a, b| b.file_size_in_bytes.cmp(&a.file_size_in_bytes));
+            sorted.sort_by_key(|b| std::cmp::Reverse(b.file_size_in_bytes));
 
             let mut current_batch = CompactBatch {
                 partition_values: Vec::new(),
@@ -568,7 +568,10 @@ impl IcebergCompactExec {
             concat_batches(&file_schema, &all_batches)
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
         } else if all_batches.len() == 1 {
-            all_batches.into_iter().next().unwrap()
+            all_batches
+                .into_iter()
+                .next()
+                .expect("all_batches has exactly 1 element, verified by len() check above")
         } else {
             return Err(DataFusionError::Execution("No data to compact".to_string()));
         };

@@ -31,7 +31,7 @@ impl SparkVersion {
 }
 
 impl ScalarUDFImpl for SparkVersion {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "version"
     }
 

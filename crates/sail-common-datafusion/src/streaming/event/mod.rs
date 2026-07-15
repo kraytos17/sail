@@ -5,7 +5,7 @@ pub mod stream;
 
 use datafusion::arrow::array::{BooleanArray, BooleanBuilder, RecordBatch};
 
-pub(crate) mod gen {
+pub(crate) mod gen_ {
     tonic::include_proto!("sail.streaming");
 }
 

@@ -28,28 +28,29 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::runtime::SpawnedTask;
 use log::debug;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
+use parquet::arrow::AsyncArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::async_writer::ParquetObjectWriter;
-use parquet::arrow::AsyncArrowWriter;
 use uuid::Uuid;
 
 use crate::checkpoint::action_fields::{
-    normalize_checkpoint_batch_for_decode, AddAugmentationConfig,
+    AddAugmentationConfig, normalize_checkpoint_batch_for_decode,
 };
 use crate::delta_log::segment_files::ReplayedTableHeader;
 use crate::delta_log::{
-    get_actions, list_delta_log_entries_from, parse_checkpoint_version_from_location,
+    LogStore, get_actions, list_delta_log_entries_from, parse_checkpoint_version_from_location,
     parse_commit_version_from_location, read_last_checkpoint_version_from_store,
-    resolve_commit_timestamp_from_actions, LogStore,
+    resolve_commit_timestamp_from_actions,
 };
 pub(crate) use crate::delta_log::{
     latest_replayable_version, load_replayed_table_header, load_replayed_table_state,
 };
 use crate::spec::{
-    checkpoint_path, is_json_checkpoint_filename, last_checkpoint_path, logical_file_key,
-    sidecar_file_path, uuid_checkpoint_path, Action, Add, CheckpointActionRow, CheckpointMetadata,
-    DeltaError as DeltaTableError, DeltaResult, DomainMetadata, LastCheckpointHint, LogicalFileKey,
-    Metadata, Protocol, Remove, Sidecar, TableFeature, TableProperties, Transaction,
+    Action, Add, CheckpointActionRow, CheckpointMetadata, DeltaError as DeltaTableError,
+    DeltaResult, DomainMetadata, LastCheckpointHint, LogicalFileKey, Metadata, Protocol, Remove,
+    Sidecar, TableFeature, TableProperties, Transaction, checkpoint_path,
+    is_json_checkpoint_filename, last_checkpoint_path, logical_file_key, sidecar_file_path,
+    uuid_checkpoint_path,
 };
 
 mod action_fields;
@@ -588,10 +589,10 @@ impl<'a> CheckpointManager<'a> {
                 }
                 continue;
             }
-            if let Some(v) = parse_checkpoint_version_from_location(&meta.location) {
-                if v <= version {
-                    checkpoint_entries.push((v, meta));
-                }
+            if let Some(v) = parse_checkpoint_version_from_location(&meta.location)
+                && v <= version
+            {
+                checkpoint_entries.push((v, meta));
             }
         }
         commit_entries.sort_by_key(|(av, _)| *av);
@@ -1383,22 +1384,22 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
-    use parquet::arrow::async_writer::ParquetObjectWriter;
     use parquet::arrow::AsyncArrowWriter;
+    use parquet::arrow::async_writer::ParquetObjectWriter;
 
     use super::{
-        checkpoint_fields, decode_checkpoint_rows, encode_checkpoint_rows,
-        read_checkpoint_rows_from_checkpoint_file, replay_commit_header_actions,
-        ReconciledCheckpointState, ReconciledHeaderState,
+        ReconciledCheckpointState, ReconciledHeaderState, checkpoint_fields,
+        decode_checkpoint_rows, encode_checkpoint_rows, read_checkpoint_rows_from_checkpoint_file,
+        replay_commit_header_actions,
     };
     use crate::checkpoint::action_fields::{
-        normalize_checkpoint_batch_for_decode, AddAugmentationConfig,
+        AddAugmentationConfig, normalize_checkpoint_batch_for_decode,
     };
     use crate::spec::{
-        sidecar_file_path, Action, Add, CheckpointActionRow, CheckpointMetadata, CommitInfo,
-        DataType, DeletionVectorDescriptor, DeltaError as DeltaTableError, DeltaResult,
-        DomainMetadata, Metadata, Protocol, Remove, Sidecar, StorageType, StructField, StructType,
-        TableFeature, Transaction,
+        Action, Add, CheckpointActionRow, CheckpointMetadata, CommitInfo, DataType,
+        DeletionVectorDescriptor, DeltaError as DeltaTableError, DeltaResult, DomainMetadata,
+        Metadata, Protocol, Remove, Sidecar, StorageType, StructField, StructType, TableFeature,
+        Transaction, sidecar_file_path,
     };
 
     fn encode_rows_for_test(rows: &Vec<CheckpointActionRow>) -> DeltaResult<RecordBatch> {
@@ -1976,8 +1977,7 @@ mod tests {
             commit_timestamp: None,
         };
 
-        let sidecar_filename =
-            "00000000000000000002.checkpoint.0000000001.0000000001.bbf4d2d5-b626-41f8-854f-63b5e397ad82.parquet";
+        let sidecar_filename = "00000000000000000002.checkpoint.0000000001.0000000001.bbf4d2d5-b626-41f8-854f-63b5e397ad82.parquet";
         let sidecar_batch = encode_rows_for_test(&vec![CheckpointActionRow {
             add: Some(add.clone()),
             ..Default::default()
@@ -2160,15 +2160,21 @@ mod tests {
 
         state.prune_expired_checkpoint_actions(now)?;
 
-        assert!(!state
-            .removes
-            .contains_key(&("expired.parquet".to_string(), None)));
-        assert!(state
-            .removes
-            .contains_key(&("fresh.parquet".to_string(), None)));
-        assert!(state
-            .removes
-            .contains_key(&("unknown-ts.parquet".to_string(), None)));
+        assert!(
+            !state
+                .removes
+                .contains_key(&("expired.parquet".to_string(), None))
+        );
+        assert!(
+            state
+                .removes
+                .contains_key(&("fresh.parquet".to_string(), None))
+        );
+        assert!(
+            state
+                .removes
+                .contains_key(&("unknown-ts.parquet".to_string(), None))
+        );
         assert!(!state.txns.contains_key("expired-app"));
         assert!(state.txns.contains_key("fresh-app"));
         assert!(state.txns.contains_key("legacy-app"));
@@ -2205,9 +2211,11 @@ mod tests {
 
         state.prune_expired_checkpoint_actions(now)?;
 
-        assert!(state
-            .removes
-            .contains_key(&("older-remove.parquet".to_string(), None)));
+        assert!(
+            state
+                .removes
+                .contains_key(&("older-remove.parquet".to_string(), None))
+        );
         Ok(())
     }
 

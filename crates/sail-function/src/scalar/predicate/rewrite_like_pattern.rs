@@ -4,7 +4,7 @@ use arrow::array::{ArrayRef, GenericStringBuilder, OffsetSizeTrait};
 use arrow::datatypes::DataType;
 use datafusion_common::cast::{as_generic_string_array, as_string_view_array};
 use datafusion_common::types::logical_string;
-use datafusion_common::{exec_err, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, exec_err};
 use datafusion_expr::{
     Coercion, ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignatureClass,
     Volatility,
@@ -50,7 +50,7 @@ impl RewriteLikePatternFunc {
 }
 
 impl ScalarUDFImpl for RewriteLikePatternFunc {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "rewrite_like_pattern"
     }
 
@@ -109,9 +109,10 @@ fn extract_escape_char(arg: &ColumnarValue) -> Result<char> {
         }
     };
     let mut chars = s.chars();
-    match (chars.next(), chars.next()) {
-        (Some(c), None) => Ok(c),
-        _ => exec_err!("escape character for rewrite_like_pattern must be a single character"),
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        Ok(c)
+    } else {
+        exec_err!("escape character for rewrite_like_pattern must be a single character")
     }
 }
 
@@ -121,7 +122,7 @@ fn rewrite<T: OffsetSizeTrait>(args: &[ArrayRef], escape: char) -> Result<ArrayR
     let mut builder = GenericStringBuilder::<T>::new();
     let mut buffer = String::new();
 
-    for string in string_array.iter() {
+    for string in string_array {
         match string {
             Some(string) => {
                 buffer.clear();
@@ -141,7 +142,7 @@ fn rewrite_view(args: &[ArrayRef], escape: char) -> Result<ArrayRef> {
     let mut builder = GenericStringBuilder::<i32>::new();
     let mut buffer = String::new();
 
-    for string in string_array.iter() {
+    for string in string_array {
         match string {
             Some(string) => {
                 buffer.clear();

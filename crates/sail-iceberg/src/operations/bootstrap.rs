@@ -35,8 +35,8 @@ use crate::spec::{FormatVersion, TableMetadata};
 use crate::table::metadata_loader::{
     encode_metadata_file, metadata_file_extension_from_properties, metadata_file_version_from_path,
 };
-use crate::utils::timestamp::monotonic_timestamp_ms;
 use crate::utils::WritePathMode;
+use crate::utils::timestamp::monotonic_timestamp_ms;
 
 /// Strategy for persisting metadata during bootstrap
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

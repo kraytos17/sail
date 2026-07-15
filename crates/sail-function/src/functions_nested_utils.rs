@@ -14,9 +14,7 @@ macro_rules! downcast_arg {
 }
 
 macro_rules! opt_downcast_arg {
-    ($ARG:expr, $ARRAY_TYPE:ident) => {{
-        $ARG.as_any().downcast_ref::<$ARRAY_TYPE>()
-    }};
+    ($ARG:expr, $ARRAY_TYPE:ident) => {{ $ARG.as_any().downcast_ref::<$ARRAY_TYPE>() }};
 }
 
 pub(crate) use downcast_arg;

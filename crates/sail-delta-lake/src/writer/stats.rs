@@ -156,7 +156,7 @@ fn stats_from_metadata(
                     if is_binary {
                         warn!(
                             "Skipping column {} because it's a binary field.",
-                            &column_descr.name().to_string()
+                            column_descr.name()
                         );
                         None
                     } else {
@@ -740,7 +740,7 @@ fn get_list_field_name(column_descr: &Arc<ColumnDescriptor>) -> Option<String> {
             ("list", seen, _) if seen == max_rep_levels => return Some("list".to_string()),
             ("element", _, seen) if seen == max_rep_levels => return Some("element".to_string()),
             (SAIL_LIST_FIELD_NAME, _, seen) if seen == max_rep_levels => {
-                return Some(SAIL_LIST_FIELD_NAME.to_string())
+                return Some(SAIL_LIST_FIELD_NAME.to_string());
             }
             ("list", _, _) => lists_seen += 1,
             ("element", _, _) | (SAIL_LIST_FIELD_NAME, _, _) => items_seen += 1,

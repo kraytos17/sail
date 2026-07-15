@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    new_null_array, Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, Int8Array,
+    Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, new_null_array,
 };
 use datafusion::arrow::datatypes::{
-    DataType, Field, FieldRef, DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE,
+    DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, Field, FieldRef,
 };
-use datafusion_common::{internal_err, Result};
+use datafusion_common::{Result, internal_err};
 use datafusion_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
-use rand::{rng, RngExt};
+use rand::{RngExt, rng};
 
 use super::xorshift::SparkXorShiftRandom;
 use crate::error::{
@@ -115,11 +115,9 @@ impl SparkUniform {
             // Integer promotion hierarchy: Int8 < Int16 < Int32 < Int64.
             // UInt32/UInt64 require Int64 to safely represent all values.
             return match (t_min, t_max) {
-                (Int64, _) | (_, Int64) | (UInt32, _) | (_, UInt32) | (UInt64, _) | (_, UInt64) => {
-                    Int64
-                }
-                (Int32, _) | (_, Int32) | (UInt16, _) | (_, UInt16) => Int32,
-                (Int16, _) | (_, Int16) | (UInt8, _) | (_, UInt8) => Int16,
+                (Int64 | UInt32 | UInt64, _) | (_, Int64 | UInt32 | UInt64) => Int64,
+                (Int32 | UInt16, _) | (_, Int32 | UInt16) => Int32,
+                (Int16 | UInt8, _) | (_, Int16 | UInt8) => Int16,
                 (Int8, Int8) => Int8,
                 _ => Int32,
             };
@@ -251,7 +249,7 @@ impl ScalarUDFImpl for SparkUniform {
                         "uniform",
                         "INT or BIGINT type for seed",
                         &arg_types[2..],
-                    ))
+                    ));
                 }
             };
             coerced_types.push(seed_type);
@@ -359,7 +357,7 @@ fn extract_seed(seed_array: Option<&ArrayRef>, i: usize) -> Option<u64> {
             None
         } else {
             match arr.data_type() {
-                DataType::Int64 => Some(arr.as_primitive::<Int64Type>().value(i) as u64),
+                DataType::Int64 => Some(arr.as_primitive::<Int64Type>().value(i).cast_unsigned()),
                 DataType::UInt64 => Some(arr.as_primitive::<UInt64Type>().value(i)),
                 _ => None,
             }
@@ -524,7 +522,7 @@ fn uniform(args: &[ArrayRef], number_rows: usize, output_type: &DataType) -> Res
                     let scale_factor = 10f64.powi(scale as i32);
                     let min_f = (min_val as f64) / scale_factor;
                     let max_f = (max_val as f64) / scale_factor;
-                    let result_f = min_f + rng.next_double() * (max_f - min_f);
+                    let result_f = rng.next_double().mul_add(max_f - min_f, min_f);
                     (result_f * scale_factor).round() as i128
                 };
 

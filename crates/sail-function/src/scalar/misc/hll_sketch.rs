@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    new_null_array, Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Int64Builder,
+    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Int64Builder, new_null_array,
 };
 use arrow::datatypes::DataType;
-use datafusion_common::{exec_err, Result};
+use datafusion_common::{Result, exec_err};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::signature::{Signature, TypeSignature, Volatility};
@@ -38,7 +38,7 @@ impl HllSketchEstimateFunction {
 }
 
 impl ScalarUDFImpl for HllSketchEstimateFunction {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "hll_sketch_estimate"
     }
 
@@ -96,7 +96,7 @@ impl HllUnionFunction {
 }
 
 impl ScalarUDFImpl for HllUnionFunction {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "hll_union"
     }
 

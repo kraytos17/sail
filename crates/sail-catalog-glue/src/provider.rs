@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
 use aws_config::BehaviorVersion;
+use aws_sdk_glue::Client;
 use aws_sdk_glue::config::Region;
 use aws_sdk_glue::types::{
     StorageDescriptor, Table, TableInput, ViewDefinitionInput, ViewRepresentationInput,
 };
-use aws_sdk_glue::Client;
 use sail_catalog::error::{CatalogError, CatalogObject, CatalogResult};
 use sail_catalog::hive_format::HiveDetectedFormat;
 use sail_catalog::provider::{
@@ -15,7 +15,7 @@ use sail_catalog::provider::{
 };
 use sail_catalog::utils::quote_namespace_if_needed;
 use sail_common_datafusion::catalog::{
-    identity_partition_fields, DatabaseStatus, TableColumnStatus, TableKind, TableStatus,
+    DatabaseStatus, TableColumnStatus, TableKind, TableStatus, identity_partition_fields,
 };
 use tokio::sync::OnceCell;
 
@@ -163,21 +163,21 @@ impl GlueCatalogProvider {
 
         // Add partition columns
         for pk in table.partition_keys() {
-            if let Some(type_str) = pk.r#type() {
-                if let Ok(data_type) = glue_type_to_arrow(type_str) {
-                    columns.push(TableColumnStatus {
-                        name: pk.name().to_string(),
-                        data_type,
-                        nullable: true,
-                        comment: pk.comment().map(|s| s.to_string()),
-                        default: None,
-                        generated_always_as: None,
-                        identity: None,
-                        is_partition: true,
-                        is_bucket: false,
-                        is_cluster: false,
-                    });
-                }
+            if let Some(type_str) = pk.r#type()
+                && let Ok(data_type) = glue_type_to_arrow(type_str)
+            {
+                columns.push(TableColumnStatus {
+                    name: pk.name().to_string(),
+                    data_type,
+                    nullable: true,
+                    comment: pk.comment().map(|s| s.to_string()),
+                    default: None,
+                    generated_always_as: None,
+                    identity: None,
+                    is_partition: true,
+                    is_bucket: false,
+                    is_cluster: false,
+                });
             }
         }
 

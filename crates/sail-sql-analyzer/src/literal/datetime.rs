@@ -1,9 +1,9 @@
 use std::str::FromStr;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use chumsky::Parser;
 use chumsky::extra::ParserExtra;
 use chumsky::prelude::{any, choice, end, just, one_of};
-use chumsky::Parser;
 
 use crate::error::{SqlError, SqlResult};
 
@@ -18,7 +18,7 @@ impl TryFrom<DateValue> for NaiveDate {
     type Error = SqlError;
 
     fn try_from(value: DateValue) -> SqlResult<Self> {
-        NaiveDate::from_ymd_opt(value.year, value.month as u32, value.day as u32)
+        Self::from_ymd_opt(value.year, u32::from(value.month), u32::from(value.day))
             .ok_or_else(|| SqlError::invalid(format!("{value:?}")))
     }
 }
@@ -35,10 +35,10 @@ impl TryFrom<TimeValue> for NaiveTime {
     type Error = SqlError;
 
     fn try_from(value: TimeValue) -> SqlResult<Self> {
-        NaiveTime::from_hms_nano_opt(
-            value.hour as u32,
-            value.minute as u32,
-            value.second as u32,
+        Self::from_hms_nano_opt(
+            u32::from(value.hour),
+            u32::from(value.minute),
+            u32::from(value.second),
             value.nanoseconds,
         )
         .ok_or_else(|| SqlError::invalid(format!("{value:?}")))
@@ -188,7 +188,7 @@ where
                 .ignored()
                 .or(just(' ').repeated().at_least(1))
                 .ignore_then(time().then(timezone()).map(Some)),
-            just(' ').repeated().map(|_| None),
+            just(' ').repeated().map(|()| None),
         )))
         .map(|(date, time_and_timezone)| {
             let (time, timezone) = match time_and_timezone {
@@ -203,6 +203,7 @@ where
         })
 }
 
+#[must_use]
 pub fn create_date_parser<'a, E>() -> impl Parser<'a, &'a str, DateValue, E>
 where
     E: ParserExtra<'a, &'a str> + 'a,
@@ -218,6 +219,7 @@ where
         .then_ignore(end())
 }
 
+#[must_use]
 pub fn create_timestamp_parser<'a, E>() -> impl Parser<'a, &'a str, TimestampValue<'a>, E>
 where
     E: ParserExtra<'a, &'a str> + 'a,
@@ -225,6 +227,7 @@ where
     timestamp().then_ignore(end())
 }
 
+#[must_use]
 pub fn create_time_parser<'a, E>() -> impl Parser<'a, &'a str, TimeValue, E>
 where
     E: ParserExtra<'a, &'a str> + 'a,

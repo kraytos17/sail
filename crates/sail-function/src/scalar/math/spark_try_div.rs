@@ -43,10 +43,8 @@ impl ScalarUDFImpl for SparkTryDiv {
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         match arg_types {
-            [DataType::Int32, DataType::Int32]
-            | [DataType::Int64, DataType::Int64]
-            | [DataType::Int32, DataType::Int64]
-            | [DataType::Int64, DataType::Int32] => Ok(DataType::Float64),
+            [DataType::Int32 | DataType::Int64, DataType::Int32]
+            | [DataType::Int64 | DataType::Int32, DataType::Int64] => Ok(DataType::Float64),
             [DataType::Interval(YearMonth), DataType::Int32] => Ok(DataType::Interval(YearMonth)),
             [DataType::Interval(MonthDayNano), DataType::Int32] => {
                 Ok(DataType::Interval(MonthDayNano))
@@ -185,10 +183,8 @@ impl ScalarUDFImpl for SparkTryDiv {
         }
         if matches!(
             (left, right),
-            (DataType::Int32, DataType::Int32)
-                | (DataType::Int64, DataType::Int64)
-                | (DataType::Int32, DataType::Int64)
-                | (DataType::Int64, DataType::Int32)
+            (DataType::Int32 | DataType::Int64, DataType::Int32)
+                | (DataType::Int64 | DataType::Int32, DataType::Int64)
         ) {
             if *left == DataType::Int64 || *right == DataType::Int64 {
                 return Ok(vec![DataType::Int64, DataType::Int64]);

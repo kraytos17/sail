@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
 use datafusion::common::tree_node::TreeNode;
-use datafusion::datasource::{source_as_provider, TableProvider};
+use datafusion::datasource::{TableProvider, source_as_provider};
 use datafusion::logical_expr::{Extension, LogicalPlan};
 use datafusion_common::tree_node::{Transformed, TreeNodeRewriter};
-use datafusion_common::{internal_err, not_impl_err, plan_err, Result};
+use datafusion_common::{Result, internal_err, not_impl_err, plan_err};
 use datafusion_expr::{
-    col, or, Explain, FetchType, Filter, Projection, SkipType, SubqueryAlias, TableScan, Union,
-    UserDefinedLogicalNode,
+    Explain, FetchType, Filter, Projection, SkipType, SubqueryAlias, TableScan, Union,
+    UserDefinedLogicalNode, col, or,
 };
 use sail_common_datafusion::rename::table_provider::RenameTableProvider;
 use sail_common_datafusion::streaming::event::schema::{
-    is_flow_event_schema, MARKER_FIELD_NAME, RETRACTED_FIELD_NAME,
+    MARKER_FIELD_NAME, RETRACTED_FIELD_NAME, is_flow_event_schema,
 };
 use sail_common_datafusion::streaming::source::{StreamSource, StreamSourceTableProvider};
 use sail_data_source::formats::console::ConsoleWriteNode;

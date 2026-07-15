@@ -8,7 +8,7 @@ use datafusion::arrow::compute::kernels::nullif::nullif;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::functions::string::concat::ConcatFunc;
 use datafusion_common::utils::list_ndims;
-use datafusion_common::{plan_err, ExprSchema, Result, ScalarValue};
+use datafusion_common::{ExprSchema, Result, ScalarValue, plan_err};
 use datafusion_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion_expr::{
     ColumnarValue, Expr, ExprSchemable, ScalarFunctionArgs, ScalarUDFImpl, Signature,
@@ -86,7 +86,7 @@ impl ScalarUDFImpl for SparkConcat {
                     _ => {
                         return plan_err!(
                             "The array_concat function can only accept list as the args."
-                        )
+                        );
                     }
                 }
             }

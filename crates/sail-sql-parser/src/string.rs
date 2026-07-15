@@ -7,7 +7,8 @@ use crate::options::ParserOptions;
 use crate::token::StringStyle;
 
 impl StringStyle {
-    pub fn prefix(&self) -> Option<char> {
+    #[must_use]
+    pub const fn prefix(&self) -> Option<char> {
         match self {
             Self::SingleQuoted { prefix }
             | Self::DoubleQuoted { prefix }
@@ -17,6 +18,7 @@ impl StringStyle {
         }
     }
 
+    #[must_use]
     pub fn parse(&self, raw: &str, options: &ParserOptions) -> StringValue {
         type Extra = chumsky::extra::Default;
 
@@ -257,7 +259,7 @@ fn backtick_quoted_string_value<'a, E>() -> impl Parser<'a, &'a str, StringValue
 where
     E: ParserExtra<'a, &'a str> + 'a,
 {
-    let character = none_of('`').or(just('`').repeated().exactly(2).map(|_| '`'));
+    let character = none_of('`').or(just('`').repeated().exactly(2).map(|()| '`'));
     text('`', character)
 }
 
@@ -276,11 +278,11 @@ enum Char<'a> {
 }
 
 impl<'a> Char<'a> {
-    fn from_str<const RADIX: u32>(value: &str, raw: &'a str) -> Char<'a> {
-        if let Ok(n) = u32::from_str_radix(value, RADIX) {
-            if let Some(c) = char::from_u32(n) {
-                return Char::One(c);
-            }
+    const fn from_str<const RADIX: u32>(value: &str, raw: &'a str) -> Self {
+        if let Ok(n) = u32::from_str_radix(value, RADIX)
+            && let Some(c) = char::from_u32(n)
+        {
+            return Char::One(c);
         }
         Char::Invalid(raw)
     }
@@ -297,29 +299,30 @@ pub enum StringValue {
 
 impl StringValue {
     pub fn valid(value: impl Into<String>) -> Self {
-        StringValue::Valid {
+        Self::Valid {
             value: value.into(),
             prefix: None,
         }
     }
 
     pub fn invalid(reason: impl Into<String>) -> Self {
-        StringValue::Invalid {
+        Self::Invalid {
             reason: reason.into(),
         }
     }
 
+    #[must_use]
     pub fn with_prefix(self, prefix: Option<char>) -> Self {
         match self {
-            StringValue::Valid { value, prefix: _ } => StringValue::Valid { value, prefix },
-            StringValue::Invalid { reason } => StringValue::Invalid { reason },
+            Self::Valid { value, prefix: _ } => Self::Valid { value, prefix },
+            Self::Invalid { reason } => Self::Invalid { reason },
         }
     }
 }
 
 impl Default for StringValue {
     fn default() -> Self {
-        StringValue::Valid {
+        Self::Valid {
             value: String::new(),
             prefix: None,
         }
@@ -328,7 +331,7 @@ impl Default for StringValue {
 
 impl Container<Char<'_>> for StringValue {
     fn with_capacity(n: usize) -> Self {
-        StringValue::Valid {
+        Self::Valid {
             value: String::with_capacity(n),
             prefix: None,
         }
@@ -337,19 +340,19 @@ impl Container<Char<'_>> for StringValue {
     fn push(&mut self, item: Char) {
         match item {
             Char::One(c) => {
-                if let StringValue::Valid { value, .. } = self {
+                if let Self::Valid { value, .. } = self {
                     value.push(c);
                 }
             }
             Char::Two(c1, c2) => {
-                if let StringValue::Valid { value, .. } = self {
+                if let Self::Valid { value, .. } = self {
                     value.push(c1);
                     value.push(c2);
                 }
             }
             Char::Invalid(s) => {
-                if matches!(self, StringValue::Valid { .. }) {
-                    *self = StringValue::Invalid {
+                if matches!(self, Self::Valid { .. }) {
+                    *self = Self::Invalid {
                         reason: format!("invalid character: {s}"),
                     };
                 }
@@ -360,14 +363,14 @@ impl Container<Char<'_>> for StringValue {
 
 impl Container<char> for StringValue {
     fn with_capacity(n: usize) -> Self {
-        StringValue::Valid {
+        Self::Valid {
             value: String::with_capacity(n),
             prefix: None,
         }
     }
 
     fn push(&mut self, item: char) {
-        if let StringValue::Valid { value, .. } = self {
+        if let Self::Valid { value, .. } = self {
             value.push(item);
         }
     }

@@ -11,6 +11,7 @@ use datafusion::logical_expr::{
 use datafusion::scalar::ScalarValue;
 use datafusion_physical_expr::expressions::Literal;
 
+#[must_use]
 pub fn spark_ntile_udwf() -> Arc<WindowUDF> {
     Arc::new(WindowUDF::from(SparkNtile::new()))
 }
@@ -19,13 +20,14 @@ pub fn spark_ntile_udwf() -> Arc<WindowUDF> {
 ///
 /// Distributes rows into `n` buckets, with extra rows going to the first buckets.
 /// For example, 10 rows with ntile(4) gives buckets of sizes (3, 3, 2, 2),
-/// not (3, 2, 3, 2) like the default DataFusion implementation.
+/// not (3, 2, 3, 2) like the default `DataFusion` implementation.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct SparkNtile {
     signature: Signature,
 }
 
 impl SparkNtile {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             signature: Signature::uniform(
@@ -53,7 +55,7 @@ impl Default for SparkNtile {
 }
 
 impl WindowUDFImpl for SparkNtile {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "ntile"
     }
 
@@ -65,7 +67,7 @@ impl WindowUDFImpl for SparkNtile {
         &self,
         partition_evaluator_args: PartitionEvaluatorArgs,
     ) -> Result<Box<dyn PartitionEvaluator>> {
-        let scalar_n = get_scalar_value_from_args(partition_evaluator_args.input_exprs(), 0)?
+        let scalar_n = get_scalar_value_from_args(partition_evaluator_args.input_exprs(), 0)
             .ok_or_else(|| {
                 datafusion::error::DataFusionError::Execution(
                     "NTILE requires a positive integer".to_string(),
@@ -83,7 +85,9 @@ impl WindowUDFImpl for SparkNtile {
             return datafusion::common::exec_err!("NTILE requires a positive integer");
         }
 
-        Ok(Box::new(SparkNtileEvaluator { n: n as u64 }))
+        Ok(Box::new(SparkNtileEvaluator {
+            n: n.cast_unsigned(),
+        }))
     }
 
     fn field(&self, field_args: WindowUDFFieldArgs) -> Result<FieldRef> {
@@ -111,6 +115,7 @@ impl PartitionEvaluator for SparkNtileEvaluator {
         let base = num_rows / n;
         let extra = num_rows % n;
 
+        #[allow(clippy::cast_possible_truncation)]
         let mut vec: Vec<u64> = Vec::with_capacity(num_rows as usize);
         for i in 0..num_rows {
             // First `extra` buckets have `base + 1` rows each
@@ -140,30 +145,30 @@ impl PartitionEvaluator for SparkNtileEvaluator {
 fn get_scalar_value_from_args(
     input_exprs: &[Arc<dyn datafusion_physical_expr::PhysicalExpr>],
     index: usize,
-) -> Result<Option<ScalarValue>> {
-    if let Some(expr) = input_exprs.get(index) {
-        if let Some(literal) = expr.downcast_ref::<Literal>() {
-            return Ok(Some(literal.value().clone()));
-        }
+) -> Option<ScalarValue> {
+    if let Some(expr) = input_exprs.get(index)
+        && let Some(literal) = expr.downcast_ref::<Literal>()
+    {
+        return Some(literal.value().clone());
     }
-    Ok(None)
+    None
 }
 
-/// Helper to extract integer value from ScalarValue
+/// Helper to extract integer value from `ScalarValue`
 fn get_integer_value(scalar: &ScalarValue) -> Result<i64> {
     match scalar {
-        ScalarValue::Int8(Some(v)) => Ok(*v as i64),
-        ScalarValue::Int16(Some(v)) => Ok(*v as i64),
-        ScalarValue::Int32(Some(v)) => Ok(*v as i64),
+        ScalarValue::Int8(Some(v)) => Ok(i64::from(*v)),
+        ScalarValue::Int16(Some(v)) => Ok(i64::from(*v)),
+        ScalarValue::Int32(Some(v)) => Ok(i64::from(*v)),
         ScalarValue::Int64(Some(v)) => Ok(*v),
-        ScalarValue::UInt8(Some(v)) => Ok(*v as i64),
-        ScalarValue::UInt16(Some(v)) => Ok(*v as i64),
-        ScalarValue::UInt32(Some(v)) => Ok(*v as i64),
+        ScalarValue::UInt8(Some(v)) => Ok(i64::from(*v)),
+        ScalarValue::UInt16(Some(v)) => Ok(i64::from(*v)),
+        ScalarValue::UInt32(Some(v)) => Ok(i64::from(*v)),
         ScalarValue::UInt64(Some(v)) => {
             if *v > i64::MAX as u64 {
                 datafusion::common::exec_err!("NTILE argument too large")
             } else {
-                Ok(*v as i64)
+                Ok((*v).cast_signed())
             }
         }
         ScalarValue::Null => datafusion::common::exec_err!("NTILE requires a non-null integer"),

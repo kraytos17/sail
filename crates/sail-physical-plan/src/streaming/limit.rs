@@ -8,8 +8,9 @@ use datafusion::physical_plan::{
     DisplayAs, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use datafusion_common::arrow::datatypes::SchemaRef;
-use datafusion_common::{internal_err, plan_err, Result, Statistics};
+use datafusion_common::{Result, Statistics, internal_err, plan_err};
 use futures::StreamExt;
+use sail_common_datafusion::streaming::event::FlowEvent;
 use sail_common_datafusion::streaming::event::encoding::{
     DecodedFlowEventStream, EncodedFlowEventStream,
 };
@@ -17,7 +18,6 @@ use sail_common_datafusion::streaming::event::schema::try_from_flow_event_schema
 use sail_common_datafusion::streaming::event::stream::{
     FlowEventStreamAdapter, SendableFlowEventStream,
 };
-use sail_common_datafusion::streaming::event::FlowEvent;
 
 /// A physical plan node that limits the number of retractable rows during
 /// streaming query execution.

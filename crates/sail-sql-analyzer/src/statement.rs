@@ -34,7 +34,7 @@ use crate::expression::{
 use crate::query::from_ast_query;
 use crate::value::from_ast_string;
 
-fn from_ast_show_function_scope(scope: Option<ShowFunctionScope>) -> (bool, bool) {
+const fn from_ast_show_function_scope(scope: Option<ShowFunctionScope>) -> (bool, bool) {
     match scope {
         None | Some(ShowFunctionScope::All(_)) => (true, true),
         Some(ShowFunctionScope::User(_)) => (true, false),
@@ -177,7 +177,7 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
         } => {
             let cascade = match specifier {
                 Some(Either::Left(Restrict { .. })) => {
-                    return Err(SqlError::todo("RESTRICT in DROP DATABASE"))
+                    return Err(SqlError::todo("RESTRICT in DROP DATABASE"));
                 }
                 Some(Either::Right(Cascade { .. })) => true,
                 None => false,
@@ -492,8 +492,9 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
                     let (schema, columns) = view_columns(columns)
                         .map(from_ast_view_using_columns)
                         .transpose()?
-                        .map(|(schema, columns)| (Some(schema), Some(columns)))
-                        .unwrap_or((None, None));
+                        .map_or((None, None), |(schema, columns)| {
+                            (Some(schema), Some(columns))
+                        });
                     let options = options
                         .map(|(_, x)| from_ast_property_list(x))
                         .transpose()?
@@ -1346,7 +1347,7 @@ fn from_ast_table_definition(
         (None, Some(stored_as)) => Some(from_ast_file_format(stored_as)?),
         (None, None) => None,
         (Some(_), Some(_)) => {
-            return Err(SqlError::invalid("conflicting USING and STORED AS clauses"))
+            return Err(SqlError::invalid("conflicting USING and STORED AS clauses"));
         }
     };
     let partition_by = partition_by
@@ -1454,7 +1455,11 @@ fn from_ast_table_columns(
             .map(|x| 1 + x.tail.len())
             .unwrap_or_default(),
     );
-    for column in columns.map(|x| x.into_items()).into_iter().flatten() {
+    for column in columns
+        .map(sail_sql_parser::common::Sequence::into_items)
+        .into_iter()
+        .flatten()
+    {
         let ColumnDefinition {
             name,
             data_type,
@@ -2099,7 +2104,7 @@ fn from_ast_sort_column(sort: SortColumn) -> SqlResult<spec::SortOrder> {
     })
 }
 
-fn from_ast_explain_format(format: Option<ExplainFormat>) -> SqlResult<spec::ExplainMode> {
+const fn from_ast_explain_format(format: Option<ExplainFormat>) -> SqlResult<spec::ExplainMode> {
     // TODO(spark-compat):
     //   - COST: match Spark (logical + stats, not physical-with-stats).
     //   - FORMATTED: add outline + node-details sections to mirror Spark.
@@ -2137,7 +2142,6 @@ fn from_ast_column_alteration_list(
     };
     columns
         .into_items()
-        .into_iter()
         .map(|x| {
             let ColumnAlteration {
                 name,
@@ -2546,7 +2550,13 @@ mod tests {
     fn test_add_column_default() -> SqlResult<()> {
         let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x int DEFAULT 42")?;
         assert_eq!(defs.len(), 1);
-        assert!(defs[0].default.as_ref().unwrap().contains("42"));
+        assert!(
+            defs[0]
+                .default
+                .as_ref()
+                .expect("column default should be Some")
+                .contains("42")
+        );
         Ok(())
     }
 
@@ -2562,7 +2572,7 @@ mod tests {
     fn test_add_column_position_first() -> SqlResult<()> {
         let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x int FIRST")?;
         assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].nullable, true);
+        assert!(defs[0].nullable);
         Ok(())
     }
 
@@ -2574,7 +2584,12 @@ mod tests {
         assert_eq!(defs.len(), 1);
         let col = &defs[0];
         assert!(!col.nullable);
-        assert!(col.default.as_ref().unwrap().contains("42"));
+        assert!(
+            col.default
+                .as_ref()
+                .expect("column default should be Some")
+                .contains("42")
+        );
         assert_eq!(col.comment, Some("desc".to_string()));
         Ok(())
     }
@@ -2616,15 +2631,27 @@ mod tests {
     fn test_add_column_default_string() -> SqlResult<()> {
         let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x string DEFAULT 'hello world'")?;
         assert_eq!(defs.len(), 1);
-        assert!(defs[0].default.as_ref().unwrap().contains("hello world"));
+        assert!(
+            defs[0]
+                .default
+                .as_ref()
+                .expect("column default should be Some")
+                .contains("hello world")
+        );
         Ok(())
     }
 
     #[test]
-    fn test_add_column_default_boolean() -> SqlResult<()> {
+    fn test_parse_add_column_default_boolean() -> TestResult {
         let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x boolean DEFAULT true")?;
         assert_eq!(defs.len(), 1);
-        assert!(defs[0].default.as_ref().unwrap().contains("true"));
+        assert!(
+            defs[0]
+                .default
+                .as_ref()
+                .expect("column default should be Some")
+                .contains("true")
+        );
         Ok(())
     }
 
@@ -2728,7 +2755,7 @@ mod tests {
         assert_eq!(defs.len(), 1);
         assert!(matches!(
             defs[0].data_type,
-            spec::DataType::Binary | spec::DataType::ConfiguredBinary { .. }
+            spec::DataType::Binary | spec::DataType::ConfiguredBinary
         ));
         Ok(())
     }
@@ -2770,7 +2797,7 @@ mod tests {
     fn test_add_column_position_after() -> SqlResult<()> {
         let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x INT AFTER y")?;
         assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].nullable, true);
+        assert!(defs[0].nullable);
         Ok(())
     }
 

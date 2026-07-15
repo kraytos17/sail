@@ -3,7 +3,7 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility};
 use datafusion_common::cast::{as_large_string_array, as_string_array, as_string_view_array};
-use datafusion_common::{internal_err, ScalarValue};
+use datafusion_common::{ScalarValue, internal_err};
 use datafusion_expr::ScalarFunctionArgs;
 use sail_common_datafusion::utils::items::ItemTaker;
 
@@ -33,15 +33,14 @@ impl RaiseError {
 fn raise_from_strings<'a>(
     mut iter: impl Iterator<Item = Option<&'a str>>,
 ) -> Result<ColumnarValue> {
-    if let Some(message) = iter.find_map(|v| v) {
-        Err(DataFusionError::Execution(message.to_string()))
-    } else {
-        internal_err!("raise_error expects a single UTF-8 string argument")
-    }
+    iter.find_map(|v| v).map_or_else(
+        || internal_err!("raise_error expects a single UTF-8 string argument"),
+        |message| Err(DataFusionError::Execution(message.to_string())),
+    )
 }
 
 impl ScalarUDFImpl for RaiseError {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "raise_error"
     }
 
@@ -59,11 +58,11 @@ impl ScalarUDFImpl for RaiseError {
             return internal_err!("raise_error should only be called with one argument");
         };
         match arg {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(message)))
-            | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(message)))
-            | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(message))) => {
-                Err(DataFusionError::Execution(message))
-            }
+            ColumnarValue::Scalar(
+                ScalarValue::Utf8(Some(message))
+                | ScalarValue::LargeUtf8(Some(message))
+                | ScalarValue::Utf8View(Some(message)),
+            ) => Err(DataFusionError::Execution(message)),
             ColumnarValue::Array(array) => match array.data_type() {
                 DataType::Utf8 => raise_from_strings(as_string_array(array.as_ref())?.iter()),
                 DataType::LargeUtf8 => {
@@ -74,7 +73,9 @@ impl ScalarUDFImpl for RaiseError {
                 }
                 _ => internal_err!("raise_error expects a single UTF-8 string argument"),
             },
-            _ => internal_err!("raise_error expects a single UTF-8 string argument"),
+            ColumnarValue::Scalar(_) => {
+                internal_err!("raise_error expects a single UTF-8 string argument")
+            }
         }
     }
 }

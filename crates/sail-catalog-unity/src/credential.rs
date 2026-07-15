@@ -21,12 +21,12 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use reqwest::header::{HeaderValue, ACCEPT};
+use reqwest::header::{ACCEPT, HeaderValue};
 use reqwest::{Client, Method, Response};
 use sail_catalog::credentials::CatalogCredentials;
 use sail_catalog::error::{CatalogError, CatalogResult};
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use crate::token::{TemporaryToken, TokenCache};
 

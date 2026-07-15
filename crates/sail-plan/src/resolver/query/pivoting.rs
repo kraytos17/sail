@@ -6,7 +6,7 @@ use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{Column, DFSchema, DFSchemaRef, ScalarValue};
 use datafusion_expr::expr::NullTreatment;
 use datafusion_expr::{
-    col, expr, lit, ExprSchemable, LogicalPlan, LogicalPlanBuilder, Projection, ScalarUDF,
+    ExprSchemable, LogicalPlan, LogicalPlanBuilder, Projection, ScalarUDF, col, expr, lit,
 };
 use datafusion_functions_nested::expr_fn as nested_fn;
 use sail_common::spec;
@@ -16,12 +16,12 @@ use sail_function::scalar::explode;
 use sail_function::scalar::struct_function::StructFunction;
 
 use crate::error::{PlanError, PlanResult};
+use crate::resolver::PlanResolver;
 use crate::resolver::expression::NamedExpr;
 use crate::resolver::state::PlanResolverState;
 use crate::resolver::tree::explode::ExplodeRewriter;
 use crate::resolver::tree::monotonic_id::MonotonicIdRewriter;
 use crate::resolver::tree::spark_partition_id::SparkPartitionIdRewriter;
-use crate::resolver::PlanResolver;
 
 impl PlanResolver<'_> {
     pub(super) async fn resolve_query_pivot(
@@ -46,7 +46,7 @@ impl PlanResolver<'_> {
             0 => {
                 return Err(PlanError::AnalysisError(
                     "pivot column required".to_string(),
-                ))
+                ));
             }
             1 => pivot_columns.swap_remove(0),
             _ => make_pivot_struct(pivot_columns),

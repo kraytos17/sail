@@ -4,7 +4,7 @@ use sail_catalog::provider::CatalogCacheManager;
 use sail_common::config::AppConfig;
 use sail_common::runtime::RuntimeManager;
 use sail_session::session_factory::{SessionFactory, WorkerSessionFactory};
-use sail_telemetry::telemetry::{init_telemetry, shutdown_telemetry, ResourceOptions};
+use sail_telemetry::telemetry::{ResourceOptions, init_telemetry, shutdown_telemetry};
 
 pub fn run_worker() -> Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(AppConfig::load()?);

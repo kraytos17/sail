@@ -1,9 +1,9 @@
+use chumsky::Parser;
 use chumsky::extra::ParserExtra;
 use chumsky::input::{Checkpoint, InputRef, ValueInput};
 use chumsky::inspector::Inspector;
 use chumsky::label::LabelError;
-use chumsky::prelude::{custom, Input};
-use chumsky::Parser;
+use chumsky::prelude::{Input, custom};
 
 use crate::ast::identifier::is_identifier_string;
 use crate::options::ParserOptions;
@@ -31,14 +31,15 @@ pub enum NumberSuffix {
 }
 
 impl NumberSuffix {
-    pub fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
-            NumberSuffix::Y => "Y",
-            NumberSuffix::S => "S",
-            NumberSuffix::L => "L",
-            NumberSuffix::F => "F",
-            NumberSuffix::D => "D",
-            NumberSuffix::Bd => "BD",
+            Self::Y => "Y",
+            Self::S => "S",
+            Self::L => "L",
+            Self::F => "F",
+            Self::D => "D",
+            Self::Bd => "BD",
         }
     }
 }
@@ -67,7 +68,7 @@ enum NumberState {
 }
 
 impl NumberState {
-    fn next_slice(mut self, slice: &str) -> Option<NumberState> {
+    fn next_slice(mut self, slice: &str) -> Option<Self> {
         let chars = slice.chars();
         for c in chars {
             self = self.next(c)?;
@@ -75,66 +76,66 @@ impl NumberState {
         Some(self)
     }
 
-    fn next(self, c: char) -> Option<NumberState> {
+    fn next(self, c: char) -> Option<Self> {
         fn extend(mut s: String, c: char) -> String {
             s.push(c);
             s
         }
 
         match self {
-            NumberState::Start => match c {
-                '0'..='9' => Some(NumberState::WholeNumber(c.to_string())),
-                '.' => Some(NumberState::DecimalPoint(c.to_string())),
+            Self::Start => match c {
+                '0'..='9' => Some(Self::WholeNumber(c.to_string())),
+                '.' => Some(Self::DecimalPoint(c.to_string())),
                 _ => None,
             },
-            NumberState::WholeNumber(x) => match c {
-                '0'..='9' => Some(NumberState::WholeNumber(extend(x, c))),
-                '.' => Some(NumberState::DecimalNumber(extend(x, c))),
-                'e' | 'E' => Some(NumberState::ExponentMarker(extend(x, c))),
-                'y' | 'Y' => Some(NumberState::SuffixY(x)),
-                's' | 'S' => Some(NumberState::SuffixS(x)),
-                'l' | 'L' => Some(NumberState::SuffixL(x)),
-                'f' | 'F' => Some(NumberState::SuffixF(x)),
-                'd' | 'D' => Some(NumberState::SuffixD(x)),
-                'b' | 'B' => Some(NumberState::SuffixB(x)),
+            Self::WholeNumber(x) => match c {
+                '0'..='9' => Some(Self::WholeNumber(extend(x, c))),
+                '.' => Some(Self::DecimalNumber(extend(x, c))),
+                'e' | 'E' => Some(Self::ExponentMarker(extend(x, c))),
+                'y' | 'Y' => Some(Self::SuffixY(x)),
+                's' | 'S' => Some(Self::SuffixS(x)),
+                'l' | 'L' => Some(Self::SuffixL(x)),
+                'f' | 'F' => Some(Self::SuffixF(x)),
+                'd' | 'D' => Some(Self::SuffixD(x)),
+                'b' | 'B' => Some(Self::SuffixB(x)),
                 _ => None,
             },
-            NumberState::DecimalPoint(x) => match c {
-                '0'..='9' => Some(NumberState::DecimalNumber(extend(x, c))),
+            Self::DecimalPoint(x) => match c {
+                '0'..='9' => Some(Self::DecimalNumber(extend(x, c))),
                 _ => None,
             },
-            NumberState::DecimalNumber(x) => match c {
-                '0'..='9' => Some(NumberState::DecimalNumber(extend(x, c))),
-                'e' | 'E' => Some(NumberState::ExponentMarker(extend(x, c))),
-                'f' | 'F' => Some(NumberState::SuffixF(x)),
-                'd' | 'D' => Some(NumberState::SuffixD(x)),
-                'b' | 'B' => Some(NumberState::SuffixB(x)),
+            Self::DecimalNumber(x) => match c {
+                '0'..='9' => Some(Self::DecimalNumber(extend(x, c))),
+                'e' | 'E' => Some(Self::ExponentMarker(extend(x, c))),
+                'f' | 'F' => Some(Self::SuffixF(x)),
+                'd' | 'D' => Some(Self::SuffixD(x)),
+                'b' | 'B' => Some(Self::SuffixB(x)),
                 _ => None,
             },
-            NumberState::ExponentMarker(x) => match c {
-                '+' | '-' => Some(NumberState::ExponentSign(extend(x, c))),
-                '0'..='9' => Some(NumberState::Exponent(extend(x, c))),
+            Self::ExponentMarker(x) => match c {
+                '+' | '-' => Some(Self::ExponentSign(extend(x, c))),
+                '0'..='9' => Some(Self::Exponent(extend(x, c))),
                 _ => None,
             },
-            NumberState::ExponentSign(x) => match c {
-                '0'..='9' => Some(NumberState::Exponent(extend(x, c))),
+            Self::ExponentSign(x) => match c {
+                '0'..='9' => Some(Self::Exponent(extend(x, c))),
                 _ => None,
             },
-            NumberState::Exponent(x) => match c {
-                '0'..='9' => Some(NumberState::Exponent(extend(x, c))),
-                'f' | 'F' => Some(NumberState::SuffixF(x)),
-                'd' | 'D' => Some(NumberState::SuffixD(x)),
-                'b' | 'B' => Some(NumberState::SuffixB(x)),
+            Self::Exponent(x) => match c {
+                '0'..='9' => Some(Self::Exponent(extend(x, c))),
+                'f' | 'F' => Some(Self::SuffixF(x)),
+                'd' | 'D' => Some(Self::SuffixD(x)),
+                'b' | 'B' => Some(Self::SuffixB(x)),
                 _ => None,
             },
-            NumberState::SuffixY(_)
-            | NumberState::SuffixS(_)
-            | NumberState::SuffixL(_)
-            | NumberState::SuffixF(_)
-            | NumberState::SuffixD(_)
-            | NumberState::SuffixBd(_) => None,
-            NumberState::SuffixB(x) => match c {
-                'd' | 'D' => Some(NumberState::SuffixBd(x)),
+            Self::SuffixY(_)
+            | Self::SuffixS(_)
+            | Self::SuffixL(_)
+            | Self::SuffixF(_)
+            | Self::SuffixD(_)
+            | Self::SuffixBd(_) => None,
+            Self::SuffixB(x) => match c {
+                'd' | 'D' => Some(Self::SuffixBd(x)),
                 _ => None,
             },
         }
@@ -142,20 +143,18 @@ impl NumberState {
 
     fn finalize(self) -> Option<(String, Option<NumberSuffix>)> {
         match self {
-            NumberState::WholeNumber(x)
-            | NumberState::DecimalNumber(x)
-            | NumberState::Exponent(x) => Some((x, None)),
-            NumberState::SuffixY(x) => Some((x, Some(NumberSuffix::Y))),
-            NumberState::SuffixS(x) => Some((x, Some(NumberSuffix::S))),
-            NumberState::SuffixL(x) => Some((x, Some(NumberSuffix::L))),
-            NumberState::SuffixF(x) => Some((x, Some(NumberSuffix::F))),
-            NumberState::SuffixD(x) => Some((x, Some(NumberSuffix::D))),
-            NumberState::SuffixBd(x) => Some((x, Some(NumberSuffix::Bd))),
-            NumberState::Start
-            | NumberState::DecimalPoint(_)
-            | NumberState::ExponentMarker(_)
-            | NumberState::ExponentSign(_)
-            | NumberState::SuffixB(_) => None,
+            Self::WholeNumber(x) | Self::DecimalNumber(x) | Self::Exponent(x) => Some((x, None)),
+            Self::SuffixY(x) => Some((x, Some(NumberSuffix::Y))),
+            Self::SuffixS(x) => Some((x, Some(NumberSuffix::S))),
+            Self::SuffixL(x) => Some((x, Some(NumberSuffix::L))),
+            Self::SuffixF(x) => Some((x, Some(NumberSuffix::F))),
+            Self::SuffixD(x) => Some((x, Some(NumberSuffix::D))),
+            Self::SuffixBd(x) => Some((x, Some(NumberSuffix::Bd))),
+            Self::Start
+            | Self::DecimalPoint(_)
+            | Self::ExponentMarker(_)
+            | Self::ExponentSign(_)
+            | Self::SuffixB(_) => None,
         }
     }
 }
@@ -186,7 +185,7 @@ where
                 if let Some(s) = state.next_slice(raw) {
                     state = s.clone();
                     if let Some((value, suffix)) = s.finalize() {
-                        let literal = NumberLiteral {
+                        let literal = Self {
                             span: input.span_since(marker.cursor()).into(),
                             value,
                             suffix,
@@ -246,21 +245,18 @@ where
     fn parser(_args: (), _options: &'a ParserOptions) -> impl Parser<'a, I, Self, E> + Clone {
         custom(|input: &mut InputRef<'a, '_, I, E>| {
             let marker = input.save();
-            let negative = match input.next() {
-                Some(Token::Punctuation(Punctuation::Minus)) => {
-                    skip_whitespace(input);
-                    true
-                }
-                _ => {
-                    input.rewind(marker.clone());
-                    false
-                }
+            let negative = if let Some(Token::Punctuation(Punctuation::Minus)) = input.next() {
+                skip_whitespace(input);
+                true
+            } else {
+                input.rewind(marker.clone());
+                false
             };
             let token = input.next();
             if let Some(Token::Word { raw, keyword: None }) = &token {
                 let value = format!("{}{}", if negative { "-" } else { "" }, raw);
                 if let Ok(value) = value.parse() {
-                    let literal = IntegerLiteral {
+                    let literal = Self {
                         span: input.span_since(marker.cursor()).into(),
                         value,
                     };
@@ -331,7 +327,7 @@ where
     } else {
         input.rewind(marker);
         return None;
-    };
+    }
 
     let marker = input.save();
     if let Some(Token::String {
@@ -366,7 +362,7 @@ where
                         Ok(style) => style.parse(raw, options),
                         Err(e) => StringValue::Invalid { reason: e },
                     };
-                    let literal = StringLiteral {
+                    let literal = Self {
                         span: input.span_since(before.cursor()).into(),
                         tokens: collect_string_tokens(input, before.clone()),
                         value,
@@ -431,13 +427,13 @@ impl TreeText for StringLiteral {
         self.tokens
             .iter()
             .map(|token| match token {
-                StringToken::Word { raw } | StringToken::String { raw } => format!("{} ", raw),
+                StringToken::Word { raw } | StringToken::String { raw } => format!("{raw} "),
             })
             .collect()
     }
 }
 
-fn is_valid_unicode_escape_character(c: char) -> bool {
+const fn is_valid_unicode_escape_character(c: char) -> bool {
     !(c.is_whitespace() || c.is_ascii_hexdigit() || c == '\'' || c == '"' || c == '+')
 }
 

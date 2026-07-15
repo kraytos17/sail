@@ -10,15 +10,15 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub enum SyntaxNode<K> {
     /// A choice among multiple nodes.
-    Choice(Vec<SyntaxNode<K>>),
+    Choice(Vec<Self>),
     /// A sequence of multiple nodes.
-    Sequence(Vec<SyntaxNode<K>>),
+    Sequence(Vec<Self>),
     /// An optional node.
-    Optional(Box<SyntaxNode<K>>),
+    Optional(Box<Self>),
     /// A node that can appear zero or more times.
-    ZeroOrMore(Box<SyntaxNode<K>>),
+    ZeroOrMore(Box<Self>),
     /// A node that can appear one or more times.
-    OneOrMore(Box<SyntaxNode<K>>),
+    OneOrMore(Box<Self>),
     /// A non-terminal node identified by a key.
     NonTerminal(K),
     /// A terminal node identified by its kind.
@@ -34,17 +34,17 @@ impl<K> SyntaxNode<K> {
         F: Fn(K) -> L + Copy,
     {
         match self {
-            SyntaxNode::Choice(nodes) => {
+            Self::Choice(nodes) => {
                 SyntaxNode::Choice(nodes.into_iter().map(|n| n.map(f)).collect())
             }
-            SyntaxNode::Sequence(nodes) => {
+            Self::Sequence(nodes) => {
                 SyntaxNode::Sequence(nodes.into_iter().map(|n| n.map(f)).collect())
             }
-            SyntaxNode::Optional(node) => SyntaxNode::Optional(Box::new(node.map(f))),
-            SyntaxNode::ZeroOrMore(node) => SyntaxNode::ZeroOrMore(Box::new(node.map(f))),
-            SyntaxNode::OneOrMore(node) => SyntaxNode::OneOrMore(Box::new(node.map(f))),
-            SyntaxNode::NonTerminal(k) => SyntaxNode::NonTerminal(f(k)),
-            SyntaxNode::Terminal(kind) => SyntaxNode::Terminal(kind),
+            Self::Optional(node) => SyntaxNode::Optional(Box::new(node.map(f))),
+            Self::ZeroOrMore(node) => SyntaxNode::ZeroOrMore(Box::new(node.map(f))),
+            Self::OneOrMore(node) => SyntaxNode::OneOrMore(Box::new(node.map(f))),
+            Self::NonTerminal(k) => SyntaxNode::NonTerminal(f(k)),
+            Self::Terminal(kind) => SyntaxNode::Terminal(kind),
         }
     }
 }
@@ -68,7 +68,7 @@ pub struct SyntaxDescriptor {
     /// The syntax node representing the structure of the AST node type.
     pub node: SyntaxNode<TypeId>,
     /// A list of AST node types that this AST node type refers to.
-    pub children: Vec<(TypeId, Box<dyn Fn() -> SyntaxDescriptor>)>,
+    pub children: Vec<(TypeId, Box<dyn Fn() -> Self>)>,
 }
 
 /// A trait for defining the syntax of an AST node type.
@@ -147,10 +147,10 @@ impl SyntaxGraphBuilder {
             .map(|(_, (name, node))| SyntaxRule {
                 name: name.clone(),
                 node: node.clone().map(|ty| {
-                    self.visited
-                        .get(&ty)
-                        .map(|(name, _)| name.clone())
-                        .unwrap_or_else(|| panic!("type should be visited: {ty:?}"))
+                    self.visited.get(&ty).map_or_else(
+                        || panic!("type should be visited: {ty:?}"),
+                        |(name, _)| name.clone(),
+                    )
                 }),
             })
             .collect::<Vec<_>>();

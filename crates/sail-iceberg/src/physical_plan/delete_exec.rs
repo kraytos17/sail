@@ -6,8 +6,8 @@ use datafusion::arrow::compute::filter_record_batch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ToDFSchema;
-use datafusion::execution::context::TaskContext;
 use datafusion::execution::SessionState;
+use datafusion::execution::context::TaskContext;
 use datafusion::physical_expr::{Distribution, EquivalenceProperties};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -22,7 +22,7 @@ use object_store::ObjectStoreExt;
 use sail_common_datafusion::catalog::LakehouseExecutionContext;
 use sail_common_datafusion::logical_expr::ExprWithSource;
 
-use crate::catalog_support::commit_helper::{commit_iceberg_changes, CommitResult};
+use crate::catalog_support::commit_helper::{CommitResult, commit_iceberg_changes};
 use crate::datasource::pruning::data_file_might_match;
 use crate::datasource::type_converter::iceberg_schema_to_arrow;
 use crate::io::StoreContext;
@@ -368,7 +368,7 @@ impl ExecutionPlan for IcebergDeleteExec {
                 )
                 .await
                 {
-                    Ok(CommitResult::Committed { .. }) => {
+                    Ok(CommitResult::Committed) => {
                         let array = Arc::new(UInt64Array::from(vec![total_deleted_rows]));
                         let batch = RecordBatch::try_new(schema, vec![array])
                             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
@@ -604,7 +604,7 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::common::ToDFSchema;
     use datafusion::execution::session_state::SessionStateBuilder;
-    use datafusion::logical_expr::{col, lit, Expr};
+    use datafusion::logical_expr::{Expr, col, lit};
 
     use crate::datasource::pruning::data_file_might_match;
     use crate::spec::{DataContentType, DataFile, DataFileFormat};

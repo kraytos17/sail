@@ -2,8 +2,8 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use sail_common::spec;
 use sail_common::spec::{
-    i256, ARROW_DECIMAL128_MAX_PRECISION, ARROW_DECIMAL256_MAX_PRECISION,
-    ARROW_DECIMAL256_MAX_SCALE,
+    ARROW_DECIMAL128_MAX_PRECISION, ARROW_DECIMAL256_MAX_PRECISION, ARROW_DECIMAL256_MAX_SCALE,
+    i256,
 };
 
 use crate::error::{SqlError, SqlResult};
@@ -97,13 +97,12 @@ pub fn parse_decimal_string(s: &str) -> SqlResult<spec::Literal> {
         .captures(s)
         .or_else(|| DECIMAL_FRACTION_REGEX.captures(s))
         .ok_or_else(error)?;
-    let sign = captures.name("sign").map(|s| s.as_str()).unwrap_or("");
+    let sign = captures.name("sign").map_or("", |s| s.as_str());
     let whole = captures
         .name("whole")
-        .map(|s| s.as_str())
-        .unwrap_or("")
+        .map_or("", |s| s.as_str())
         .trim_start_matches('0');
-    let fraction = captures.name("fraction").map(|s| s.as_str()).unwrap_or("");
+    let fraction = captures.name("fraction").map_or("", |s| s.as_str());
     let e: i8 = extract_match(&captures, "exponent", error)?.unwrap_or(0);
     let (whole, w, f) = match (whole, fraction) {
         ("", "") => ("0", 1i8, 0i8),
@@ -303,14 +302,14 @@ mod tests {
             }
         );
         assert!(parse("123456789012345678901234567890123456789").is_ok());
-        assert!(parse(
-            "1234567890123456789012345678901234567891234567890123456789012345678901234567"
-        )
-        .is_ok());
-        assert!(parse(
-            "12345678901234567890123456789012345678912345678901234567890123456789012345677"
-        )
-        .is_err());
+        assert!(
+            parse("1234567890123456789012345678901234567891234567890123456789012345678901234567")
+                .is_ok()
+        );
+        assert!(
+            parse("12345678901234567890123456789012345678912345678901234567890123456789012345677")
+                .is_err()
+        );
         Ok(())
     }
 }

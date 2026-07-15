@@ -6,7 +6,7 @@ use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::signature::{Signature, Volatility};
 
 use crate::functions_utils::make_scalar_function;
-use crate::scalar::url::parse_url::{spark_handled_parse_url, ParseUrl};
+use crate::scalar::url::parse_url::{ParseUrl, spark_handled_parse_url};
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct SparkTryParseUrl {
@@ -28,7 +28,7 @@ impl SparkTryParseUrl {
 }
 
 impl ScalarUDFImpl for SparkTryParseUrl {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "spark_try_parse_url"
     }
 

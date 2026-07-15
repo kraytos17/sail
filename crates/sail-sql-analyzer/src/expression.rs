@@ -410,8 +410,8 @@ pub fn from_ast_expression(expr: Expr) -> SqlResult<spec::Expr> {
             if let Some(escape) = from_ast_pattern_escape_string(escape)? {
                 arguments.push(spec::Expr::Literal(spec::Literal::Utf8 {
                     value: Some(escape.to_string()),
-                }))
-            };
+                }));
+            }
             let expr = spec::Expr::UnresolvedFunction(spec::UnresolvedFunction {
                 function_name: spec::ObjectName::bare("like"),
                 arguments,
@@ -437,7 +437,7 @@ pub fn from_ast_expression(expr: Expr) -> SqlResult<spec::Expr> {
                 arguments.push(spec::Expr::Literal(spec::Literal::Utf8 {
                     value: Some(escape.to_string()),
                 }));
-            };
+            }
             let expr = spec::Expr::UnresolvedFunction(spec::UnresolvedFunction {
                 function_name: spec::ObjectName::bare("ilike"),
                 arguments,
@@ -1003,9 +1003,11 @@ fn from_ast_atom_expression(atom: AtomExpr) -> SqlResult<spec::Expr> {
             let null_treatment = match (inner_null_treatment, null_treatment) {
                 (Some(x), None) => Some(x),
                 (None, Some(x)) => Some(x),
-                (Some(_), Some(_)) => return Err(SqlError::invalid(
-                    "conflicting null treatment clause inside and outside function argument list",
-                )),
+                (Some(_), Some(_)) => {
+                    return Err(SqlError::invalid(
+                        "conflicting null treatment clause inside and outside function argument list",
+                    ));
+                }
                 (None, None) => None,
             };
             let ignore_nulls = match null_treatment {

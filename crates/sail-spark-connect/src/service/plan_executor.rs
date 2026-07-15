@@ -3,9 +3,9 @@ use std::task::{Context, Poll};
 
 use datafusion::arrow::compute::concat_batches;
 use datafusion::prelude::SessionContext;
+use fastrace::Span;
 use fastrace::collector::SpanContext;
 use fastrace::future::FutureExt;
-use fastrace::Span;
 use futures::stream;
 use log::{debug, warn};
 use sail_common::spec;
@@ -14,27 +14,27 @@ use sail_common_datafusion::session::job::JobService;
 use sail_plan::resolve_and_execute_plan;
 use sail_sql_analyzer::parser::parse_one_statement;
 use sail_sql_analyzer::statement::from_ast_statement;
-use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
-use tonic::codegen::tokio_stream::Stream;
 use tonic::Status;
+use tonic::codegen::tokio_stream::Stream;
+use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::{ProtoFieldExt, SparkError, SparkResult};
 use crate::executor::{
-    read_stream, to_arrow_batch, Executor, ExecutorBatch, ExecutorMetadata, ExecutorOutput,
-    ExecutorOutputStream,
+    Executor, ExecutorBatch, ExecutorMetadata, ExecutorOutput, ExecutorOutputStream, read_stream,
+    to_arrow_batch,
 };
 use crate::session::SparkSession;
 use crate::spark::connect::execute_plan_response::{
     ResponseType, ResultComplete, SqlCommandResult,
 };
 use crate::spark::connect::{
-    relation, CheckpointCommand, CheckpointCommandResult, CommonInlineUserDefinedDataSource,
+    CheckpointCommand, CheckpointCommandResult, CommonInlineUserDefinedDataSource,
     CommonInlineUserDefinedFunction, CommonInlineUserDefinedTableFunction,
     CreateDataFrameViewCommand, ExecutePlanResponse, GetResourcesCommand, LocalRelation,
     MergeIntoTableCommand, Relation, SqlCommand, StreamingQueryCommand,
     StreamingQueryCommandResult, StreamingQueryListenerBusCommand, StreamingQueryManagerCommand,
     StreamingQueryManagerCommandResult, WriteOperation, WriteOperationV2,
-    WriteStreamOperationStart, WriteStreamOperationStartResult,
+    WriteStreamOperationStart, WriteStreamOperationStartResult, relation,
 };
 use crate::streaming::timeout_millis;
 
@@ -405,7 +405,7 @@ pub(crate) async fn handle_execute_streaming_query_command(
         | Command::Exception(false) => {
             return Err(SparkError::invalid(format!(
                 "invalid streaming query command: {command:?}"
-            )))
+            )));
         }
     };
     let result = StreamingQueryCommandResult {
@@ -480,18 +480,18 @@ pub(crate) async fn handle_execute_streaming_query_manager_command(
             Some(ResultType::ResetTerminated(true))
         }
         Command::AddListener(_) => {
-            return Err(SparkError::NotImplemented("add listener".to_string()))
+            return Err(SparkError::NotImplemented("add listener".to_string()));
         }
         Command::RemoveListener(_) => {
-            return Err(SparkError::NotImplemented("remove listener".to_string()))
+            return Err(SparkError::NotImplemented("remove listener".to_string()));
         }
         Command::ListListeners(_) => {
-            return Err(SparkError::NotImplemented("list listeners".to_string()))
+            return Err(SparkError::NotImplemented("list listeners".to_string()));
         }
         Command::Active(false) | Command::ResetTerminated(false) => {
             return Err(SparkError::invalid(format!(
                 "invalid streaming query manager command: {command:?}"
-            )))
+            )));
         }
     };
     let result = StreamingQueryManagerCommandResult { result_type };
@@ -647,7 +647,7 @@ pub(crate) async fn handle_execute_register_datasource(
         None => {
             return Err(SparkError::invalid(
                 "RegisterDataSource requires a python_data_source",
-            ))
+            ));
         }
     };
 

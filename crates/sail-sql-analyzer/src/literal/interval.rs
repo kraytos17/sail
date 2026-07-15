@@ -11,7 +11,7 @@ use sail_sql_parser::ast::expression::{
 };
 
 use crate::error::{SqlError, SqlResult};
-use crate::literal::utils::{extract_fraction_match, extract_match, parse_signed_value, Signed};
+use crate::literal::utils::{Signed, extract_fraction_match, extract_match, parse_signed_value};
 use crate::parser::parse_interval_literal;
 use crate::value::from_ast_string;
 
@@ -75,17 +75,17 @@ pub enum IntervalValue {
 impl From<IntervalValue> for spec::Literal {
     fn from(value: IntervalValue) -> Self {
         match value {
-            IntervalValue::YearMonth { months } => spec::Literal::IntervalYearMonth {
+            IntervalValue::YearMonth { months } => Self::IntervalYearMonth {
                 months: Some(months),
             },
-            IntervalValue::Microsecond { microseconds } => spec::Literal::DurationMicrosecond {
+            IntervalValue::Microsecond { microseconds } => Self::DurationMicrosecond {
                 microseconds: Some(microseconds),
             },
             IntervalValue::MonthDayNanosecond {
                 months,
                 days,
                 nanoseconds,
-            } => spec::Literal::IntervalMonthDayNano {
+            } => Self::IntervalMonthDayNano {
                 value: Some(spec::IntervalMonthDayNano {
                     months,
                     days,
@@ -100,7 +100,7 @@ pub fn from_ast_signed_interval(value: Signed<IntervalExpr>) -> SqlResult<Interv
     // TODO: support the legacy calendar interval when `spark.sql.legacy.interval.enabled` is `true`
     let negated = value.is_negative();
     let interval = value.into_inner();
-    match interval.clone() {
+    match interval {
         IntervalExpr::Standard { value, qualifier } => {
             let kind = from_ast_interval_qualifier(qualifier)?;
             from_ast_standard_interval(value, kind, negated)
@@ -167,9 +167,9 @@ impl FromStr for Signed<DecimalSecond> {
             microseconds,
         };
         if negated {
-            Ok(Signed::Negative(value))
+            Ok(Self::Negative(value))
         } else {
-            Ok(Signed::Positive(value))
+            Ok(Self::Positive(value))
         }
     }
 }
@@ -391,8 +391,8 @@ fn from_ast_multi_unit_interval(
                 let value: Signed<DecimalSecond> = parse_signed_value(value)?;
                 let negated = value.is_negative();
                 let value = value.into_inner();
-                let seconds = TimeDelta::seconds(value.seconds as i64);
-                let microseconds = TimeDelta::microseconds(value.microseconds as i64);
+                let seconds = TimeDelta::seconds(i64::from(value.seconds));
+                let microseconds = TimeDelta::microseconds(i64::from(value.microseconds));
                 if negated {
                     delta = delta.checked_sub(&seconds).ok_or_else(error)?;
                     delta = delta.checked_sub(&microseconds).ok_or_else(error)?;

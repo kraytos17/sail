@@ -27,7 +27,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
     PlanProperties, SendableRecordBatchStream,
 };
-use datafusion_common::{internal_err, DataFusionError, Result};
+use datafusion_common::{DataFusionError, Result, internal_err};
 use datafusion_physical_expr::{Distribution, EquivalenceProperties};
 use futures::stream::{self, StreamExt};
 use log::warn;
@@ -40,19 +40,19 @@ use url::Url;
 
 use crate::catalog::coordinator::{DeltaCatalogCommitCoordinator, DeltaCatalogManagedTable};
 use crate::catalog_managed::{catalog_managed_delta_table, enable_catalog_managed_create_actions};
-use crate::delta_log::{get_object_store_from_context, LogStoreRef, StorageConfig};
+use crate::delta_log::{LogStoreRef, StorageConfig, get_object_store_from_context};
 use crate::physical_plan::action_schema::ExecCommitMeta;
 use crate::physical_plan::catalog_location::resolve_catalog_table_url;
-use crate::physical_plan::{decode_actions_and_meta_from_batch, DeltaCommitContext, COL_ACTION};
+use crate::physical_plan::{COL_ACTION, DeltaCommitContext, decode_actions_and_meta_from_batch};
 use crate::schema::{
     metadata_for_create_with_struct_type, normalize_delta_schema, protocol_for_create,
     schema_has_column_defaults, schema_has_generated_columns, schema_has_identity_columns,
 };
 use crate::snapshot::DeltaSnapshotConfig;
 use crate::spec::{
-    commit_path, contains_timestampntz_arrow, contains_variant_arrow, ColumnMetadataKey,
-    CommitAction, DeltaError, DeltaOperation, Metadata, MetadataValue, SaveMode, StatValue, Stats,
-    StructField, StructType, TableFeature,
+    ColumnMetadataKey, CommitAction, DeltaError, DeltaOperation, Metadata, MetadataValue, SaveMode,
+    StatValue, Stats, StructField, StructType, TableFeature, commit_path,
+    contains_timestampntz_arrow, contains_variant_arrow,
 };
 use crate::table::{
     create_delta_table_with_object_store, load_catalog_managed_commits_for_snapshot,
@@ -94,7 +94,6 @@ pub struct DeltaCommitExec {
 }
 
 impl DeltaCommitExec {
-    #[expect(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         table_url: Url,
@@ -378,12 +377,11 @@ impl DeltaCommitExec {
         if let Some(protocol) = actions.iter().find_map(|action| match action {
             CommitAction::Protocol(protocol) => Some(protocol),
             _ => None,
-        }) {
-            if protocol != snapshot.protocol() {
-                return Err(DataFusionError::Plan(
-                    "Delta table already exists with a different protocol".to_string(),
-                ));
-            }
+        }) && protocol != snapshot.protocol()
+        {
+            return Err(DataFusionError::Plan(
+                "Delta table already exists with a different protocol".to_string(),
+            ));
         }
 
         if let Some(metadata) = actions.iter().find_map(|action| match action {
@@ -656,7 +654,7 @@ impl ExecutionPlan for DeltaCommitExec {
             log::trace!(
                 "final_actions_len: {}, final_action_kinds: {:?}",
                 final_actions.len(),
-                &kinds
+                kinds
             );
 
             if !has_commit_payload_actions(&final_actions) {

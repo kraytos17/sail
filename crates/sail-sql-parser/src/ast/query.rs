@@ -1,16 +1,16 @@
+use chumsky::Parser;
 use chumsky::extra::ParserExtra;
 use chumsky::input::{Input, ValueInput};
 use chumsky::label::LabelError;
 use chumsky::pratt::{infix, left};
 use chumsky::prelude::choice;
-use chumsky::Parser;
 use either::Either;
 use sail_sql_macro::{TreeParser, TreeSyntax, TreeText};
 
 use crate::ast::expression::{
     DuplicateTreatment, Expr, FunctionArgument, GroupingExpr, OrderByExpr, WindowSpec,
 };
-use crate::ast::identifier::{column_ident, object_name, table_ident, Ident, ObjectName};
+use crate::ast::identifier::{Ident, ObjectName, column_ident, object_name, table_ident};
 use crate::ast::keywords::{
     All, Anti, As, Bucket, By, Cluster, Cross, Cube, Distinct, Distribute, Except, Exclude, For,
     From, Full, Group, Having, Identifier, In, Include, Inner, Intersect, Join, Lateral, Left,
@@ -83,10 +83,10 @@ pub struct IdentList {
 pub enum QueryBody {
     Term(Box<QueryTerm>),
     SetOperation {
-        left: Box<QueryBody>,
+        left: Box<Self>,
         operator: SetOperator,
         quantifier: Option<SetQuantifier>,
-        right: Box<QueryBody>,
+        right: Box<Self>,
     },
 }
 
@@ -106,14 +106,14 @@ where
     ) -> impl Parser<'a, I, Self, E> + Clone {
         let quantifier = SetQuantifier::parser((), options).or_not();
         let term = QueryTerm::parser((query, expr, table_with_joins), options)
-            .map(|t| QueryBody::Term(Box::new(t)));
+            .map(|t| Self::Term(Box::new(t)));
         term.pratt((
             infix(
                 left(2),
                 Intersect::parser((), options)
                     .map(SetOperator::Intersect)
                     .then(quantifier.clone()),
-                |left, (operator, quantifier), right, _| QueryBody::SetOperation {
+                |left, (operator, quantifier), right, _| Self::SetOperation {
                     left: Box::new(left),
                     operator,
                     quantifier,
@@ -128,7 +128,7 @@ where
                     Minus::parser((), options).map(SetOperator::Minus),
                 ))
                 .then(quantifier),
-                |left, (operator, quantifier), right, _| QueryBody::SetOperation {
+                |left, (operator, quantifier), right, _| Self::SetOperation {
                     left: Box::new(left),
                     operator,
                     quantifier,

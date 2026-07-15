@@ -12,16 +12,18 @@ pub struct TokenSpan {
 }
 
 impl TokenSpan {
-    pub fn is_empty(&self) -> bool {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.start >= self.end
     }
 
+    #[must_use]
     pub fn union(&self, other: &Self) -> Self {
         match (self.is_empty(), other.is_empty()) {
-            (true, true) => TokenSpan::default(),
+            (true, true) => Self::default(),
             (true, false) => *other,
             (false, true) => *self,
-            (false, false) => TokenSpan {
+            (false, false) => Self {
                 start: self.start.min(other.start),
                 end: self.end.max(other.end),
             },
@@ -30,7 +32,7 @@ impl TokenSpan {
 
     pub fn union_all<I>(iter: I) -> Self
     where
-        I: IntoIterator<Item = TokenSpan>,
+        I: IntoIterator<Item = Self>,
     {
         iter.into_iter()
             .reduce(|acc, span| acc.union(&span))
@@ -40,7 +42,7 @@ impl TokenSpan {
 
 impl<C> From<SimpleSpan<usize, C>> for TokenSpan {
     fn from(span: SimpleSpan<usize, C>) -> Self {
-        TokenSpan {
+        Self {
             start: span.start,
             end: span.end,
         }

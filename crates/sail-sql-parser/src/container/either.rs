@@ -1,8 +1,8 @@
 use std::any::TypeId;
 
+use chumsky::Parser;
 use chumsky::extra::ParserExtra;
 use chumsky::prelude::Input;
-use chumsky::Parser;
 use either::Either;
 
 use crate::combinator::either_or;
@@ -49,8 +49,8 @@ where
 {
     fn text(&self) -> String {
         match self {
-            Either::Left(l) => l.text(),
-            Either::Right(r) => r.text(),
+            Self::Left(l) => l.text(),
+            Self::Right(r) => r.text(),
         }
     }
 }

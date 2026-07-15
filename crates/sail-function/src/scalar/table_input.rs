@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
-use datafusion_common::{plan_err, Result};
+use datafusion_common::{Result, plan_err};
 use datafusion_expr::{
     ColumnarValue, LogicalPlan, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
@@ -27,7 +27,7 @@ impl TableInput {
 }
 
 impl ScalarUDFImpl for TableInput {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "table_input"
     }
 

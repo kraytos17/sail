@@ -51,7 +51,7 @@ fn build_unity_catalog() -> Result<(), Box<dyn std::error::Error>> {
         // These code snippets do not compile when running `cargo test -- --ignored`.
         .replace("```ignore", "```notrust");
     let content = add_column_type_name_aliases(content);
-    let content = add_nullable_array_deserializer(content);
+    let content = add_nullable_array_deserializer(&content);
     let content = add_table_info_columns_deserializer(content);
 
     std::fs::write(out_file, content)?;
@@ -93,11 +93,11 @@ fn add_column_type_name_aliases(content: String) -> String {
     })
 }
 
-fn add_nullable_array_deserializer(content: String) -> String {
+fn add_nullable_array_deserializer(content: &str) -> String {
     // OneLake may return `null` for columns when listing tables.
     content.replace(
         "pub mod types {\n",
-        r#"pub mod types {
+        r"pub mod types {
     fn deserialize_null_as_default<'de, D, T>(
         deserializer: D,
     ) -> ::std::result::Result<T, D::Error>
@@ -108,7 +108,7 @@ fn add_nullable_array_deserializer(content: String) -> String {
         Ok(<::std::option::Option<T> as ::serde::Deserialize>::deserialize(deserializer)?
             .unwrap_or_default())
     }
-"#,
+",
     )
 }
 

@@ -1,7 +1,7 @@
 use chumsky::extra::ParserExtra;
 use chumsky::input::{Input, ValueInput};
 use chumsky::label::LabelError;
-use chumsky::prelude::{end, Recursive};
+use chumsky::prelude::{Recursive, end};
 use chumsky::{IterParser, Parser};
 
 use crate::ast::data_type::DataType;
@@ -143,6 +143,7 @@ where
     IntervalLiteral::parser(expression(options), options)
 }
 
+#[must_use]
 pub fn create_parser<'a, I, E>(
     options: &'a ParserOptions,
 ) -> impl Parser<'a, I, Vec<Statement>, E> + Clone

@@ -9,8 +9,8 @@ use sail_common_datafusion::datasource::OptionLayer;
 use url::Url;
 
 use crate::catalog_support::commit::{
-    catalog_requirements, table_metadata_location, CatalogCommitOutcome, CatalogTableInfo,
-    IcebergCatalogCommitCoordinator, IcebergCatalogCommitMode,
+    CatalogCommitOutcome, CatalogTableInfo, IcebergCatalogCommitCoordinator,
+    IcebergCatalogCommitMode, catalog_requirements, table_metadata_location,
 };
 use crate::io::StoreContext;
 use crate::spec::{MetadataLog, TableMetadata, TableUpdate};
@@ -117,8 +117,9 @@ pub(crate) async fn commit_iceberg_changes(
                 // subsequent reads discover the latest metadata. Fall through to the
                 // object-store write path with MetadataLocationCas mode.
                 catalog_commit_mode = IcebergCatalogCommitMode::MetadataLocationCas;
-                catalog_metadata_update_table = Some(catalog_table)
-                    .filter(|_| catalog_commit_mode.uses_metadata_location_update());
+                catalog_metadata_update_table = catalog_commit_mode
+                    .uses_metadata_location_update()
+                    .then_some(catalog_table);
             }
             CatalogCommitOutcome::NotSupported => {
                 log::warn!(
@@ -128,8 +129,9 @@ pub(crate) async fn commit_iceberg_changes(
                 // fall back to MetadataLocationCas so we still update the catalog's
                 // metadata-location pointer to the new metadata file.
                 catalog_commit_mode = IcebergCatalogCommitMode::MetadataLocationCas;
-                catalog_metadata_update_table = Some(catalog_table)
-                    .filter(|_| catalog_commit_mode.uses_metadata_location_update());
+                catalog_metadata_update_table = catalog_commit_mode
+                    .uses_metadata_location_update()
+                    .then_some(catalog_table);
             }
             CatalogCommitOutcome::Conflict => {
                 return Err(DataFusionError::Execution(
@@ -164,10 +166,10 @@ pub(crate) async fn commit_iceberg_changes(
             _ => {}
         }
     }
-    if let Some(seq) = newest_snapshot_seq {
-        if seq > table_meta.last_sequence_number {
-            table_meta.last_sequence_number = seq;
-        }
+    if let Some(seq) = newest_snapshot_seq
+        && seq > table_meta.last_sequence_number
+    {
+        table_meta.last_sequence_number = seq;
     }
     table_meta.last_updated_ms = timestamp_ms;
 

@@ -130,10 +130,10 @@ impl PartitionEvaluator for SparkFirstLastValueEvaluator {
         if range.start == range.end {
             return ScalarValue::try_from(array.data_type());
         }
-        match self.valid_index(array, range) {
-            Some(index) => ScalarValue::try_from_array(array, index),
-            None => ScalarValue::try_from(array.data_type()),
-        }
+        self.valid_index(array, range).map_or_else(
+            || ScalarValue::try_from(array.data_type()),
+            |index| ScalarValue::try_from_array(array, index),
+        )
     }
 
     fn supports_bounded_execution(&self) -> bool {
@@ -149,10 +149,10 @@ impl SparkFirstLastValueEvaluator {
     fn valid_index(&self, array: &ArrayRef, range: &Range<usize>) -> Option<usize> {
         if self.ignore_nulls {
             let slice = array.slice(range.start, range.end - range.start);
-            if let Some(nulls) = slice.nulls() {
-                if nulls.null_count() > 0 {
-                    return self.valid_index_with_nulls(nulls, range.start);
-                }
+            if let Some(nulls) = slice.nulls()
+                && nulls.null_count() > 0
+            {
+                return self.valid_index_with_nulls(nulls, range.start);
             }
         }
         match self.kind {

@@ -7,7 +7,7 @@ use prost::Message;
 use crate::error::ExecutionResult;
 use crate::id::TaskStreamKey;
 use crate::rpc::{ClientHandle, ClientOptions, ClientService};
-use crate::stream::gen::TaskStreamTicket;
+use crate::stream::gen_::TaskStreamTicket;
 use crate::stream::reader::TaskStreamSource;
 
 #[derive(Clone)]

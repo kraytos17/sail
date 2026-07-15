@@ -4,7 +4,7 @@ use sail_sql_macro::{TreeParser, TreeSyntax, TreeText};
 use crate::ast;
 use crate::ast::data_type::DataType;
 use crate::ast::expression::{BooleanLiteral, Expr, OrderDirection};
-use crate::ast::identifier::{table_ident, Ident, ObjectName};
+use crate::ast::identifier::{Ident, ObjectName, table_ident};
 use crate::ast::keywords::{
     Add, After, All, Alter, Always, Analyze, And, As, Buckets, By, Cache, Cascade, Catalog,
     Catalogs, Change, Check, Clear, Cluster, Clustered, Codegen, Collection, Column, Columns,
@@ -204,7 +204,7 @@ pub enum Statement {
         explain: Explain,
         format: Option<ExplainFormat>,
         #[parser(function = |(s, _, _, _), _| boxed(s))]
-        statement: Box<Statement>,
+        statement: Box<Self>,
     },
     InsertOverwriteDirectory {
         insert: Insert,
@@ -524,7 +524,7 @@ pub struct ColumnTypeDefinition {
 pub enum PartitionByItem {
     /// Hive-style typed partition column definition: `col_name <data_type>`
     ColumnDefinition(#[parser(function = |(_, _, d), o| compose(d, o))] ColumnTypeDefinition),
-    /// DataSource partition expression: `years(ts)`, `bucket(16, b)`, `ts`, ...
+    /// `DataSource` partition expression: `years(ts)`, `bucket(16, b)`, `ts`, ...
     Expression(#[parser(function = |(e, q, d), o| compose((e, q, d), o))] Expr),
 }
 

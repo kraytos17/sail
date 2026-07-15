@@ -18,9 +18,9 @@ use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema as ArrowSch
 use datafusion_common::{DataFusionError, Result};
 use sail_common_datafusion::variant::variant_storage_types_equivalent;
 
+use crate::spec::TableMetadata;
 use crate::spec::schema::{Schema as IcebergSchema, SchemaBuilder};
 use crate::spec::types::{ListType, MapType, NestedField, PrimitiveType, StructType, Type};
-use crate::spec::TableMetadata;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaMode {
@@ -223,10 +223,10 @@ impl SchemaEvolver {
             DataType::Timestamp(table_unit, table_tz),
             DataType::Timestamp(input_unit, input_tz),
         ) = (table_type, input_type)
+            && table_unit == input_unit
+            && Self::timestamp_timezone_compatible(table_tz, input_tz)
         {
-            if table_unit == input_unit && Self::timestamp_timezone_compatible(table_tz, input_tz) {
-                return true;
-            }
+            return true;
         }
         match (table_type, input_type) {
             (DataType::Struct(table_fields), DataType::Struct(input_fields)) => {
@@ -843,8 +843,8 @@ mod tests {
     use crate::spec::metadata::format::FormatVersion;
     use crate::spec::partition::PartitionSpec;
     use crate::spec::transform::Transform;
-    use crate::spec::types::values::{Literal, PrimitiveLiteral};
     use crate::spec::types::PrimitiveType;
+    use crate::spec::types::values::{Literal, PrimitiveLiteral};
 
     #[test]
     fn assign_schema_field_ids_assigns_nested_children() {

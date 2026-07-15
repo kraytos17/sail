@@ -1,9 +1,9 @@
+use chumsky::Parser;
 use chumsky::extra::ParserExtra;
 use chumsky::input::{Input, MapExtra, ValueInput};
 use chumsky::label::LabelError;
-use chumsky::pratt::{infix, left, postfix, prefix, Operator};
+use chumsky::pratt::{Operator, infix, left, postfix, prefix};
 use chumsky::prelude::{any, choice};
-use chumsky::Parser;
 use either::Either;
 use sail_sql_macro::{TreeParser, TreeSyntax, TreeText};
 
@@ -40,58 +40,58 @@ use crate::tree::TreeParser;
 #[syntax(name = "Expression")]
 pub enum Expr {
     Atom(AtomExpr),
-    UnaryOperator(UnaryOperator, Box<Expr>),
-    BinaryOperator(Box<Expr>, BinaryOperator, Box<Expr>),
-    Wildcard(Box<Expr>, Period, operator::Asterisk),
-    Field(Box<Expr>, Period, Ident),
-    Subscript(Box<Expr>, LeftBracket, Box<Expr>, RightBracket),
-    Cast(Box<Expr>, DoubleColon, DataType),
-    IsFalse(Box<Expr>, Is, Option<Not>, False),
-    IsTrue(Box<Expr>, Is, Option<Not>, True),
-    IsUnknown(Box<Expr>, Is, Option<Not>, Unknown),
-    IsNull(Box<Expr>, Is, Option<Not>, Null),
-    IsDistinctFrom(Box<Expr>, Is, Option<Not>, Distinct, From, Box<Expr>),
+    UnaryOperator(UnaryOperator, Box<Self>),
+    BinaryOperator(Box<Self>, BinaryOperator, Box<Self>),
+    Wildcard(Box<Self>, Period, operator::Asterisk),
+    Field(Box<Self>, Period, Ident),
+    Subscript(Box<Self>, LeftBracket, Box<Self>, RightBracket),
+    Cast(Box<Self>, DoubleColon, DataType),
+    IsFalse(Box<Self>, Is, Option<Not>, False),
+    IsTrue(Box<Self>, Is, Option<Not>, True),
+    IsUnknown(Box<Self>, Is, Option<Not>, Unknown),
+    IsNull(Box<Self>, Is, Option<Not>, Null),
+    IsDistinctFrom(Box<Self>, Is, Option<Not>, Distinct, From, Box<Self>),
     InList(
-        Box<Expr>,
+        Box<Self>,
         Option<Not>,
         In,
         LeftParenthesis,
-        Sequence<Expr, Comma>,
+        Sequence<Self, Comma>,
         RightParenthesis,
     ),
     InSubquery(
-        Box<Expr>,
+        Box<Self>,
         Option<Not>,
         In,
         LeftParenthesis,
         Query,
         RightParenthesis,
     ),
-    Between(Box<Expr>, Option<Not>, Between, Box<Expr>, And, Box<Expr>),
+    Between(Box<Self>, Option<Not>, Between, Box<Self>, And, Box<Self>),
     Like(
-        Box<Expr>,
+        Box<Self>,
         Option<Not>,
         Like,
         Option<PatternQuantifier>,
-        Box<Expr>,
+        Box<Self>,
         Option<PatternEscape>,
     ),
     ILike(
-        Box<Expr>,
+        Box<Self>,
         Option<Not>,
         Ilike,
         Option<PatternQuantifier>,
-        Box<Expr>,
+        Box<Self>,
         Option<PatternEscape>,
     ),
-    RLike(Box<Expr>, Option<Not>, Rlike, Box<Expr>),
-    RegExp(Box<Expr>, Option<Not>, Regexp, Box<Expr>),
+    RLike(Box<Self>, Option<Not>, Rlike, Box<Self>),
+    RegExp(Box<Self>, Option<Not>, Regexp, Box<Self>),
     SimilarTo(
-        Box<Expr>,
+        Box<Self>,
         Option<Not>,
         Similar,
         To,
-        Box<Expr>,
+        Box<Self>,
         Option<PatternEscape>,
     ),
 }
@@ -690,32 +690,32 @@ enum ExprFragment<T, S> {
     Singleton(Expr),
     UnaryOperator {
         op: UnaryOperator,
-        expr: Box<ExprFragment<T, S>>,
+        expr: Box<Self>,
     },
     BinaryOperator {
-        left: Box<ExprFragment<T, S>>,
+        left: Box<Self>,
         op: BinaryOperator,
-        right: Box<ExprFragment<T, S>>,
+        right: Box<Self>,
     },
     Modifier {
-        expr: Box<ExprFragment<T, S>>,
+        expr: Box<Self>,
         modifier: ExprModifier,
     },
     PostfixPredicate {
-        expr: Box<ExprFragment<T, S>>,
+        expr: Box<Self>,
         predicate: ExprPostfixPredicate,
     },
     InfixPredicate {
         token: T,
         span: S,
-        left: Box<ExprFragment<T, S>>,
+        left: Box<Self>,
         predicate: ExprInfixPredicate,
-        right: Box<ExprFragment<T, S>>,
+        right: Box<Self>,
     },
     Escape {
         token: T,
         span: S,
-        expr: Box<ExprFragment<T, S>>,
+        expr: Box<Self>,
         escape: PatternEscape,
     },
 }
@@ -732,11 +732,11 @@ where
         E::Error: LabelError<'a, I, TokenLabel>,
     {
         match self {
-            ExprFragment::Singleton(expr) => Ok(expr),
-            ExprFragment::UnaryOperator { op, expr } => {
+            Self::Singleton(expr) => Ok(expr),
+            Self::UnaryOperator { op, expr } => {
                 Ok(Expr::UnaryOperator(op, Box::new(expr.build::<I, E>()?)))
             }
-            ExprFragment::BinaryOperator { left, op, right } => match op {
+            Self::BinaryOperator { left, op, right } => match op {
                 BinaryOperator::And(and) => left.build_logical_and::<I, E>(and, *right),
                 _ => Ok(Expr::BinaryOperator(
                     Box::new(left.build::<I, E>()?),
@@ -744,7 +744,7 @@ where
                     Box::new(right.build::<I, E>()?),
                 )),
             },
-            ExprFragment::Modifier { expr, modifier } => {
+            Self::Modifier { expr, modifier } => {
                 let expr = expr.build::<I, E>()?;
                 match modifier {
                     ExprModifier::Wildcard(x1, x2) => Ok(Expr::Wildcard(Box::new(expr), x1, x2)),
@@ -755,7 +755,7 @@ where
                     ExprModifier::Cast(x1, x2) => Ok(Expr::Cast(Box::new(expr), x1, x2)),
                 }
             }
-            ExprFragment::PostfixPredicate { expr, predicate } => {
+            Self::PostfixPredicate { expr, predicate } => {
                 let expr = expr.build::<I, E>()?;
                 match predicate {
                     ExprPostfixPredicate::IsFalse(x1, x2, x3) => {
@@ -778,7 +778,7 @@ where
                     }
                 }
             }
-            ExprFragment::InfixPredicate {
+            Self::InfixPredicate {
                 token,
                 span,
                 left,
@@ -844,7 +844,7 @@ where
                     ))
                 }
             },
-            ExprFragment::Escape {
+            Self::Escape {
                 token,
                 span,
                 expr: _,
@@ -860,7 +860,7 @@ where
         E::Error: LabelError<'a, I, TokenLabel>,
     {
         match self {
-            ExprFragment::Escape {
+            Self::Escape {
                 token: _,
                 span: _,
                 expr,
@@ -884,13 +884,13 @@ where
         let mut current = &mut self;
         loop {
             match current {
-                ExprFragment::InfixPredicate {
+                Self::InfixPredicate {
                     left: expr,
                     predicate: ExprInfixPredicate::Between(not, between),
                     right: low,
                     ..
                 } => {
-                    *current = ExprFragment::Singleton(Expr::Between(
+                    *current = Self::Singleton(Expr::Between(
                         Box::new(expr.clone().build::<I, E>()?),
                         not.clone(),
                         between.clone(),
@@ -900,15 +900,15 @@ where
                     ));
                     return self.build::<I, E>();
                 }
-                ExprFragment::UnaryOperator { expr: next, .. }
-                | ExprFragment::BinaryOperator { right: next, .. }
-                | ExprFragment::InfixPredicate { right: next, .. } => {
+                Self::UnaryOperator { expr: next, .. }
+                | Self::BinaryOperator { right: next, .. }
+                | Self::InfixPredicate { right: next, .. } => {
                     current = next;
                 }
-                ExprFragment::Singleton(_)
-                | ExprFragment::Modifier { .. }
-                | ExprFragment::PostfixPredicate { .. }
-                | ExprFragment::Escape { .. } => break,
+                Self::Singleton(_)
+                | Self::Modifier { .. }
+                | Self::PostfixPredicate { .. }
+                | Self::Escape { .. } => break,
             }
         }
         Ok(Expr::BinaryOperator(
@@ -925,7 +925,7 @@ where
     I::Span: Into<TokenSpan> + Clone,
     E: ParserExtra<'a, I> + 'a,
     E::Error: LabelError<'a, I, TokenLabel>,
-    P1: Parser<'a, I, Expr, E> + Clone + 'a,
+    P1: Parser<'a, I, Self, E> + Clone + 'a,
     P2: Parser<'a, I, Query, E> + Clone + 'a,
     P3: Parser<'a, I, DataType, E> + Clone + 'a,
 {
@@ -934,11 +934,11 @@ where
         options: &'a ParserOptions,
     ) -> impl Parser<'a, I, Self, E> + Clone {
         let atom = AtomExpr::parser((expr.clone(), query.clone(), data_type.clone()), options)
-            .map(|atom| <ExprFragment<Token<'a>, I::Span>>::Singleton(Expr::Atom(atom)));
+            .map(|atom| <ExprFragment<Token<'a>, I::Span>>::Singleton(Self::Atom(atom)));
         let operator = (
             postfix(
                 26,
-                ExprModifier::parser((expr.clone(), data_type.clone()), options),
+                ExprModifier::parser((expr.clone(), data_type), options),
                 |e, op, _| ExprFragment::Modifier {
                     expr: Box::new(e),
                     modifier: op,
@@ -1064,7 +1064,7 @@ where
             // The "postfix" predicates and "infix" predicates are allowed to have the same binding power.
             postfix(
                 16,
-                ExprPostfixPredicate::parser((expr.clone(), query.clone()), options),
+                ExprPostfixPredicate::parser((expr, query), options),
                 |e, op, _| ExprFragment::PostfixPredicate {
                     expr: Box::new(e),
                     predicate: op,

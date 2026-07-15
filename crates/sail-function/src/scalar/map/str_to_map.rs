@@ -3,7 +3,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, ListArray, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion_common::utils::take_function_args;
-use datafusion_common::{internal_err, Result};
+use datafusion_common::{Result, internal_err};
 use datafusion_expr::function::Hint;
 use datafusion_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
@@ -15,7 +15,7 @@ use sail_common::spec::{SAIL_MAP_KEY_FIELD_NAME, SAIL_MAP_VALUE_FIELD_NAME};
 use crate::scalar::map::utils::{
     map_from_keys_values_offsets_nulls, map_type_from_key_value_types,
 };
-use crate::scalar::string::spark_split::{parse_regex, split_to_array, SparkSplit};
+use crate::scalar::string::spark_split::{SparkSplit, parse_regex, split_to_array};
 
 /// Spark-compatible `str_to_map` expression
 /// <https://spark.apache.org/docs/latest/api/sql/index.html#str_to_map>
@@ -123,7 +123,7 @@ fn str_to_map_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
 
                 for pair_rn in pair_offsets[rn]..pair_offsets[rn + 1] {
                     let pair = pair_strs.value(pair_rn as usize);
-                    let key_value = split_to_array(pair, &key_value_delim, 2)?;
+                    let key_value = split_to_array(pair, &key_value_delim, 2);
                     keys.push(key_value.first().cloned().flatten());
                     values.push(key_value.get(1).cloned().flatten());
                 }

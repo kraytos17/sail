@@ -10,10 +10,9 @@ fn keyword_identifier(value: &str) -> String {
         .map(|part| {
             let part = part.to_lowercase();
             let mut part = part.chars();
-            match part.next() {
-                Some(first) => first.to_uppercase().chain(part).collect::<String>(),
-                None => String::new(),
-            }
+            part.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(part).collect::<String>()
+            })
         })
         .collect::<String>()
 }
@@ -26,7 +25,7 @@ fn build_keywords_macros() -> Result<(), Box<dyn std::error::Error>> {
 
     let keywords = data
         .lines()
-        .map(|line| line.trim())
+        .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect::<Vec<_>>();
     let identifiers = keywords

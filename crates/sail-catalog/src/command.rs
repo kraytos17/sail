@@ -3,8 +3,8 @@ use datafusion::arrow::datatypes::SchemaRef;
 use sail_common_datafusion::array::serde::ArrowSerializer;
 use sail_common_datafusion::catalog::{FunctionStatus, LakehouseOperation};
 use sail_common_datafusion::datasource::{
-    is_lakehouse_format, BucketBy, TableFormatAlterTableOperation, TableFormatCreateTableColumn,
-    TableFormatCreateTableInfo, TableFormatRegistry,
+    BucketBy, TableFormatAlterTableOperation, TableFormatCreateTableColumn,
+    TableFormatCreateTableInfo, TableFormatRegistry, is_lakehouse_format,
 };
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::session::plan::PlanService;
@@ -14,8 +14,8 @@ use crate::error::{CatalogError, CatalogObject, CatalogResult};
 use crate::lakehouse::{
     LakehouseCreateMaterialization, LakehouseCreatePlan, LakehouseCreateRequest,
 };
-use crate::manager::tracker::{CatalogFunctionId, CatalogLogicalPlanId};
 use crate::manager::CatalogManager;
+use crate::manager::tracker::{CatalogFunctionId, CatalogLogicalPlanId};
 use crate::provider::{
     AlterTableOptions, CreateDatabaseOptions, CreateTableOptions, CreateTemporaryViewOptions,
     CreateViewOptions, DropDatabaseOptions, DropTableOptions, DropTemporaryViewOptions,
@@ -519,19 +519,15 @@ impl CatalogCommand {
                             sail_common_datafusion::catalog::managed::metadata_location_value(
                                 props.iter().copied(),
                             )
-                        {
-                            if let Some((prefix, version_str)) =
+                            && let Some((prefix, version_str)) =
                                 meta_location.rsplit_once("/metadata/v")
-                            {
-                                if let Some(ver_str) = version_str.split('.').next() {
-                                    if let Ok(ver) = ver_str.parse::<u64>() {
-                                        let ext = meta_location
-                                            .rsplit('.')
-                                            .next()
-                                            .unwrap_or("metadata.json");
-                                        let new_meta_location =
-                                            format!("{}/metadata/v{}.{}", prefix, ver + 1, ext);
-                                        let _ = manager
+                            && let Some(ver_str) = version_str.split('.').next()
+                            && let Ok(ver) = ver_str.parse::<u64>()
+                        {
+                            let ext = meta_location.rsplit('.').next().unwrap_or("metadata.json");
+                            let new_meta_location =
+                                format!("{}/metadata/v{}.{}", prefix, ver + 1, ext);
+                            let _ = manager
                                             .alter_table(
                                                 &table,
                                                 AlterTableOptions::SetTableProperties {
@@ -543,9 +539,6 @@ impl CatalogCommand {
                                                 },
                                             )
                                             .await;
-                                    }
-                                }
-                            }
                         }
                     }
 

@@ -12,7 +12,7 @@ use sail_logical_plan::merge::RowLevelWriteNode;
 
 use crate::logical::IcebergTableSource;
 use crate::physical::row_level_planner::plan_iceberg_row_level_write;
-use crate::table_format::{plan_iceberg_write, IcebergWriteNode};
+use crate::table_format::{IcebergWriteNode, plan_iceberg_write};
 
 pub struct IcebergPhysicalPlanner;
 
@@ -49,12 +49,12 @@ impl ExtensionPlanner for IcebergPhysicalPlanner {
         }
 
         // Handle RowLevelWriteNode (DELETE)
-        if let Some(delete_node) = node.as_any().downcast_ref::<RowLevelWriteNode>() {
-            if delete_node.target_format().eq_ignore_ascii_case("iceberg") {
-                return plan_iceberg_row_level_write(session_state, delete_node)
-                    .await
-                    .map(Some);
-            }
+        if let Some(delete_node) = node.as_any().downcast_ref::<RowLevelWriteNode>()
+            && delete_node.target_format().eq_ignore_ascii_case("iceberg")
+        {
+            return plan_iceberg_row_level_write(session_state, delete_node)
+                .await
+                .map(Some);
         }
 
         Ok(None)

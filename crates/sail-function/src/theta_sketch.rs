@@ -5,7 +5,7 @@ use arrow::array::{
     LargeListArray, LargeStringArray, ListArray, StringArray, StringViewArray, UInt32Array,
     UInt64Array,
 };
-use datafusion_common::{exec_err, DataFusionError, Result};
+use datafusion_common::{DataFusionError, Result, exec_err};
 use datasketches::hash_value::{canonical_float, raw_bytes};
 use datasketches::theta::{CompactThetaSketch, ThetaSketch};
 
@@ -22,12 +22,12 @@ const FLAG_COMPACT: u8 = 1 << 3;
 const FLAG_ORDERED: u8 = 1 << 4;
 
 pub(crate) fn validate_lg_nom_entries(value: i32, function_name: &str) -> Result<u8> {
-    if !(MIN_LG_NOM_ENTRIES..=MAX_LG_NOM_ENTRIES).contains(&value) {
+    if (MIN_LG_NOM_ENTRIES..=MAX_LG_NOM_ENTRIES).contains(&value) {
+        Ok(value as u8)
+    } else {
         exec_err!(
             "{function_name} requires lgNomEntries between {MIN_LG_NOM_ENTRIES} and {MAX_LG_NOM_ENTRIES}, got {value}"
         )
-    } else {
-        Ok(value as u8)
     }
 }
 
@@ -125,10 +125,10 @@ where
         }
     }
 
-    if entries.len() > nominal_entries {
-        if let Some(next_theta) = entries.pop_last() {
-            theta = theta.min(next_theta);
-        }
+    if entries.len() > nominal_entries
+        && let Some(next_theta) = entries.pop_last()
+    {
+        theta = theta.min(next_theta);
     }
     let entries: Vec<u64> = entries.into_iter().collect();
     let empty = !saw_non_empty && entries.is_empty() && theta == MAX_THETA;

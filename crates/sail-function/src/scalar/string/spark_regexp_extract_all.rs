@@ -363,11 +363,7 @@ fn extract_capture(
             &format!("Expects group index between 0 and {max_group_idx}, but got {group_idx}"),
         ));
     }
-    Ok(caps
-        .get(group_idx)
-        .map(|m| m.as_str())
-        .unwrap_or("")
-        .to_string())
+    Ok(caps.get(group_idx).map_or("", |m| m.as_str()).to_string())
 }
 
 fn extract_first_match(
@@ -377,10 +373,10 @@ fn extract_first_match(
     group_idx: i64,
 ) -> Result<String> {
     validate_group_idx(function_name, group_idx)?;
-    match re.captures(value) {
-        Some(caps) => extract_capture(function_name, &caps, group_idx),
-        None => Ok(String::new()),
-    }
+    re.captures(value).map_or_else(
+        || Ok(String::new()),
+        |caps| extract_capture(function_name, &caps, group_idx),
+    )
 }
 
 fn extract_all_matches(

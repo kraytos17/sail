@@ -8,8 +8,8 @@ use datafusion::arrow::array::{
 use datafusion::arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use datafusion::arrow::datatypes::{
     DataType, Decimal128Type, Decimal256Type, Field, FieldRef, Float16Type, Float32Type,
-    Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, IntervalUnit, UInt16Type, UInt32Type,
-    UInt64Type, UInt8Type,
+    Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, IntervalUnit, UInt8Type, UInt16Type,
+    UInt32Type, UInt64Type,
 };
 use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
@@ -269,12 +269,14 @@ impl AggregateUDFImpl for PercentileDisc {
             "percentile_disc"
         };
 
-        Ok(vec![Field::new(
-            format_state_name(args.name, state_name),
-            DataType::List(Arc::new(field)),
-            true,
-        )
-        .into()])
+        Ok(vec![
+            Field::new(
+                format_state_name(args.name, state_name),
+                DataType::List(Arc::new(field)),
+                true,
+            )
+            .into(),
+        ])
     }
 
     fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {

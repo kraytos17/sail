@@ -349,8 +349,9 @@ fn from_ast_query_body(body: QueryBody) -> SqlResult<spec::QueryPlan> {
                 Some(SetQuantifier::All(_)) => (true, false),
                 Some(SetQuantifier::Distinct(_)) | None => (false, false),
                 Some(SetQuantifier::AllByName(_, _, _)) => (true, true),
-                Some(SetQuantifier::ByName(_, _))
-                | Some(SetQuantifier::DistinctByName(_, _, _)) => (false, true),
+                Some(SetQuantifier::ByName(_, _) | SetQuantifier::DistinctByName(_, _, _)) => {
+                    (false, true)
+                }
             };
             let set_op_type = match operator {
                 SetOperator::Union(_) => spec::SetOpType::Union,
@@ -686,7 +687,7 @@ fn query_plan_with_table_modifier(
                     let alias = match alias {
                         Some((_, Either::Left(x))) => Some(x.value.into()),
                         Some((_, Either::Right(IdentList { .. }))) => {
-                            return Err(SqlError::invalid("multiple alias for pivot value"))
+                            return Err(SqlError::invalid("multiple alias for pivot value"));
                         }
                         None => None,
                     };
@@ -903,9 +904,11 @@ fn query_plan_with_join(left: spec::QueryPlan, join: TableJoin) -> SqlResult<spe
                 }
                 let outer = match operator {
                     None | Some(JoinOperator::Inner(_)) => false,
-                    Some(JoinOperator::LeftOuter(_, _))
-                    | Some(JoinOperator::Left(_))
-                    | Some(JoinOperator::Cross(_)) => true,
+                    Some(
+                        JoinOperator::LeftOuter(_, _)
+                        | JoinOperator::Left(_)
+                        | JoinOperator::Cross(_),
+                    ) => true,
                     _ => return Err(SqlError::invalid("LATERAL JOIN operator")),
                 };
                 query_plan_with_lateral_table_factor(Some(left), right, outer)
@@ -913,7 +916,7 @@ fn query_plan_with_join(left: spec::QueryPlan, join: TableJoin) -> SqlResult<spe
             TableFactor::Query { .. } => {
                 let join_type = match operator {
                     None | Some(JoinOperator::Inner(_)) => spec::JoinType::Inner,
-                    Some(JoinOperator::LeftOuter(_, _)) | Some(JoinOperator::Left(_)) => {
+                    Some(JoinOperator::LeftOuter(_, _) | JoinOperator::Left(_)) => {
                         spec::JoinType::LeftOuter
                     }
                     Some(JoinOperator::Cross(_)) => spec::JoinType::Cross,
@@ -929,23 +932,15 @@ fn query_plan_with_join(left: spec::QueryPlan, join: TableJoin) -> SqlResult<spe
     let right = from_ast_table_factor(right)?;
     let join_type = match operator {
         None | Some(JoinOperator::Inner(_)) => spec::JoinType::Inner,
-        Some(JoinOperator::LeftOuter(_, _)) | Some(JoinOperator::Left(_)) => {
-            spec::JoinType::LeftOuter
+        Some(JoinOperator::LeftOuter(_, _) | JoinOperator::Left(_)) => spec::JoinType::LeftOuter,
+        Some(JoinOperator::RightOuter(_, _) | JoinOperator::Right(_)) => spec::JoinType::RightOuter,
+        Some(JoinOperator::FullOuter(_, _) | JoinOperator::Full(_) | JoinOperator::Outer(_)) => {
+            spec::JoinType::FullOuter
         }
-        Some(JoinOperator::RightOuter(_, _)) | Some(JoinOperator::Right(_)) => {
-            spec::JoinType::RightOuter
-        }
-        Some(JoinOperator::FullOuter(_, _))
-        | Some(JoinOperator::Full(_))
-        | Some(JoinOperator::Outer(_)) => spec::JoinType::FullOuter,
         Some(JoinOperator::Cross(_)) => spec::JoinType::Cross,
-        Some(JoinOperator::Semi(_)) | Some(JoinOperator::LeftSemi(_, _)) => {
-            spec::JoinType::LeftSemi
-        }
+        Some(JoinOperator::Semi(_) | JoinOperator::LeftSemi(_, _)) => spec::JoinType::LeftSemi,
         Some(JoinOperator::RightSemi(_, _)) => spec::JoinType::RightSemi,
-        Some(JoinOperator::Anti(_)) | Some(JoinOperator::LeftAnti(_, _)) => {
-            spec::JoinType::LeftAnti
-        }
+        Some(JoinOperator::Anti(_) | JoinOperator::LeftAnti(_, _)) => spec::JoinType::LeftAnti,
         Some(JoinOperator::RightAnti(_, _)) => spec::JoinType::RightAnti,
     };
     let join_criteria = match (natural, criteria) {

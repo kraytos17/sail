@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    as_primitive_array, Array, Float32Array, Float64Array, Int32Array, Int64Array,
+    Array, Float32Array, Float64Array, Int32Array, Int64Array, as_primitive_array,
 };
 use datafusion::arrow::datatypes::{DataType, Float32Type, Float64Type, Int32Type, Int64Type};
 use datafusion_common::{Result, ScalarValue};
@@ -76,7 +76,7 @@ impl ScalarUDFImpl for SparkBRound {
                     "spark_bround",
                     (1, 2),
                     args.len(),
-                ))
+                ));
             }
         };
         let [x, d] = args.as_slice() else {

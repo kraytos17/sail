@@ -13,7 +13,7 @@ use sail_telemetry::common::{SpanAssociation, SpanAttribute};
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use crate::driver::gen;
+use crate::driver::gen_;
 use crate::error::ExecutionResult;
 use crate::id::{JobId, TaskKey, TaskStreamKey, WorkerId};
 use crate::stream::reader::TaskStreamSource;
@@ -129,24 +129,24 @@ impl fmt::Display for TaskStatus {
     }
 }
 
-impl From<gen::TaskStatus> for TaskStatus {
-    fn from(value: gen::TaskStatus) -> Self {
+impl From<gen_::TaskStatus> for TaskStatus {
+    fn from(value: gen_::TaskStatus) -> Self {
         match value {
-            gen::TaskStatus::Running => Self::Running,
-            gen::TaskStatus::Succeeded => Self::Succeeded,
-            gen::TaskStatus::Failed => Self::Failed,
-            gen::TaskStatus::Canceled => Self::Canceled,
+            gen_::TaskStatus::Running => Self::Running,
+            gen_::TaskStatus::Succeeded => Self::Succeeded,
+            gen_::TaskStatus::Failed => Self::Failed,
+            gen_::TaskStatus::Canceled => Self::Canceled,
         }
     }
 }
 
-impl From<TaskStatus> for gen::TaskStatus {
+impl From<TaskStatus> for gen_::TaskStatus {
     fn from(value: TaskStatus) -> Self {
         match value {
-            TaskStatus::Running => gen::TaskStatus::Running,
-            TaskStatus::Succeeded => gen::TaskStatus::Succeeded,
-            TaskStatus::Failed => gen::TaskStatus::Failed,
-            TaskStatus::Canceled => gen::TaskStatus::Canceled,
+            TaskStatus::Running => gen_::TaskStatus::Running,
+            TaskStatus::Succeeded => gen_::TaskStatus::Succeeded,
+            TaskStatus::Failed => gen_::TaskStatus::Failed,
+            TaskStatus::Canceled => gen_::TaskStatus::Canceled,
         }
     }
 }

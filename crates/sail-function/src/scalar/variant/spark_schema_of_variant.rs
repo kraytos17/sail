@@ -42,7 +42,7 @@ impl Default for SparkSchemaOfVariantUdf {
 }
 
 impl ScalarUDFImpl for SparkSchemaOfVariantUdf {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "schema_of_variant"
     }
 
@@ -128,15 +128,15 @@ pub(crate) fn variant_to_spark_type(variant: &Variant) -> String {
         Variant::Decimal4(d) => decimal_type_string(d.integer() as i128, d.scale()),
         Variant::Decimal8(d) => decimal_type_string(d.integer() as i128, d.scale()),
         Variant::Decimal16(d) => decimal_type_string(d.integer(), d.scale()),
-        Variant::String(_) | Variant::ShortString(_) => "STRING".to_string(),
+        Variant::String(_) | Variant::ShortString(_) | Variant::Time(_) | Variant::Uuid(_) => {
+            "STRING".to_string()
+        }
         Variant::Binary(_) => "BINARY".to_string(),
         Variant::Date(_) => "DATE".to_string(),
         Variant::TimestampMicros(_) | Variant::TimestampNanos(_) => "TIMESTAMP".to_string(),
         Variant::TimestampNtzMicros(_) | Variant::TimestampNtzNanos(_) => {
             "TIMESTAMP_NTZ".to_string()
         }
-        Variant::Time(_) => "STRING".to_string(),
-        Variant::Uuid(_) => "STRING".to_string(),
         Variant::Object(obj) => {
             if obj.is_empty() {
                 return "OBJECT<>".to_string();

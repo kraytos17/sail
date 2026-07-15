@@ -7,10 +7,10 @@ use crate::error::{SqlError, SqlResult};
 use crate::literal::binary::BinaryValue;
 use crate::literal::numeric::{
     parse_decimal_128_string, parse_decimal_256_string, parse_f32_string, parse_f64_string,
-    parse_i16_string, parse_i32_string, parse_i64_string, parse_i8_string,
+    parse_i8_string, parse_i16_string, parse_i32_string, parse_i64_string,
 };
 
-pub(crate) fn from_ast_number_literal(value: NumberLiteral) -> SqlResult<spec::Expr> {
+pub fn from_ast_number_literal(value: NumberLiteral) -> SqlResult<spec::Expr> {
     let NumberLiteral {
         span: _,
         value,
@@ -93,11 +93,11 @@ impl TryFrom<StringLiteralList> for spec::Expr {
             },
             StringLiteralList::Text(text) => spec::Literal::Utf8 { value: Some(text) },
         };
-        Ok(spec::Expr::Literal(literal))
+        Ok(Self::Literal(literal))
     }
 }
 
-pub(crate) fn from_ast_string_literal(
+pub fn from_ast_string_literal(
     head: StringLiteral,
     tail: Vec<StringLiteral>,
 ) -> SqlResult<spec::Expr> {
@@ -109,7 +109,7 @@ pub(crate) fn from_ast_string_literal(
         .try_into()
 }
 
-pub(crate) fn from_ast_boolean_literal(value: BooleanLiteral) -> SqlResult<spec::Expr> {
+pub const fn from_ast_boolean_literal(value: BooleanLiteral) -> SqlResult<spec::Expr> {
     let value = match value {
         BooleanLiteral::True(_) => true,
         BooleanLiteral::False(_) => false,
@@ -119,7 +119,7 @@ pub(crate) fn from_ast_boolean_literal(value: BooleanLiteral) -> SqlResult<spec:
     }))
 }
 
-pub(crate) fn from_ast_string(s: StringLiteral) -> SqlResult<String> {
+pub fn from_ast_string(s: StringLiteral) -> SqlResult<String> {
     let StringLiteral {
         span: _,
         tokens: _,

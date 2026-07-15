@@ -2,8 +2,8 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    as_dictionary_array, as_largestring_array, as_string_array, BinaryBuilder, OffsetSizeTrait,
-    StringArray,
+    BinaryBuilder, OffsetSizeTrait, StringArray, as_dictionary_array, as_largestring_array,
+    as_string_array,
 };
 use datafusion::arrow::datatypes::{DataType, Int32Type};
 use datafusion::logical_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility};
@@ -11,7 +11,7 @@ use datafusion_common::cast::{
     as_binary_array, as_fixed_size_binary_array, as_generic_string_array, as_int64_array,
     as_string_view_array,
 };
-use datafusion_common::{exec_err, DataFusionError, Result, ScalarValue};
+use datafusion_common::{DataFusionError, Result, ScalarValue, exec_err};
 use datafusion_expr::ScalarFunctionArgs;
 use datafusion_expr_common::signature::TypeSignature;
 
@@ -269,9 +269,11 @@ fn spark_unhex_inner<T: OffsetSizeTrait>(
             }
             Ok(ColumnarValue::Array(Arc::new(builder.finish())))
         }
-        ColumnarValue::Scalar(ScalarValue::Utf8(Some(string)))
-        | ColumnarValue::Scalar(ScalarValue::Utf8View(Some(string)))
-        | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(string))) => {
+        ColumnarValue::Scalar(
+            ScalarValue::Utf8(Some(string))
+            | ScalarValue::Utf8View(Some(string))
+            | ScalarValue::LargeUtf8(Some(string)),
+        ) => {
             let mut encoded = Vec::new();
 
             if unhex(string, &mut encoded).is_ok() {
@@ -282,11 +284,9 @@ fn spark_unhex_inner<T: OffsetSizeTrait>(
                 Ok(ColumnarValue::Scalar(ScalarValue::Binary(None)))
             }
         }
-        ColumnarValue::Scalar(ScalarValue::Utf8(None))
-        | ColumnarValue::Scalar(ScalarValue::Utf8View(None))
-        | ColumnarValue::Scalar(ScalarValue::LargeUtf8(None)) => {
-            Ok(ColumnarValue::Scalar(ScalarValue::Binary(None)))
-        }
+        ColumnarValue::Scalar(
+            ScalarValue::Utf8(None) | ScalarValue::Utf8View(None) | ScalarValue::LargeUtf8(None),
+        ) => Ok(ColumnarValue::Scalar(ScalarValue::Binary(None))),
         _ => {
             exec_err!(
                 "The first argument must be a string scalar or array, but got: {:?}",

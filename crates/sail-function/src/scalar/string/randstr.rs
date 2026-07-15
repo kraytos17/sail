@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::StringArray;
 use datafusion::arrow::datatypes::DataType;
-use datafusion_common::{exec_err, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, exec_err};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 
 use crate::scalar::math::xorshift::SparkXorShiftRandom;
@@ -27,7 +27,7 @@ impl Randstr {
 }
 
 impl ScalarUDFImpl for Randstr {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "randstr"
     }
 
@@ -59,7 +59,7 @@ impl ScalarUDFImpl for Randstr {
                 return exec_err!(
                     "`randstr` expects a constant integer length, got {:?}",
                     other.data_type()
-                )
+                );
             }
         };
 
@@ -68,14 +68,14 @@ impl ScalarUDFImpl for Randstr {
                 ColumnarValue::Scalar(ScalarValue::Int32(Some(v))) => Some(*v as i64),
                 ColumnarValue::Scalar(ScalarValue::Int64(Some(v))) => Some(*v),
                 ColumnarValue::Scalar(ScalarValue::Int16(Some(v))) => Some(*v as i64),
-                ColumnarValue::Scalar(ScalarValue::Null)
-                | ColumnarValue::Scalar(ScalarValue::Int32(None))
-                | ColumnarValue::Scalar(ScalarValue::Int64(None)) => None,
+                ColumnarValue::Scalar(
+                    ScalarValue::Null | ScalarValue::Int32(None) | ScalarValue::Int64(None),
+                ) => None,
                 other => {
                     return exec_err!(
                         "`randstr` expects an integer seed, got {:?}",
                         other.data_type()
-                    )
+                    );
                 }
             }
         } else {

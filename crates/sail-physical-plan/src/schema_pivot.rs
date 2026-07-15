@@ -10,7 +10,7 @@ use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::{
     DisplayAs, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
-use datafusion_common::{exec_err, internal_datafusion_err, DataFusionError, Result};
+use datafusion_common::{DataFusionError, Result, exec_err, internal_datafusion_err};
 use futures::{Stream, StreamExt};
 use sail_common_datafusion::utils::items::ItemTaker;
 

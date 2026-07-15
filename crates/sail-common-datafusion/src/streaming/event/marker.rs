@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
-use datafusion_common::{plan_datafusion_err, plan_err, Result};
+use datafusion_common::{Result, plan_datafusion_err, plan_err};
 use prost::Message;
 
-use crate::streaming::event::gen;
+use crate::streaming::event::gen_;
 
 /// A marker injected in a streaming data flow for various purposes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,33 +42,33 @@ impl FlowMarker {
                 source,
                 id,
                 timestamp,
-            } => gen::flow_marker::Kind::LatencyTracker(gen::LatencyTracker {
+            } => gen_::flow_marker::Kind::LatencyTracker(gen_::LatencyTracker {
                 source,
                 id,
                 timestamp_secs: timestamp.timestamp(),
                 timestamp_nanos: timestamp.timestamp_subsec_nanos(),
             }),
             FlowMarker::Watermark { source, timestamp } => {
-                gen::flow_marker::Kind::Watermark(gen::Watermark {
+                gen_::flow_marker::Kind::Watermark(gen_::Watermark {
                     source,
                     timestamp_secs: timestamp.timestamp(),
                     timestamp_nanos: timestamp.timestamp_subsec_nanos(),
                 })
             }
             FlowMarker::Checkpoint { id } => {
-                gen::flow_marker::Kind::Checkpoint(gen::Checkpoint { id })
+                gen_::flow_marker::Kind::Checkpoint(gen_::Checkpoint { id })
             }
-            FlowMarker::EndOfData => gen::flow_marker::Kind::EndOfData(gen::EndOfData {}),
+            FlowMarker::EndOfData => gen_::flow_marker::Kind::EndOfData(gen_::EndOfData {}),
         };
-        let message = gen::FlowMarker { kind: Some(kind) };
+        let message = gen_::FlowMarker { kind: Some(kind) };
         Ok(message.encode_to_vec())
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let message = gen::FlowMarker::decode(bytes)
+        let message = gen_::FlowMarker::decode(bytes)
             .map_err(|e| plan_datafusion_err!("failed to decode marker: {e}"))?;
         match message.kind {
-            Some(gen::flow_marker::Kind::LatencyTracker(gen::LatencyTracker {
+            Some(gen_::flow_marker::Kind::LatencyTracker(gen_::LatencyTracker {
                 source,
                 id,
                 timestamp_secs,
@@ -79,7 +79,7 @@ impl FlowMarker {
                 timestamp: <DateTime<Utc>>::from_timestamp(timestamp_secs, timestamp_nanos)
                     .ok_or_else(|| plan_datafusion_err!("invalid latency tracker timestamp"))?,
             }),
-            Some(gen::flow_marker::Kind::Watermark(gen::Watermark {
+            Some(gen_::flow_marker::Kind::Watermark(gen_::Watermark {
                 source,
                 timestamp_secs,
                 timestamp_nanos,
@@ -88,10 +88,12 @@ impl FlowMarker {
                 timestamp: <DateTime<Utc>>::from_timestamp(timestamp_secs, timestamp_nanos)
                     .ok_or_else(|| plan_datafusion_err!("invalid watermark timestamp"))?,
             }),
-            Some(gen::flow_marker::Kind::Checkpoint(gen::Checkpoint { id })) => {
+            Some(gen_::flow_marker::Kind::Checkpoint(gen_::Checkpoint { id })) => {
                 Ok(FlowMarker::Checkpoint { id })
             }
-            Some(gen::flow_marker::Kind::EndOfData(gen::EndOfData {})) => Ok(FlowMarker::EndOfData),
+            Some(gen_::flow_marker::Kind::EndOfData(gen_::EndOfData {})) => {
+                Ok(FlowMarker::EndOfData)
+            }
             None => plan_err!("missing marker kind"),
         }
     }

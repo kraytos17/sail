@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
-use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig, STANDARD};
 use base64::engine::DecodePaddingMode;
-use base64::{alphabet, Engine as _};
+use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig, STANDARD};
+use base64::{Engine as _, alphabet};
 use datafusion::arrow::array::{
     Array, BinaryArray, BinaryBuilder, BinaryViewArray, FixedSizeBinaryArray, LargeBinaryArray,
     LargeBinaryBuilder, LargeStringArray, StringArray, StringViewArray,
 };
 use datafusion::arrow::datatypes::DataType;
-use datafusion_common::{exec_datafusion_err, exec_err, plan_err, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, exec_datafusion_err, exec_err, plan_err};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 
 const SPARK_BASE64_DECODE: GeneralPurpose = GeneralPurpose::new(
@@ -93,17 +93,15 @@ impl ScalarUDFImpl for SparkBase64 {
                         .map(|value| STANDARD.encode(value.as_bytes())),
                 )))
             }
-            ColumnarValue::Scalar(ScalarValue::Binary(value))
-            | ColumnarValue::Scalar(ScalarValue::BinaryView(value))
-            | ColumnarValue::Scalar(ScalarValue::FixedSizeBinary(_, value)) => {
+            ColumnarValue::Scalar(ScalarValue::Binary(value) |
+ScalarValue::BinaryView(value) | ScalarValue::FixedSizeBinary(_, value)) => {
                 Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
                     value
                         .as_ref()
                         .map(|value| STANDARD.encode(value.as_slice())),
                 )))
             }
-            ColumnarValue::Scalar(ScalarValue::Utf8(value))
-            | ColumnarValue::Scalar(ScalarValue::Utf8View(value)) => {
+            ColumnarValue::Scalar(ScalarValue::Utf8(value) | ScalarValue::Utf8View(value)) => {
                 Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
                     value
                         .as_ref()
@@ -364,8 +362,7 @@ impl ScalarUDFImpl for SparkUnbase64 {
         };
 
         match arg {
-            ColumnarValue::Scalar(ScalarValue::Utf8(value))
-            | ColumnarValue::Scalar(ScalarValue::Utf8View(value)) => {
+            ColumnarValue::Scalar(ScalarValue::Utf8(value) | ScalarValue::Utf8View(value)) => {
                 Ok(ColumnarValue::Scalar(ScalarValue::Binary(
                     value
                         .as_ref()

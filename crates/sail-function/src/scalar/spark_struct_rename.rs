@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, FixedSizeListArray, StructArray};
 use datafusion::arrow::datatypes::{DataType, Field, Fields};
-use datafusion_common::{exec_err, Result};
+use datafusion_common::{Result, exec_err};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 
 /// Spark-compatible "rename struct fields by position".
@@ -36,7 +36,7 @@ impl SparkStructRename {
 }
 
 impl ScalarUDFImpl for SparkStructRename {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "spark_struct_rename"
     }
 

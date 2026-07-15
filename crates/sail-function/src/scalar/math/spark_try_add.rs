@@ -46,23 +46,24 @@ impl ScalarUDFImpl for SparkTryAdd {
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         match arg_types {
             [DataType::Int32, DataType::Int32] => Ok(DataType::Int32),
-            [DataType::Int64, DataType::Int64]
-            | [DataType::Int32, DataType::Int64]
+            [DataType::Int64 | DataType::Int32, DataType::Int64]
             | [DataType::Int64, DataType::Int32] => Ok(DataType::Int64),
             [DataType::Date32, _] | [_, DataType::Date32] => Ok(DataType::Date32),
             [DataType::Interval(YearMonth), _] | [_, DataType::Interval(YearMonth)] => {
                 Ok(DataType::Interval(YearMonth))
             }
-            [DataType::Interval(MonthDayNano), DataType::Int32]
-            | [DataType::Int32, DataType::Interval(MonthDayNano)]
-            | [DataType::Interval(MonthDayNano), DataType::Int64]
-            | [DataType::Int64, DataType::Interval(MonthDayNano)]
-            | [DataType::Interval(MonthDayNano), DataType::Interval(MonthDayNano)] => {
-                Ok(DataType::Interval(MonthDayNano))
-            }
-            [DataType::Timestamp(Microsecond, _), DataType::Duration(Microsecond)] => {
-                Ok(DataType::Timestamp(Microsecond, None))
-            }
+            [
+                DataType::Interval(MonthDayNano),
+                DataType::Int32 | DataType::Int64 | DataType::Interval(MonthDayNano),
+            ]
+            | [
+                DataType::Int32 | DataType::Int64,
+                DataType::Interval(MonthDayNano),
+            ] => Ok(DataType::Interval(MonthDayNano)),
+            [
+                DataType::Timestamp(Microsecond, _),
+                DataType::Duration(Microsecond),
+            ] => Ok(DataType::Timestamp(Microsecond, None)),
 
             _ => Err(unsupported_data_types_exec_err(
                 "try_add",
@@ -177,20 +178,20 @@ impl ScalarUDFImpl for SparkTryAdd {
 
         let valid_pair = matches!(
             (left, right),
-            (DataType::Int32, DataType::Int32)
+            (DataType::Int32 | DataType::Date32, DataType::Int32)
                 | (DataType::Int64, DataType::Int64)
-                | (DataType::Date32, DataType::Int32)
-                | (DataType::Date32, DataType::Interval(YearMonth))
-                | (DataType::Date32, DataType::Interval(MonthDayNano))
+                | (
+                    DataType::Date32 | DataType::Interval(YearMonth),
+                    DataType::Interval(YearMonth)
+                )
+                | (
+                    DataType::Date32 | DataType::Interval(MonthDayNano),
+                    DataType::Interval(MonthDayNano)
+                )
                 | (DataType::Interval(YearMonth), DataType::Date32)
-                | (DataType::Interval(YearMonth), DataType::Interval(YearMonth))
                 | (
                     DataType::Timestamp(Microsecond, _),
                     DataType::Duration(Microsecond)
-                )
-                | (
-                    DataType::Interval(MonthDayNano),
-                    DataType::Interval(MonthDayNano)
                 )
         );
         if *left == DataType::Null {

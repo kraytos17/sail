@@ -3,9 +3,9 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, ArrayRef, Int32Array, Int64Array, OffsetSizeTrait};
 use datafusion::arrow::datatypes::DataType;
 use datafusion_common::cast::{as_generic_string_array, as_int32_array, as_string_view_array};
-use datafusion_common::types::{logical_int32, logical_string, NativeType};
+use datafusion_common::types::{NativeType, logical_int32, logical_string};
 use datafusion_common::utils::datafusion_strsim;
-use datafusion_common::{exec_err, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, exec_err};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 use datafusion_expr_common::signature::{Coercion, TypeSignature, TypeSignatureClass};
 use datafusion_expr_common::type_coercion::binary::{binary_to_string_coercion, string_coercion};
@@ -60,7 +60,7 @@ impl Levenshtein {
 }
 
 impl ScalarUDFImpl for Levenshtein {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "levenshtein"
     }
 
@@ -69,19 +69,18 @@ impl ScalarUDFImpl for Levenshtein {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if let Some(coercion_data_type) = string_coercion(&arg_types[0], &arg_types[1])
+        string_coercion(&arg_types[0], &arg_types[1])
             .or_else(|| binary_to_string_coercion(&arg_types[0], &arg_types[1]))
-        {
-            match coercion_data_type {
-                DataType::LargeUtf8 => Ok(DataType::Int64),
-                DataType::Utf8 | DataType::Utf8View => Ok(DataType::Int32),
-                other => exec_err!("levenshtein requires Utf8, LargeUtf8 or Utf8View, got {other}"),
-            }
-        } else {
-            exec_err!(
-                "Unsupported data types for levenshtein. Expected Utf8, LargeUtf8 or Utf8View"
+            .map_or_else(
+                || exec_err!(
+                    "Unsupported data types for levenshtein. Expected Utf8, LargeUtf8 or Utf8View"
+                ),
+                |coercion_data_type| match coercion_data_type {
+                    DataType::LargeUtf8 => Ok(DataType::Int64),
+                    DataType::Utf8 | DataType::Utf8View => Ok(DataType::Int32),
+                    other => exec_err!("levenshtein requires Utf8, LargeUtf8 or Utf8View, got {other}"),
+                },
             )
-        }
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -158,17 +157,14 @@ fn spark_levenshtein<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> 
                             let dist = datafusion_strsim::levenshtein_with_buffer(
                                 string1, string2, &mut cache,
                             ) as i32;
-                            match &threshold {
-                                Some(t) => {
-                                    let thresh = if t.is_null(i) { 0 } else { t.value(i) };
-                                    if dist > thresh {
-                                        Some(-1i32)
-                                    } else {
-                                        Some(dist)
-                                    }
+                            threshold.as_ref().map_or(Some(dist), |t| {
+                                let thresh = if t.is_null(i) { 0 } else { t.value(i) };
+                                if dist > thresh {
+                                    Some(-1i32)
+                                } else {
+                                    Some(dist)
                                 }
-                                None => Some(dist),
-                            }
+                            })
                         }
                         _ => None,
                     })
@@ -189,17 +185,14 @@ fn spark_levenshtein<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> 
                             let dist = datafusion_strsim::levenshtein_with_buffer(
                                 string1, string2, &mut cache,
                             ) as i32;
-                            match &threshold {
-                                Some(t) => {
-                                    let thresh = if t.is_null(i) { 0 } else { t.value(i) };
-                                    if dist > thresh {
-                                        Some(-1i32)
-                                    } else {
-                                        Some(dist)
-                                    }
+                            threshold.as_ref().map_or(Some(dist), |t| {
+                                let thresh = if t.is_null(i) { 0 } else { t.value(i) };
+                                if dist > thresh {
+                                    Some(-1i32)
+                                } else {
+                                    Some(dist)
                                 }
-                                None => Some(dist),
-                            }
+                            })
                         }
                         _ => None,
                     })
@@ -219,18 +212,15 @@ fn spark_levenshtein<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> 
                         (Some(string1), Some(string2)) => {
                             let dist = datafusion_strsim::levenshtein_with_buffer(
                                 string1, string2, &mut cache,
-                            ) as i64;
-                            match &threshold {
-                                Some(t) => {
-                                    let thresh = if t.is_null(i) { 0 } else { t.value(i) as i64 };
-                                    if dist > thresh {
-                                        Some(-1i64)
-                                    } else {
-                                        Some(dist)
-                                    }
+                            ) as i32;
+                            threshold.as_ref().map_or(Some(dist as i64), |t| {
+                                let thresh = if t.is_null(i) { 0 } else { t.value(i) as i64 };
+                                if (dist as i64) > thresh {
+                                    Some(-1i64)
+                                } else {
+                                    Some(dist as i64)
                                 }
-                                None => Some(dist),
-                            }
+                            })
                         }
                         _ => None,
                     })

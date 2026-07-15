@@ -15,15 +15,15 @@ pub enum Signed<T> {
 impl<T> Signed<T> {
     pub fn into_inner(self) -> T {
         match self {
-            Signed::Positive(x) => x,
-            Signed::Negative(x) => x,
+            Self::Positive(x) => x,
+            Self::Negative(x) => x,
         }
     }
 
-    pub fn is_negative(&self) -> bool {
+    pub const fn is_negative(&self) -> bool {
         match self {
-            Signed::Positive(_) => false,
-            Signed::Negative(_) => true,
+            Self::Positive(_) => false,
+            Self::Negative(_) => true,
         }
     }
 }
@@ -33,8 +33,8 @@ impl<T> Neg for Signed<T> {
 
     fn neg(self) -> Self::Output {
         match self {
-            Signed::Positive(x) => Signed::Negative(x),
-            Signed::Negative(x) => Signed::Positive(x),
+            Self::Positive(x) => Self::Negative(x),
+            Self::Negative(x) => Self::Positive(x),
         }
     }
 }
@@ -44,7 +44,7 @@ impl<T: FromStr> FromStr for Signed<T> {
 
     fn from_str(s: &str) -> SqlResult<Self> {
         let v = s.parse::<T>().map_err(|_| SqlError::invalid(s))?;
-        Ok(Signed::Positive(v))
+        Ok(Self::Positive(v))
     }
 }
 

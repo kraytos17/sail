@@ -3,7 +3,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{ArrayRef, AsArray, IntervalYearMonthArray};
 use datafusion::arrow::datatypes::{DataType, Int32Type, IntervalUnit};
 use datafusion_common::types::NativeType;
-use datafusion_common::{exec_err, plan_err, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, exec_err, plan_err};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 
 #[derive(Debug, PartialEq, Eq, Hash)]

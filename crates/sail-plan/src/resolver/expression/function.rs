@@ -1,7 +1,7 @@
 use datafusion_common::DFSchemaRef;
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::utils::{expand_qualified_wildcard, expand_wildcard};
-use datafusion_expr::{expr, EmptyRelation, Expr, LogicalPlan};
+use datafusion_expr::{EmptyRelation, Expr, LogicalPlan, expr};
 use sail_catalog::manager::CatalogManager;
 use sail_common::spec;
 use sail_common_datafusion::extension::SessionExtensionAccessor;
@@ -15,11 +15,11 @@ use crate::function::common::{AggFunctionInput, FunctionContextInput, ScalarFunc
 use crate::function::{
     get_built_in_aggregate_function, get_built_in_function, is_higher_order_function,
 };
-use crate::resolver::expression::lambda::is_spec_lambda_argument;
+use crate::resolver::PlanResolver;
 use crate::resolver::expression::NamedExpr;
+use crate::resolver::expression::lambda::is_spec_lambda_argument;
 use crate::resolver::function::PythonUdf;
 use crate::resolver::state::PlanResolverState;
-use crate::resolver::PlanResolver;
 
 impl PlanResolver<'_> {
     pub(super) async fn resolve_expression_function(
@@ -73,10 +73,10 @@ impl PlanResolver<'_> {
 
         let canonical_function_name = function_name.to_ascii_lowercase();
         let catalog_manager = self.ctx.extension::<CatalogManager>()?;
-        if let Some(udf) = catalog_manager.get_function(&canonical_function_name)? {
-            if udf.inner().is::<PySparkUnresolvedUDF>() {
-                state.config_mut().arrow_allow_large_var_types = true;
-            }
+        if let Some(udf) = catalog_manager.get_function(&canonical_function_name)?
+            && udf.inner().is::<PySparkUnresolvedUDF>()
+        {
+            state.config_mut().arrow_allow_large_var_types = true;
         }
 
         // For functions that accept a date-part keyword as the first argument
@@ -445,14 +445,13 @@ impl PlanResolver<'_> {
         ];
         if arguments.len() >= 3
             && DATE_PART_FUNCTIONS.contains(&function_name.trim().to_lowercase().as_str())
+            && let spec::Expr::UnresolvedAttribute { ref name, .. } = arguments[0]
         {
-            if let spec::Expr::UnresolvedAttribute { ref name, .. } = arguments[0] {
-                let parts: Vec<String> = name.clone().into();
-                if parts.len() == 1 {
-                    arguments[0] = spec::Expr::Literal(spec::Literal::Utf8 {
-                        value: Some(parts.into_iter().next().unwrap_or_default()),
-                    });
-                }
+            let parts: Vec<String> = name.clone().into();
+            if parts.len() == 1 {
+                arguments[0] = spec::Expr::Literal(spec::Literal::Utf8 {
+                    value: Some(parts.into_iter().next().unwrap_or_default()),
+                });
             }
         }
         arguments

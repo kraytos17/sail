@@ -3,9 +3,15 @@ use std::sync::Arc;
 
 use chrono::prelude::*;
 use datafusion::arrow::array::timezone::Tz;
-use datafusion::arrow::array::*;
-use datafusion::arrow::datatypes::*;
-use datafusion_common::{exec_err, plan_err, DataFusionError, Result, ScalarValue};
+use datafusion::arrow::array::{
+    Array, ArrayRef, AsArray, LargeListArray, ListArray, MapArray, StringArray, StructArray,
+};
+use datafusion::arrow::datatypes::{
+    DataType, Date32Type, Date64Type, Decimal128Type, Field, Fields, TimeUnit,
+    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    TimestampSecondType,
+};
+use datafusion_common::{DataFusionError, Result, ScalarValue, exec_err, plan_err};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature};
 use datafusion_expr_common::signature::Volatility;
 use sail_common::spec::{SAIL_MAP_KEY_FIELD_NAME, SAIL_MAP_VALUE_FIELD_NAME};
@@ -205,7 +211,7 @@ impl ScalarUDFImpl for SparkToXml {
                 match &arg_types[0] {
                     DataType::Struct(_) => {}
                     other => {
-                        return plan_err!("`to_xml` first argument must be a struct, got {other}")
+                        return plan_err!("`to_xml` first argument must be a struct, got {other}");
                     }
                 }
                 match &arg_types[1] {
@@ -213,7 +219,7 @@ impl ScalarUDFImpl for SparkToXml {
                     other => {
                         return plan_err!(
                             "`to_xml` second argument must be a map of options, got {other}"
-                        )
+                        );
                     }
                 }
                 Ok(arg_types.to_vec())
@@ -557,7 +563,7 @@ fn write_map(
             other => {
                 return exec_err!(
                     "to_xml: map keys must be strings to be valid XML tag names, got {other:?}"
-                )
+                );
             }
         };
         if key.is_empty() {
@@ -620,37 +626,34 @@ fn write_map(
                                 push_element(&mut inner, &key, &escape_text(nv));
                                 inner.push('\n');
                             }
+                        } else if let DataType::Struct(child_fields) = item_field.data_type() {
+                            let child = array_values
+                                .as_any()
+                                .downcast_ref::<StructArray>()
+                                .ok_or_else(|| {
+                                    DataFusionError::Internal(format!(
+                                        "to_xml: expected StructArray in map array value for '{field_name}'"
+                                    ))
+                                })?;
+                            write_struct(
+                                &mut inner,
+                                child,
+                                elem_idx,
+                                child_fields,
+                                &key,
+                                depth + 1,
+                                options,
+                            )?;
                         } else {
-                            match item_field.data_type() {
-                                DataType::Struct(child_fields) => {
-                                    let child = array_values
-                                        .as_any()
-                                        .downcast_ref::<StructArray>()
-                                        .ok_or_else(|| DataFusionError::Internal(format!(
-                                            "to_xml: expected StructArray in map array value for '{field_name}'"
-                                        )))?;
-                                    write_struct(
-                                        &mut inner,
-                                        child,
-                                        elem_idx,
-                                        child_fields,
-                                        &key,
-                                        depth + 1,
-                                        options,
-                                    )?;
-                                }
-                                _ => {
-                                    let text = format_field_to_xml(
-                                        &array_values,
-                                        elem_idx,
-                                        item_field.data_type(),
-                                        options,
-                                    )?;
-                                    inner.push_str(&INDENT.repeat(depth + 1));
-                                    push_element(&mut inner, &key, &escape_text(&text));
-                                    inner.push('\n');
-                                }
-                            }
+                            let text = format_field_to_xml(
+                                &array_values,
+                                elem_idx,
+                                item_field.data_type(),
+                                options,
+                            )?;
+                            inner.push_str(&INDENT.repeat(depth + 1));
+                            push_element(&mut inner, &key, &escape_text(&text));
+                            inner.push('\n');
                         }
                     }
                 }
@@ -664,15 +667,12 @@ fn write_map(
         }
     }
 
+    buf.push_str(&pad);
+    buf.push('<');
+    buf.push_str(field_name);
     if inner.is_empty() {
-        buf.push_str(&pad);
-        buf.push('<');
-        buf.push_str(field_name);
         buf.push_str("/>\n");
     } else {
-        buf.push_str(&pad);
-        buf.push('<');
-        buf.push_str(field_name);
         buf.push_str(">\n");
         buf.push_str(&inner);
         buf.push_str(&pad);
@@ -692,7 +692,7 @@ fn format_field_to_xml(
 ) -> Result<String> {
     match data_type {
         DataType::Timestamp(time_unit, tz_opt) => {
-            format_timestamp_field(array, row_idx, time_unit, tz_opt, options)
+            format_timestamp_field(array, row_idx, *time_unit, tz_opt.as_ref(), options)
         }
         DataType::Date32 => {
             let days = array.as_primitive::<Date32Type>().value(row_idx);
@@ -777,8 +777,8 @@ fn scalar_to_display_string(scalar: &ScalarValue) -> Result<String> {
 fn format_timestamp_field(
     array: &ArrayRef,
     row_idx: usize,
-    time_unit: &TimeUnit,
-    tz_opt: &Option<Arc<str>>,
+    time_unit: TimeUnit,
+    tz_opt: Option<&Arc<str>>,
     options: &SparkToXmlOptions,
 ) -> Result<String> {
     let micros = match time_unit {

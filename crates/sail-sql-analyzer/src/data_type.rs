@@ -22,7 +22,7 @@ fn from_ast_char_length(length: Option<&IntegerLiteral>) -> SqlResult<u32> {
         .map_err(|_| SqlError::invalid("char length"))
 }
 
-fn from_ast_year_month_interval_field(
+const fn from_ast_year_month_interval_field(
     field: &IntervalYearMonthUnit,
 ) -> SqlResult<spec::IntervalFieldType> {
     match field {
@@ -31,7 +31,7 @@ fn from_ast_year_month_interval_field(
     }
 }
 
-fn from_ast_day_time_interval_field(
+const fn from_ast_day_time_interval_field(
     field: &IntervalDayTimeUnit,
 ) -> SqlResult<spec::IntervalFieldType> {
     match field {
@@ -151,10 +151,10 @@ pub fn from_ast_data_type(sql_type: DataType) -> SqlResult<spec::DataType> {
                 Some(TimezoneType::WithoutTimeZone(_, _, _)) => {
                     spec::TimestampType::WithoutTimeZone
                 }
-                Some(TimezoneType::WithLocalTimeZone(_, _, _, _))
-                | Some(TimezoneType::WithTimeZone(_, _, _)) => {
-                    spec::TimestampType::WithLocalTimeZone
-                }
+                Some(
+                    TimezoneType::WithLocalTimeZone(_, _, _, _)
+                    | TimezoneType::WithTimeZone(_, _, _),
+                ) => spec::TimestampType::WithLocalTimeZone,
                 None => spec::TimestampType::Configured,
             };
             let time_unit = from_ast_timestamp_precision(precision)?;
@@ -250,12 +250,12 @@ pub fn from_ast_data_type(sql_type: DataType) -> SqlResult<spec::DataType> {
                                 not_null,
                                 comment,
                             } = f;
-                            let name = identifier.value.clone();
+                            let name = identifier.value;
                             let data_type = from_ast_data_type(data_type)?;
                             let mut metadata = vec![];
                             if let Some((_, comment)) = comment {
                                 metadata.push(("comment".to_string(), from_ast_string(comment)?));
-                            };
+                            }
                             Ok(spec::Field {
                                 name,
                                 data_type,

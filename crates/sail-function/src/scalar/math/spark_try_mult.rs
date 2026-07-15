@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
-use datafusion::arrow::compute::{cast_with_options, CastOptions};
+use datafusion::arrow::compute::{CastOptions, cast_with_options};
 use datafusion::arrow::datatypes::IntervalUnit::{MonthDayNano, YearMonth};
 use datafusion::arrow::datatypes::{
     DataType, Int32Type, Int64Type, IntervalMonthDayNanoType, IntervalYearMonthType,
 };
-use datafusion_common::utils::take_function_args;
 use datafusion_common::Result;
+use datafusion_common::utils::take_function_args;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 use datafusion_functions::utils::make_scalar_function;
 
@@ -48,17 +48,24 @@ impl ScalarUDFImpl for SparkTryMult {
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         match arg_types {
             [DataType::Int32, DataType::Int32] => Ok(DataType::Int32),
-            [DataType::Int64, DataType::Int64]
-            | [DataType::Int32, DataType::Int64]
+            [DataType::Int64 | DataType::Int32, DataType::Int64]
             | [DataType::Int64, DataType::Int32] => Ok(DataType::Int64),
-            [DataType::Interval(YearMonth), DataType::Int32 | DataType::Int64]
-            | [DataType::Int32 | DataType::Int64, DataType::Interval(YearMonth)] => {
-                Ok(DataType::Interval(YearMonth))
-            }
-            [DataType::Interval(MonthDayNano), DataType::Int32 | DataType::Int64]
-            | [DataType::Int32 | DataType::Int64, DataType::Interval(MonthDayNano)] => {
-                Ok(DataType::Interval(MonthDayNano))
-            }
+            [
+                DataType::Interval(YearMonth),
+                DataType::Int32 | DataType::Int64,
+            ]
+            | [
+                DataType::Int32 | DataType::Int64,
+                DataType::Interval(YearMonth),
+            ] => Ok(DataType::Interval(YearMonth)),
+            [
+                DataType::Interval(MonthDayNano),
+                DataType::Int32 | DataType::Int64,
+            ]
+            | [
+                DataType::Int32 | DataType::Int64,
+                DataType::Interval(MonthDayNano),
+            ] => Ok(DataType::Interval(MonthDayNano)),
 
             _ => Err(unsupported_data_types_exec_err(
                 "try_multiply",
@@ -76,14 +83,10 @@ impl ScalarUDFImpl for SparkTryMult {
             (_, DataType::Null) => Ok(vec![left.clone(), left.clone()]),
             (DataType::Int32, DataType::Int32)
             | (DataType::Int64, DataType::Int64)
-            | (
-                DataType::Interval(YearMonth) | DataType::Interval(MonthDayNano),
-                DataType::Int32 | DataType::Int64,
-            )
-            | (
-                DataType::Int32 | DataType::Int64,
-                DataType::Interval(YearMonth) | DataType::Interval(MonthDayNano),
-            ) => Ok(vec![left.clone(), right.clone()]),
+            | (DataType::Interval(YearMonth | MonthDayNano), DataType::Int32 | DataType::Int64)
+            | (DataType::Int32 | DataType::Int64, DataType::Interval(YearMonth | MonthDayNano)) => {
+                Ok(vec![left.clone(), right.clone()])
+            }
             (DataType::Int32, DataType::Int64) | (DataType::Int64, DataType::Int32) => {
                 Ok(vec![DataType::Int64, DataType::Int64])
             }
@@ -105,7 +108,7 @@ fn try_multiply_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
 
     let (left_arr, right_arr) = if matches!(
         right_arr.data_type(),
-        DataType::Interval(YearMonth) | DataType::Interval(MonthDayNano)
+        DataType::Interval(YearMonth | MonthDayNano)
     ) {
         (right_arr, left_arr)
     } else {

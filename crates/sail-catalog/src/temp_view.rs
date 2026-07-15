@@ -37,16 +37,19 @@ impl TemporaryView {
         &self.columns
     }
 
-    pub fn comment(&self) -> &Option<String> {
-        &self.comment
+    #[must_use]
+    pub const fn comment(&self) -> Option<&String> {
+        self.comment.as_ref()
     }
 
+    #[must_use]
     pub fn properties(&self) -> &[(String, String)] {
         &self.properties
     }
 
-    pub fn source(&self) -> &Option<TemporaryViewSource> {
-        &self.source
+    #[must_use]
+    pub const fn source(&self) -> Option<&TemporaryViewSource> {
+        self.source.as_ref()
     }
 }
 
@@ -62,8 +65,9 @@ impl Default for TemporaryViewManager {
 }
 
 impl TemporaryViewManager {
+    #[must_use]
     pub fn new() -> Self {
-        TemporaryViewManager {
+        Self {
             views: RwLock::new(HashMap::new()),
         }
     }
@@ -80,6 +84,8 @@ impl TemporaryViewManager {
             .map_err(|e| CatalogError::Internal(e.to_string()))
     }
 
+    /// # Errors
+    /// Returns an error if the temporary view already exists or if column count mismatches.
     pub fn create_view(
         &self,
         name: String,
@@ -148,9 +154,12 @@ impl TemporaryViewManager {
             source,
         };
         views.insert(name, Arc::new(view));
+        drop(views);
         Ok(())
     }
 
+    /// # Errors
+    /// Returns an error if the temporary view does not exist and `if_exists` is false.
     pub fn drop_view(&self, name: &str, if_exists: bool) -> CatalogResult<()> {
         let mut views = self.write()?;
         if !views.contains_key(name) && !if_exists {
@@ -160,9 +169,12 @@ impl TemporaryViewManager {
             ));
         }
         views.remove(name);
+        drop(views);
         Ok(())
     }
 
+    /// # Errors
+    /// Returns an error if the temporary view does not exist.
     pub fn get_view(&self, name: &str) -> CatalogResult<Arc<TemporaryView>> {
         let views = self.read()?;
         let view = views.get(name).ok_or_else(|| {

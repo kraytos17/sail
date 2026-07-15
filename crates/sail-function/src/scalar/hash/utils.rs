@@ -3,8 +3,8 @@ use std::sync::Arc;
 use datafusion::arrow::array::*;
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{
-    ArrowDictionaryKeyType, ArrowNativeType, ArrowNativeTypeOp, DataType, Int16Type, Int32Type,
-    Int64Type, Int8Type, TimeUnit, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    ArrowDictionaryKeyType, ArrowNativeType, ArrowNativeTypeOp, DataType, Int8Type, Int16Type,
+    Int32Type, Int64Type, TimeUnit, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use datafusion::error::{DataFusionError, Result};
 
@@ -46,8 +46,9 @@ pub fn spark_compatible_murmur3_hash<T: AsRef<[u8]>>(data: T, seed: u32) -> u32 
         // safety: data length must be aligned to 4 bytes
         let mut h1 = seed as i32;
         for i in (0..data.len()).step_by(4) {
-            let ints = data.as_ptr().add(i) as *const i32;
-            let mut half_word = ints.read_unaligned();
+            // SAFETY: data length is guaranteed to be aligned to 4 bytes
+            let ints = unsafe { data.as_ptr().add(i) as *const i32 };
+            let mut half_word = unsafe { ints.read_unaligned() };
             if cfg!(target_endian = "big") {
                 half_word = half_word.reverse_bits();
             }
@@ -387,7 +388,7 @@ macro_rules! create_hashes_internal {
                         return Err(DataFusionError::Internal(format!(
                             "Unsupported dictionary type in hasher hashing: {}",
                             col.data_type(),
-                        )))
+                        )));
                     }
                 },
                 _ => {
@@ -425,7 +426,7 @@ mod tests {
     use std::sync::Arc;
 
     use datafusion::arrow::array::{
-        Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, Int8Array, StringArray,
+        Array, ArrayRef, Float32Array, Float64Array, Int8Array, Int32Array, Int64Array, StringArray,
     };
 
     use super::create_murmur3_hashes;

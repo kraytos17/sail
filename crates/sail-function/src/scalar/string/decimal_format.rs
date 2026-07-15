@@ -1,4 +1,4 @@
-use datafusion_common::{exec_err, Result};
+use datafusion_common::{Result, exec_err};
 
 /// Spark's default pattern when an empty string is passed to format_number.
 const DEFAULT_PATTERN: &str = "#,###,###,###,###,###,##0";
@@ -39,15 +39,13 @@ pub fn parse_pattern(pattern: &str) -> Result<ParsedPattern> {
     };
     validate_pattern(pattern)?;
 
-    let (integer_part, frac_part) = match pattern.find('.') {
-        Some(pos) => (&pattern[..pos], Some(&pattern[pos + 1..])),
-        None => (pattern, None),
-    };
+    let (integer_part, frac_part) = pattern.find('.').map_or((pattern, None), |pos| {
+        (&pattern[..pos], Some(&pattern[pos + 1..]))
+    });
 
-    let grouping_size = match integer_part.rfind(',') {
-        Some(last_comma) => integer_part.len() - last_comma - 1,
-        None => 0,
-    };
+    let grouping_size = integer_part
+        .rfind(',')
+        .map_or(0, |last_comma| integer_part.len() - last_comma - 1);
 
     let min_integer_digits = integer_part.chars().filter(|c| *c == '0').count();
 
@@ -86,9 +84,8 @@ fn trim_optional_decimals(
         return formatted.to_string();
     }
 
-    let (int_part, dec_part) = match formatted.split_once('.') {
-        Some((i, d)) => (i, d),
-        None => return formatted.to_string(),
+    let Some((int_part, dec_part)) = formatted.split_once('.') else {
+        return formatted.to_string();
     };
 
     let mut dec_chars: Vec<char> = dec_part.chars().collect();
@@ -109,10 +106,9 @@ fn pad_integer_digits(s: &str, min_digits: usize) -> String {
         return s.to_string();
     }
 
-    let (integer_part, rest) = match s.find('.') {
-        Some(pos) => (&s[..pos], Some(&s[pos..])),
-        None => (s, None),
-    };
+    let (integer_part, rest) = s
+        .find('.')
+        .map_or((s, None), |pos| (&s[..pos], Some(&s[pos..])));
 
     let negative = integer_part.starts_with('-');
     let digits = if negative {
@@ -146,10 +142,9 @@ pub fn insert_grouping(s: &str, grouping_size: usize) -> String {
         return s.to_string();
     }
 
-    let (integer_part, decimal_part) = match s.find('.') {
-        Some(pos) => (&s[..pos], Some(&s[pos..])),
-        None => (s, None),
-    };
+    let (integer_part, decimal_part) = s
+        .find('.')
+        .map_or((s, None), |pos| (&s[..pos], Some(&s[pos..])));
 
     let negative = integer_part.starts_with('-');
     let digits = if negative {

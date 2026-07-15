@@ -1,8 +1,8 @@
+use chumsky::Parser;
 use chumsky::extra::ParserExtra;
 use chumsky::input::{Input, InputRef, ValueInput};
 use chumsky::label::LabelError;
 use chumsky::prelude::custom;
-use chumsky::Parser;
 
 use crate::options::ParserOptions;
 use crate::span::TokenSpan;
@@ -56,7 +56,7 @@ macro_rules! keyword_types {
             }
 
             impl $name {
-                pub fn new(span: TokenSpan) -> Self {
+                pub const fn new(span: TokenSpan) -> Self {
                     Self { span }
                 }
 

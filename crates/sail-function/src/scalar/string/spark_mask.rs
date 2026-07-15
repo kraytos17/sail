@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use datafusion::arrow::array::{new_null_array, ArrayRef, AsArray, GenericStringBuilder};
+use datafusion::arrow::array::{ArrayRef, AsArray, GenericStringBuilder, new_null_array};
 use datafusion::arrow::datatypes::DataType;
-use datafusion_common::{exec_err, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, exec_err};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::signature::{Signature, Volatility};
@@ -80,14 +80,18 @@ impl ScalarUDFImpl for SparkMask {
 
         let masked_upper = if args.len() > 1 {
             match &args[1] {
-                ColumnarValue::Scalar(ScalarValue::Utf8(string))
-                | ColumnarValue::Scalar(ScalarValue::LargeUtf8(string))
-                | ColumnarValue::Scalar(ScalarValue::Utf8View(string)) => {
+                ColumnarValue::Scalar(
+                    ScalarValue::Utf8(string)
+                    | ScalarValue::LargeUtf8(string)
+                    | ScalarValue::Utf8View(string),
+                ) => {
                     if let Some(string) = string {
                         if string.chars().count() == 1 {
                             Ok(string.chars().next())
                         } else {
-                            exec_err!("Spark `mask` function: second arg must be a single character, got {string}")
+                            exec_err!(
+                                "Spark `mask` function: second arg must be a single character, got {string}"
+                            )
                         }
                     } else {
                         Ok(None)
@@ -105,14 +109,18 @@ impl ScalarUDFImpl for SparkMask {
 
         let masked_lower = if args.len() > 2 {
             match &args[2] {
-                ColumnarValue::Scalar(ScalarValue::Utf8(string))
-                | ColumnarValue::Scalar(ScalarValue::LargeUtf8(string))
-                | ColumnarValue::Scalar(ScalarValue::Utf8View(string)) => {
+                ColumnarValue::Scalar(
+                    ScalarValue::Utf8(string)
+                    | ScalarValue::LargeUtf8(string)
+                    | ScalarValue::Utf8View(string),
+                ) => {
                     if let Some(string) = string {
                         if string.chars().count() == 1 {
                             Ok(string.chars().next())
                         } else {
-                            exec_err!("Spark `mask` function: third arg must be a single character, got {string}")
+                            exec_err!(
+                                "Spark `mask` function: third arg must be a single character, got {string}"
+                            )
                         }
                     } else {
                         Ok(None)
@@ -130,14 +138,18 @@ impl ScalarUDFImpl for SparkMask {
 
         let masked_digit = if args.len() > 3 {
             match &args[3] {
-                ColumnarValue::Scalar(ScalarValue::Utf8(string))
-                | ColumnarValue::Scalar(ScalarValue::LargeUtf8(string))
-                | ColumnarValue::Scalar(ScalarValue::Utf8View(string)) => {
+                ColumnarValue::Scalar(
+                    ScalarValue::Utf8(string)
+                    | ScalarValue::LargeUtf8(string)
+                    | ScalarValue::Utf8View(string),
+                ) => {
                     if let Some(string) = string {
                         if string.chars().count() == 1 {
                             Ok(string.chars().next())
                         } else {
-                            exec_err!("Spark `mask` function: fourth arg must be a single character, got {string}")
+                            exec_err!(
+                                "Spark `mask` function: fourth arg must be a single character, got {string}"
+                            )
                         }
                     } else {
                         Ok(None)
@@ -155,14 +167,18 @@ impl ScalarUDFImpl for SparkMask {
 
         let masked_other = if args.len() > 4 {
             match &args[4] {
-                ColumnarValue::Scalar(ScalarValue::Utf8(string))
-                | ColumnarValue::Scalar(ScalarValue::LargeUtf8(string))
-                | ColumnarValue::Scalar(ScalarValue::Utf8View(string)) => {
+                ColumnarValue::Scalar(
+                    ScalarValue::Utf8(string)
+                    | ScalarValue::LargeUtf8(string)
+                    | ScalarValue::Utf8View(string),
+                ) => {
                     if let Some(string) = string {
                         if string.chars().count() == 1 {
                             Ok(string.chars().next())
                         } else {
-                            exec_err!("Spark `mask` function: fifth arg must be a single character, got {string}")
+                            exec_err!(
+                                "Spark `mask` function: fifth arg must be a single character, got {string}"
+                            )
                         }
                     } else {
                         Ok(None)
@@ -179,8 +195,7 @@ impl ScalarUDFImpl for SparkMask {
         }?;
 
         match &args[0] {
-            ColumnarValue::Scalar(ScalarValue::Utf8(string))
-            | ColumnarValue::Scalar(ScalarValue::Utf8View(string)) => {
+            ColumnarValue::Scalar(ScalarValue::Utf8(string) | ScalarValue::Utf8View(string)) => {
                 if let Some(string) = string {
                     Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(mask(
                         string.as_str(),

@@ -18,7 +18,7 @@ impl FromStr for BinaryValue {
             match try_decode_hex_char(hex_bytes[0]) {
                 Some(byte) => decoded_bytes.push(byte),
                 None => return Err(SqlError::invalid(format!("hex string: {value}"))),
-            };
+            }
         }
 
         for i in (start_idx..hex_bytes.len()).step_by(2) {

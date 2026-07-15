@@ -1,8 +1,8 @@
+use chumsky::Parser;
 use chumsky::extra::ParserExtra;
 use chumsky::input::{Input, InputRef, ValueInput};
 use chumsky::label::LabelError;
 use chumsky::prelude::custom;
-use chumsky::Parser;
 use sail_sql_macro::{TreeParser, TreeSyntax, TreeText};
 
 use crate::ast::operator::{Asterisk, Period};
@@ -46,7 +46,7 @@ where
             {
                 let output = Ident {
                     span: input.span_since(&before).into(),
-                    value: value.clone(),
+                    value,
                 };
                 skip_whitespace(input);
                 return Ok(output);
@@ -165,22 +165,20 @@ where
     E::Error: LabelError<'a, I, TokenLabel>,
 {
     let marker = input.save();
-    match (input.next(), input.next()) {
-        (
-            Some(Token::Punctuation(p @ (Punctuation::Dollar | Punctuation::Colon))),
-            Some(Token::Word { keyword: _, raw }),
-        ) => {
-            let variable = Variable {
-                span: input.span_since(marker.cursor()).into(),
-                value: format!("{}{}", p.to_char(), raw),
-            };
-            skip_whitespace(input);
-            Some(variable)
-        }
-        _ => {
-            input.rewind(marker);
-            None
-        }
+    if let (
+        Some(Token::Punctuation(p @ (Punctuation::Dollar | Punctuation::Colon))),
+        Some(Token::Word { keyword: _, raw }),
+    ) = (input.next(), input.next())
+    {
+        let variable = Variable {
+            span: input.span_since(marker.cursor()).into(),
+            value: format!("{}{}", p.to_char(), raw),
+        };
+        skip_whitespace(input);
+        Some(variable)
+    } else {
+        input.rewind(marker);
+        None
     }
 }
 
@@ -192,19 +190,16 @@ where
     E::Error: LabelError<'a, I, TokenLabel>,
 {
     let marker = input.save();
-    match input.next() {
-        Some(Token::Punctuation(p @ Punctuation::QuestionMark)) => {
-            let variable = Variable {
-                span: input.span_since(marker.cursor()).into(),
-                value: format!("{}", p.to_char()),
-            };
-            skip_whitespace(input);
-            Some(variable)
-        }
-        _ => {
-            input.rewind(marker);
-            None
-        }
+    if let Some(Token::Punctuation(p @ Punctuation::QuestionMark)) = input.next() {
+        let variable = Variable {
+            span: input.span_since(marker.cursor()).into(),
+            value: format!("{}", p.to_char()),
+        };
+        skip_whitespace(input);
+        Some(variable)
+    } else {
+        input.rewind(marker);
+        None
     }
 }
 
@@ -250,7 +245,7 @@ impl TreeText for Variable {
     }
 }
 
-pub(crate) fn is_identifier_string(style: &StringStyle, options: &ParserOptions) -> bool {
+pub(crate) const fn is_identifier_string(style: &StringStyle, options: &ParserOptions) -> bool {
     if options.allow_double_quote_identifier {
         matches!(
             style,

@@ -4,7 +4,7 @@ use datafusion::arrow::array::{
     Array, ArrayRef, GenericStringBuilder, LargeStringArray, StringArray, StringArrayType,
 };
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::{exec_datafusion_err, exec_err, plan_err, Result};
+use datafusion::common::{Result, exec_datafusion_err, exec_err, plan_err};
 use datafusion_common::cast::{as_large_string_array, as_string_array, as_string_view_array};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 use url::Url;
@@ -61,24 +61,25 @@ impl ParseUrl {
                 "HOST" => url.host_str().map(String::from),
                 "PATH" => {
                     let path = url.path().to_string();
-                    let path = if path == "/" { "".to_string() } else { path };
+                    let path = if path == "/" { String::new() } else { path };
                     Some(path)
                 }
-                "QUERY" => match key {
-                    None => url.query().map(String::from),
-                    Some(key) => url
-                        .query_pairs()
-                        .find(|(k, _)| k == key)
-                        .map(|(_, v)| v.into_owned()),
-                },
+                "QUERY" => key.map_or_else(
+                    || url.query().map(String::from),
+                    |key| {
+                        url.query_pairs()
+                            .find(|(k, _)| k == key)
+                            .map(|(_, v)| v.into_owned())
+                    },
+                ),
                 "REF" => url.fragment().map(String::from),
                 "PROTOCOL" => Some(url.scheme().to_string()),
                 "FILE" => {
                     let path = url.path();
-                    match url.query() {
-                        Some(query) => Some(format!("{path}?{query}")),
-                        None => Some(path.to_string()),
-                    }
+                    url.query().map_or_else(
+                        || Some(path.to_string()),
+                        |query| Some(format!("{path}?{query}")),
+                    )
                 }
                 "AUTHORITY" => Some(url.authority().to_string()),
                 "USERINFO" => {
@@ -86,41 +87,41 @@ impl ParseUrl {
                     if username.is_empty() {
                         return Ok(None);
                     }
-                    match url.password() {
-                        Some(password) => Some(format!("{username}:{password}")),
-                        None => Some(username.to_string()),
-                    }
+                    url.password().map_or_else(
+                        || Some(username.to_string()),
+                        |password| Some(format!("{username}:{password}")),
+                    )
                 }
                 _ => None,
             }),
             Err(url::ParseError::RelativeUrlWithoutBase) => {
                 // Spark's java.net.URI treats schemeless strings as relative URIs.
                 // Parse the components manually: path?query#fragment
-                let (without_fragment, fragment) = match value.find('#') {
-                    Some(i) => (&value[..i], Some(&value[i + 1..])),
-                    None => (value, None),
-                };
-                let (path, query) = match without_fragment.find('?') {
-                    Some(i) => (&without_fragment[..i], Some(&without_fragment[i + 1..])),
-                    None => (without_fragment, None),
-                };
+                let (without_fragment, fragment) = value
+                    .find('#')
+                    .map_or((value, None), |i| (&value[..i], Some(&value[i + 1..])));
+                let (path, query) = without_fragment
+                    .find('?')
+                    .map_or((without_fragment, None), |i| {
+                        (&without_fragment[..i], Some(&without_fragment[i + 1..]))
+                    });
                 Ok(match part {
                     "PATH" => Some(path.to_string()),
-                    "QUERY" => match key {
-                        None => query.map(String::from),
-                        Some(key) => query.and_then(|q| {
-                            q.split('&')
-                                .filter_map(|pair| pair.split_once('='))
-                                .find(|(k, _)| *k == key)
-                                .map(|(_, v)| v.to_string())
-                        }),
-                    },
+                    "QUERY" => key.map_or_else(
+                        || query.map(String::from),
+                        |key| {
+                            query.and_then(|q| {
+                                q.split('&')
+                                    .filter_map(|pair| pair.split_once('='))
+                                    .find(|(k, _)| *k == key)
+                                    .map(|(_, v)| v.to_string())
+                            })
+                        },
+                    ),
                     "REF" => fragment.map(String::from),
                     "FILE" => {
-                        let file = match query {
-                            Some(q) => format!("{path}?{q}"),
-                            None => path.to_string(),
-                        };
+                        let file =
+                            query.map_or_else(|| path.to_string(), |q| format!("{path}?{q}"));
                         Some(file)
                     }
                     _ => None,
@@ -132,7 +133,7 @@ impl ParseUrl {
 }
 
 impl ScalarUDFImpl for ParseUrl {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "parse_url"
     }
 
@@ -252,7 +253,7 @@ pub fn spark_handled_parse_url(
     let url = &args[0];
     let part = &args[1];
 
-    let result = if args.len() == 3 {
+    if args.len() == 3 {
         // In this case, the 'key' argument is passed
         let key = &args[2];
 
@@ -557,8 +558,7 @@ pub fn spark_handled_parse_url(
             }
             _ => exec_err!("{} expects STRING arguments, got {:?}", "`parse_url`", args),
         }
-    };
-    result
+    }
 }
 
 fn process_parse_url<'a, A, B, C, T>(

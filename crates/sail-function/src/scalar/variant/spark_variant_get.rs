@@ -4,13 +4,13 @@ use std::sync::Arc;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef};
 use chumsky::prelude::*;
 use datafusion::arrow::datatypes::TimeUnit;
-use datafusion_common::{arrow_datafusion_err, exec_datafusion_err, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, arrow_datafusion_err, exec_datafusion_err};
 use datafusion_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 use parquet_variant::{VariantPath, VariantPathElement};
-use parquet_variant_compute::{variant_get, GetOptions, VariantType};
-use sail_common_datafusion::variant::{variant_metadata_field, VARIANT_VALUE_FIELD_NAME};
+use parquet_variant_compute::{GetOptions, VariantType, variant_get};
+use sail_common_datafusion::variant::{VARIANT_VALUE_FIELD_NAME, variant_metadata_field};
 
 use crate::error::{generic_exec_err, invalid_arg_count_exec_err, unsupported_data_type_exec_err};
 use crate::scalar::variant::utils::helper::{try_field_as_variant_array, try_parse_string_scalar};
@@ -39,9 +39,9 @@ fn type_hint_from_scalar(field_name: &str, scalar: &ScalarValue) -> Result<Field
     Ok(Arc::new(Field::new(field_name, dt, true)))
 }
 
-fn build_get_options<'a>(path: VariantPath<'a>, as_type: &Option<FieldRef>) -> GetOptions<'a> {
+fn build_get_options<'a>(path: VariantPath<'a>, as_type: Option<&FieldRef>) -> GetOptions<'a> {
     match as_type {
-        Some(field) => GetOptions::new_with_path(path).with_as_type(Some(field.clone())),
+        Some(field) => GetOptions::new_with_path(path).with_as_type(Some((*field).clone())),
         None => GetOptions::new_with_path(path),
     }
 }
@@ -52,12 +52,11 @@ fn build_get_options<'a>(path: VariantPath<'a>, as_type: &Option<FieldRef>) -> G
 /// - 2-arg form: returns a Variant struct (Binary for PySpark compat).
 fn return_field_for_variant_get(name: &str, args: &ReturnFieldArgs) -> Result<FieldRef> {
     // Validate path (arg 1) is a constant non-null string
-    if let Some(path_opt) = args.scalar_arguments.get(1) {
-        if let Some(sv) = path_opt.as_ref() {
-            if sv.try_as_str().flatten().is_none() {
-                return Err(generic_exec_err(name, "path must be a non-null string"));
-            }
-        }
+    if let Some(path_opt) = args.scalar_arguments.get(1)
+        && let Some(sv) = path_opt.as_ref()
+        && sv.try_as_str().flatten().is_none()
+    {
+        return Err(generic_exec_err(name, "path must be a non-null string"));
     }
 
     // 3-arg form: variant_get(variant, path, type) → typed result
@@ -88,7 +87,7 @@ fn return_field_for_variant_get(name: &str, args: &ReturnFieldArgs) -> Result<Fi
 ///
 /// Handles both scalar and array variant inputs (path is always scalar in Spark).
 /// Based on datafusion-variant's `invoke_variant_get` pattern.
-fn invoke_variant_get(args: ScalarFunctionArgs, name: &str, safe: bool) -> Result<ColumnarValue> {
+fn invoke_variant_get(args: &ScalarFunctionArgs, name: &str, safe: bool) -> Result<ColumnarValue> {
     let variant_field = args
         .arg_fields
         .first()
@@ -108,10 +107,10 @@ fn invoke_variant_get(args: ScalarFunctionArgs, name: &str, safe: bool) -> Resul
     // Extract type hint (optional — 2-arg form returns variant)
     let type_str = if args.args.len() >= 3 {
         match &args.args[2] {
-            ColumnarValue::Scalar(scalar) => {
-                try_parse_string_scalar(scalar)?.map(|s| s.to_string())
+            ColumnarValue::Scalar(scalar) => try_parse_string_scalar(scalar)?.cloned(),
+            ColumnarValue::Array(_) => {
+                return Err(generic_exec_err(name, "type must be a constant string"));
             }
-            _ => return Err(generic_exec_err(name, "type must be a constant string")),
         }
     } else {
         None
@@ -141,7 +140,7 @@ fn invoke_variant_get(args: ScalarFunctionArgs, name: &str, safe: bool) -> Resul
     };
 
     // Build options
-    let mut options = build_get_options(variant_path.clone(), &extract_field);
+    let mut options = build_get_options(variant_path.clone(), extract_field.as_ref());
     if safe {
         options = options.with_cast_options(datafusion::arrow::compute::CastOptions {
             safe: true,
@@ -165,7 +164,7 @@ fn invoke_variant_get(args: ScalarFunctionArgs, name: &str, safe: bool) -> Resul
         if let Some(ref dt) = final_type {
             if dt.is_integer() {
                 let bool_field = Some(Arc::new(Field::new(name, DataType::Boolean, true)));
-                let bool_options = build_get_options(variant_path.clone(), &bool_field);
+                let bool_options = build_get_options(variant_path.clone(), bool_field.as_ref());
                 let bool_result = variant_get(&variant_arr, bool_options).map_err(|e| {
                     datafusion_common::DataFusionError::Execution(format!("{name}: {e}"))
                 })?;
@@ -304,7 +303,7 @@ impl ScalarUDFImpl for SparkVariantGet {
                     self.name(),
                     "string",
                     &arg_types[1],
-                ))
+                ));
             }
         });
         if arg_types.len() == 3 {
@@ -316,7 +315,7 @@ impl ScalarUDFImpl for SparkVariantGet {
                         self.name(),
                         "string",
                         &arg_types[2],
-                    ))
+                    ));
                 }
             });
         }
@@ -324,7 +323,7 @@ impl ScalarUDFImpl for SparkVariantGet {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        invoke_variant_get(args, self.name(), self.safe)
+        invoke_variant_get(&args, self.name(), self.safe)
     }
 }
 
@@ -341,7 +340,7 @@ fn spark_type_to_arrow(type_str: &str) -> Result<DataType> {
         .strip_prefix("decimal(")
         .and_then(|s| s.strip_suffix(')'))
     {
-        let parts: Vec<&str> = params.split(',').map(|s| s.trim()).collect();
+        let parts: Vec<&str> = params.split(',').map(str::trim).collect();
         return match parts.as_slice() {
             [p, s] => {
                 let precision = p.parse::<u8>().map_err(|_| {
@@ -379,7 +378,7 @@ fn spark_type_to_arrow(type_str: &str) -> Result<DataType> {
         "binary" => return Ok(DataType::Binary),
         "date" => return Ok(DataType::Date32),
         "timestamp" | "timestamp_ntz" => {
-            return Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
+            return Ok(DataType::Timestamp(TimeUnit::Microsecond, None));
         }
         _ => {}
     }
@@ -422,8 +421,8 @@ fn quoted_field_name<'src>(
         .then_ignore(just(quote))
 }
 
-fn spark_variant_path_parser<'src>(
-) -> impl Parser<'src, &'src str, VariantPath<'static>, extra::Err<Rich<'src, char>>> {
+fn spark_variant_path_parser<'src>()
+-> impl Parser<'src, &'src str, VariantPath<'static>, extra::Err<Rich<'src, char>>> {
     let ident_field_name = text::ident().map(|s: &str| VariantPathElement::field(s.to_string()));
 
     let single_quoted_field_name = quoted_field_name('\'').map(VariantPathElement::field);

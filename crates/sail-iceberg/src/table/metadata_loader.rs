@@ -14,12 +14,12 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
-use datafusion::common::{plan_err, DataFusionError, Result};
+use datafusion::common::{DataFusionError, Result, plan_err};
+use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression;
-use object_store::path::Path as ObjectPath;
 use object_store::ObjectStoreExt;
+use object_store::path::Path as ObjectPath;
 use url::Url;
 
 const METADATA_COMPRESSION_PROPERTY: &str = "write.metadata.compression-codec";
@@ -173,23 +173,22 @@ pub async fn find_latest_metadata_file_with_catalog_fallback(
     let version_hint_path = base_path.clone().join("metadata").join("version-hint.text");
     let mut hinted_version: Option<i32> = None;
     let mut hinted_filename: Option<String> = None;
-    if let Ok(version_hint_data) = object_store.get(&version_hint_path).await {
-        if let Ok(version_hint_bytes) = version_hint_data.bytes().await {
-            if let Ok(version_hint) = String::from_utf8(version_hint_bytes.to_vec()) {
-                let content = version_hint.trim();
-                if let Ok(version) = content.parse::<i32>() {
-                    log::trace!("Using numeric version hint: {}", version);
-                    hinted_version = Some(version);
-                } else {
-                    let fname = if parse_metadata_file_name(content).is_some() {
-                        content.to_string()
-                    } else {
-                        format!("{}.metadata.json", content)
-                    };
-                    log::trace!("Using filename version hint: {}", fname);
-                    hinted_filename = Some(fname);
-                }
-            }
+    if let Ok(version_hint_data) = object_store.get(&version_hint_path).await
+        && let Ok(version_hint_bytes) = version_hint_data.bytes().await
+        && let Ok(version_hint) = String::from_utf8(version_hint_bytes.to_vec())
+    {
+        let content = version_hint.trim();
+        if let Ok(version) = content.parse::<i32>() {
+            log::trace!("Using numeric version hint: {}", version);
+            hinted_version = Some(version);
+        } else {
+            let fname = if parse_metadata_file_name(content).is_some() {
+                content.to_string()
+            } else {
+                format!("{}.metadata.json", content)
+            };
+            log::trace!("Using filename version hint: {}", fname);
+            hinted_filename = Some(fname);
         }
     }
 
@@ -201,10 +200,10 @@ pub async fn find_latest_metadata_file_with_catalog_fallback(
     let metadata_files: Result<Vec<_>, _> = objects
         .try_filter_map(|obj| async move {
             let path_str = obj.location.to_string();
-            if let Some(filename) = path_str.split('/').next_back() {
-                if let Some(metadata_file) = parse_metadata_file_name(filename) {
-                    return Ok(Some((metadata_file.version, path_str, obj.last_modified)));
-                }
+            if let Some(filename) = path_str.split('/').next_back()
+                && let Some(metadata_file) = parse_metadata_file_name(filename)
+            {
+                return Ok(Some((metadata_file.version, path_str, obj.last_modified)));
             }
             Ok(None)
         })
@@ -213,7 +212,7 @@ pub async fn find_latest_metadata_file_with_catalog_fallback(
 
     match metadata_files {
         Ok(mut files) => {
-            log::trace!("find_latest_metadata_file: found files: {:?}", &files);
+            log::trace!("find_latest_metadata_file: found files: {:?}", files);
             files.sort_by(|left, right| {
                 left.0
                     .cmp(&right.0)
@@ -229,71 +228,70 @@ pub async fn find_latest_metadata_file_with_catalog_fallback(
                     // written at or after the hinted file, it is a ghost
                     // from the same commit attempt — prefer it over the
                     // stale hint so that retry loops don't get stuck.
-                    if let Some((highest_version, highest_path, highest_ts)) = files.last() {
-                        if *highest_version > *hinted_version && *highest_ts >= *hinted_ts {
-                            log::trace!(
-                                "find_latest_metadata_file: hint version {} overridden by higher version {} path={}",
-                                hinted_version,
-                                highest_version,
-                                highest_path
-                            );
-                            return Ok(highest_path.clone());
-                        }
+                    if let Some((highest_version, highest_path, highest_ts)) = files.last()
+                        && *highest_version > *hinted_version
+                        && *highest_ts >= *hinted_ts
+                    {
+                        log::trace!(
+                            "find_latest_metadata_file: hint version {} overridden by higher version {} path={}",
+                            hinted_version,
+                            highest_version,
+                            highest_path
+                        );
+                        return Ok(highest_path.clone());
                     }
                     log::trace!(
                         "find_latest_metadata_file: selected by filename hint version {} path={}",
                         hinted_version,
-                        &hinted_path
+                        hinted_path
                     );
                     return Ok(hinted_path.clone());
                 }
-            } else if let Some(hint) = hinted_version {
-                if let Some((hinted_version, hinted_path, hinted_ts)) =
+            } else if let Some(hint) = hinted_version
+                && let Some((hinted_version, hinted_path, hinted_ts)) =
                     files.iter().rev().find(|(v, _, _)| *v == hint)
+            {
+                if let Some((highest_version, highest_path, highest_ts)) = files.last()
+                    && *highest_version > *hinted_version
+                    && *highest_ts >= *hinted_ts
                 {
-                    if let Some((highest_version, highest_path, highest_ts)) = files.last() {
-                        if *highest_version > *hinted_version && *highest_ts >= *hinted_ts {
-                            log::trace!(
-                                "find_latest_metadata_file: hint version {} overridden by higher version {} path={}",
-                                hinted_version,
-                                highest_version,
-                                highest_path
-                            );
-                            return Ok(highest_path.clone());
-                        }
-                    }
                     log::trace!(
-                        "find_latest_metadata_file: selected by numeric hint version {} path={}",
+                        "find_latest_metadata_file: hint version {} overridden by higher version {} path={}",
                         hinted_version,
-                        &hinted_path
+                        highest_version,
+                        highest_path
                     );
-                    return Ok(hinted_path.clone());
+                    return Ok(highest_path.clone());
                 }
+                log::trace!(
+                    "find_latest_metadata_file: selected by numeric hint version {} path={}",
+                    hinted_version,
+                    hinted_path
+                );
+                return Ok(hinted_path.clone());
             }
 
             // Catalog fallback: when the hint didn't resolve, prefer the metadata
             // file that the catalog considers authoritative (avoids picking stale
             // metadata from a previous table instance when version numbers reset).
-            if let Some(location) = catalog_metadata_location {
-                if let Some(filename) = location.rsplit('/').next() {
-                    if let Some((version, path, _)) =
-                        files.iter().rev().find(|(_, p, _)| p.ends_with(filename))
-                    {
-                        log::trace!(
-                            "find_latest_metadata_file: selected by catalog metadata location version {} path={}",
-                            version,
-                            &path
-                        );
-                        return Ok(path.clone());
-                    }
-                }
+            if let Some(location) = catalog_metadata_location
+                && let Some(filename) = location.rsplit('/').next()
+                && let Some((version, path, _)) =
+                    files.iter().rev().find(|(_, p, _)| p.ends_with(filename))
+            {
+                log::trace!(
+                    "find_latest_metadata_file: selected by catalog metadata location version {} path={}",
+                    version,
+                    path
+                );
+                return Ok(path.clone());
             }
 
             if let Some((version, latest_file, _)) = files.last() {
                 log::trace!(
                     "find_latest_metadata_file: selected version {} path={}",
                     version,
-                    &latest_file
+                    latest_file
                 );
                 Ok(latest_file.clone())
             } else {
@@ -312,13 +310,13 @@ mod tests {
     use std::io::{self, Write};
 
     use datafusion::common::Result;
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
 
     use super::{
-        decode_metadata_file, encode_metadata_file, metadata_file_extension_from_properties,
-        metadata_location_to_object_path, parse_metadata_file_name, MetadataFileCodec,
-        MetadataFileName,
+        MetadataFileCodec, MetadataFileName, decode_metadata_file, encode_metadata_file,
+        metadata_file_extension_from_properties, metadata_location_to_object_path,
+        parse_metadata_file_name,
     };
 
     #[test]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, ArrayRef, StructArray};
 use datafusion::arrow::datatypes::{DataType, Field};
 use datafusion_common::cast::as_struct_array;
-use datafusion_common::{exec_datafusion_err, exec_err, plan_err, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, exec_datafusion_err, exec_err, plan_err};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -29,60 +29,54 @@ impl UpdateStructField {
         field_names: &[String],
         new_field: &Field,
     ) -> Result<DataType> {
-        match data_type {
-            DataType::Struct(fields) => {
-                if field_names.is_empty() {
-                    return plan_err!("Field name cannot be empty");
-                }
+        if let DataType::Struct(fields) = data_type {
+            if field_names.is_empty() {
+                return plan_err!("Field name cannot be empty");
+            }
 
-                let current_field = &field_names[0];
-                let mut new_fields = Vec::new();
-                let mut field_found = false;
+            let current_field = &field_names[0];
+            let mut new_fields = Vec::new();
+            let mut field_found = false;
 
-                for field in fields.iter() {
-                    if field.name() == current_field {
-                        field_found = true;
-                        if field_names.len() == 1 {
-                            new_fields.push(Arc::new(new_field.clone()));
-                        } else {
-                            let new_data_type = Self::update_nested_field(
-                                field.data_type(),
-                                &field_names[1..],
-                                new_field,
-                            )?;
-                            new_fields.push(Arc::new(Field::new(
-                                field.name(),
-                                new_data_type,
-                                field.is_nullable(),
-                            )));
-                        }
-                    } else {
-                        new_fields.push(Arc::clone(field));
-                    }
-                }
-
-                if !field_found {
+            for field in fields {
+                if field.name() == current_field {
+                    field_found = true;
                     if field_names.len() == 1 {
                         new_fields.push(Arc::new(new_field.clone()));
                     } else {
-                        let mut intermediate_type = new_field.data_type().clone();
-                        for field_name in field_names.iter().rev().skip(1) {
-                            intermediate_type = DataType::Struct(
-                                vec![Arc::new(Field::new(field_name, intermediate_type, true))]
-                                    .into(),
-                            );
-                        }
+                        let new_data_type = Self::update_nested_field(
+                            field.data_type(),
+                            &field_names[1..],
+                            new_field,
+                        )?;
                         new_fields.push(Arc::new(Field::new(
-                            current_field,
-                            intermediate_type,
-                            true,
+                            field.name(),
+                            new_data_type,
+                            field.is_nullable(),
                         )));
                     }
+                } else {
+                    new_fields.push(Arc::clone(field));
                 }
-
-                Ok(DataType::Struct(new_fields.into()))
             }
-            _ => plan_err!("Expected Struct, found {data_type}"),
+
+            if !field_found {
+                if field_names.len() == 1 {
+                    new_fields.push(Arc::new(new_field.clone()));
+                } else {
+                    let mut intermediate_type = new_field.data_type().clone();
+                    for field_name in field_names.iter().rev().skip(1) {
+                        intermediate_type = DataType::Struct(
+                            vec![Arc::new(Field::new(field_name, intermediate_type, true))].into(),
+                        );
+                    }
+                    new_fields.push(Arc::new(Field::new(current_field, intermediate_type, true)));
+                }
+            }
+
+            Ok(DataType::Struct(new_fields.into()))
+        } else {
+            plan_err!("Expected Struct, found {data_type}")
         }
     }
 
@@ -102,13 +96,12 @@ impl UpdateStructField {
         let new_field = Field::new(last_field_name, new_field_array.data_type().clone(), true);
         let new_data_type =
             Self::update_nested_field(struct_array.data_type(), field_names, &new_field)?;
-        let new_fields = match new_data_type {
-            DataType::Struct(fields) => fields,
-            _ => unreachable!("update_nested_field should always return a Struct"),
+        let DataType::Struct(new_fields) = new_data_type else {
+            unreachable!("update_nested_field should always return a Struct")
         };
         let mut new_arrays = Vec::new();
 
-        for field in new_fields.iter() {
+        for field in &new_fields {
             if field.name() == last_field_name {
                 if field_names.len() == 1 {
                     new_arrays.push(Arc::clone(new_field_array));
@@ -140,7 +133,7 @@ impl UpdateStructField {
 }
 
 impl ScalarUDFImpl for UpdateStructField {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "update_struct_field"
     }
 

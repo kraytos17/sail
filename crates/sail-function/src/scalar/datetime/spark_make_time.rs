@@ -3,7 +3,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Array, PrimitiveBuilder};
 use datafusion::arrow::datatypes::{DataType, Time64MicrosecondType, TimeUnit};
 use datafusion_common::types::NativeType;
-use datafusion_common::{exec_err, plan_err, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, exec_err, plan_err};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 
 use crate::scalar::datetime::utils::{to_decimal128_array, to_int32_array};
@@ -68,9 +68,11 @@ impl ScalarUDFImpl for SparkMakeTime {
         let contains_scalar_null = args.iter().any(|arg| {
             matches!(
                 arg,
-                ColumnarValue::Scalar(ScalarValue::Int32(None))
-                    | ColumnarValue::Scalar(ScalarValue::Decimal128(None, _, _))
-                    | ColumnarValue::Scalar(ScalarValue::Null)
+                ColumnarValue::Scalar(
+                    ScalarValue::Int32(None)
+                        | ScalarValue::Decimal128(None, _, _)
+                        | ScalarValue::Null
+                )
             )
         });
 

@@ -27,31 +27,32 @@ pub enum SqlError {
 
 impl SqlError {
     pub fn todo(message: impl Into<String>) -> Self {
-        SqlError::NotImplemented(message.into())
+        Self::NotImplemented(message.into())
     }
 
     pub fn unsupported(message: impl Into<String>) -> Self {
-        SqlError::NotSupported(message.into())
+        Self::NotSupported(message.into())
     }
 
     pub fn missing(message: impl Into<String>) -> Self {
-        SqlError::MissingArgument(message.into())
+        Self::MissingArgument(message.into())
     }
 
     pub fn invalid(message: impl Into<String>) -> Self {
-        SqlError::InvalidArgument(message.into())
+        Self::InvalidArgument(message.into())
     }
 
     pub fn analysis(message: impl Into<String>) -> Self {
-        SqlError::AnalysisError(message.into())
+        Self::AnalysisError(message.into())
     }
 
+    #[must_use]
     pub fn parser<T, S>(errors: Vec<Rich<'_, T, S>>) -> Self
     where
         T: fmt::Display,
         S: Into<TokenSpan> + Clone,
     {
-        SqlError::SqlParserError(
+        Self::SqlParserError(
             errors
                 .into_iter()
                 .map(|e| format!("{}", ParserErrorDisplay(&e)))
@@ -64,10 +65,10 @@ impl SqlError {
 impl From<CommonError> for SqlError {
     fn from(error: CommonError) -> Self {
         match error {
-            CommonError::MissingArgument(message) => SqlError::MissingArgument(message),
-            CommonError::InvalidArgument(message) => SqlError::InvalidArgument(message),
-            CommonError::NotSupported(message) => SqlError::NotSupported(message),
-            CommonError::InternalError(message) => SqlError::InternalError(message),
+            CommonError::MissingArgument(message) => Self::MissingArgument(message),
+            CommonError::InvalidArgument(message) => Self::InvalidArgument(message),
+            CommonError::NotSupported(message) => Self::NotSupported(message),
+            CommonError::InternalError(message) => Self::InternalError(message),
         }
     }
 }

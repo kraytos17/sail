@@ -51,12 +51,12 @@ pub fn arrow_to_glue_type(data_type: &DataType) -> CatalogResult<String> {
             Ok(format!("struct<{}>", field_strs?.join(",")))
         }
         DataType::Map(field, _) => {
-            if let DataType::Struct(fields) = field.data_type() {
-                if fields.len() == 2 {
-                    let key_type = arrow_to_glue_type(fields[0].data_type())?;
-                    let value_type = arrow_to_glue_type(fields[1].data_type())?;
-                    return Ok(format!("map<{key_type},{value_type}>"));
-                }
+            if let DataType::Struct(fields) = field.data_type()
+                && fields.len() == 2
+            {
+                let key_type = arrow_to_glue_type(fields[0].data_type())?;
+                let value_type = arrow_to_glue_type(fields[1].data_type())?;
+                return Ok(format!("map<{key_type},{value_type}>"));
             }
             Err(CatalogError::InvalidArgument(
                 "Map type must have key and value fields".to_string(),
@@ -162,32 +162,32 @@ pub fn arrow_to_iceberg_type(data_type: &DataType) -> CatalogResult<Document> {
             ))
         }
         DataType::Map(field, _) => {
-            if let DataType::Struct(fields) = field.data_type() {
-                if fields.len() == 2 {
-                    let key_type = arrow_to_iceberg_type(fields[0].data_type())?;
-                    let value_type = arrow_to_iceberg_type(fields[1].data_type())?;
-                    return Ok(Document::Object(
-                        vec![
-                            ("type".to_string(), Document::String("map".to_string())),
-                            (
-                                "key-id".to_string(),
-                                Document::Number(aws_smithy_types::Number::PosInt(1)),
-                            ),
-                            ("key".to_string(), key_type),
-                            (
-                                "value-id".to_string(),
-                                Document::Number(aws_smithy_types::Number::PosInt(2)),
-                            ),
-                            ("value".to_string(), value_type),
-                            (
-                                "value-required".to_string(),
-                                Document::Bool(!fields[1].is_nullable()),
-                            ),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    ));
-                }
+            if let DataType::Struct(fields) = field.data_type()
+                && fields.len() == 2
+            {
+                let key_type = arrow_to_iceberg_type(fields[0].data_type())?;
+                let value_type = arrow_to_iceberg_type(fields[1].data_type())?;
+                return Ok(Document::Object(
+                    vec![
+                        ("type".to_string(), Document::String("map".to_string())),
+                        (
+                            "key-id".to_string(),
+                            Document::Number(aws_smithy_types::Number::PosInt(1)),
+                        ),
+                        ("key".to_string(), key_type),
+                        (
+                            "value-id".to_string(),
+                            Document::Number(aws_smithy_types::Number::PosInt(2)),
+                        ),
+                        ("value".to_string(), value_type),
+                        (
+                            "value-required".to_string(),
+                            Document::Bool(!fields[1].is_nullable()),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ));
             }
             Err(CatalogError::InvalidArgument(
                 "Map type must have key and value fields".to_string(),

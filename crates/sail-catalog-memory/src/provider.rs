@@ -3,15 +3,15 @@ use std::collections::HashMap;
 use dashmap::{DashMap, Entry};
 use sail_catalog::error::{CatalogError, CatalogObject, CatalogResult};
 use sail_catalog::provider::{
-    plain_lakehouse_create_table_metadata_requirement, AlterTableOptions, CatalogProvider,
-    CreateDatabaseOptions, CreateTableColumnOptions, CreateTableMetadataRequirement,
-    CreateTableMode, CreateTableOptions, CreateViewColumnOptions, CreateViewOptions,
-    DropDatabaseOptions, DropTableOptions, DropViewOptions, Namespace,
+    AlterTableOptions, CatalogProvider, CreateDatabaseOptions, CreateTableColumnOptions,
+    CreateTableMetadataRequirement, CreateTableMode, CreateTableOptions, CreateViewColumnOptions,
+    CreateViewOptions, DropDatabaseOptions, DropTableOptions, DropViewOptions, Namespace,
+    plain_lakehouse_create_table_metadata_requirement,
 };
 use sail_catalog::utils::quote_namespace_if_needed;
 use sail_common_datafusion::catalog::{
-    alter_column_default, alter_column_type, CatalogPartitionField, DatabaseStatus,
-    TableColumnStatus, TableKind, TableStatus,
+    CatalogPartitionField, DatabaseStatus, TableColumnStatus, TableKind, TableStatus,
+    alter_column_default, alter_column_type,
 };
 
 use crate::managed_table;
@@ -271,10 +271,10 @@ impl CatalogProvider for MemoryCatalogProvider {
     }
 
     async fn get_table(&self, database: &Namespace, table: &str) -> CatalogResult<TableStatus> {
-        if let Some(db) = self.databases.get(database) {
-            if let Some(status) = db.tables.get(table) {
-                return Ok(status.clone());
-            }
+        if let Some(db) = self.databases.get(database)
+            && let Some(status) = db.tables.get(table)
+        {
+            return Ok(status.clone());
         }
         Err(CatalogError::NotFound(
             CatalogObject::Table,
@@ -572,10 +572,10 @@ impl CatalogProvider for MemoryCatalogProvider {
     }
 
     async fn get_view(&self, database: &Namespace, view: &str) -> CatalogResult<TableStatus> {
-        if let Some(db) = self.databases.get(database) {
-            if let Some(status) = db.views.get(view) {
-                return Ok(status.clone());
-            }
+        if let Some(db) = self.databases.get(database)
+            && let Some(status) = db.views.get(view)
+        {
+            return Ok(status.clone());
         }
         Err(CatalogError::NotFound(
             CatalogObject::View,

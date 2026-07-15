@@ -18,9 +18,8 @@ use crate::io::StoreContext;
 use crate::spec::manifest::ManifestWriterBuilder;
 use crate::spec::manifest_list::{ManifestFile, ManifestListWriter};
 use crate::spec::{
-    DataFile, FormatVersion, ManifestContentType, Operation, PartitionSpec, Schema,
+    DataFile, FormatVersion, MAIN_BRANCH, ManifestContentType, Operation, PartitionSpec, Schema,
     SnapshotBuilder, SnapshotReference, SnapshotRetention, TableRequirement, TableUpdate,
-    MAIN_BRANCH,
 };
 use crate::utils::join_table_uri;
 use crate::utils::snapshot_id::generate_snapshot_id;
@@ -167,7 +166,7 @@ impl<'a> SnapshotProducer<'a> {
 
             log::trace!(
                 "snapshot producer: loading parent manifest list: {}",
-                &manifest_list_path
+                manifest_list_path
             );
             let manifest_list_data = store_ref
                 .get(&manifest_list_path)

@@ -8,8 +8,8 @@ use datafusion::logical_expr::{
 };
 use datafusion::scalar::ScalarValue;
 use datafusion_common::exec_err;
-use parquet_variant_compute::{cast_to_variant, VariantType};
-use sail_common_datafusion::variant::{variant_metadata_field, VARIANT_VALUE_FIELD_NAME};
+use parquet_variant_compute::{VariantType, cast_to_variant};
+use sail_common_datafusion::variant::{VARIANT_VALUE_FIELD_NAME, variant_metadata_field};
 
 use super::spark_parse_json::convert_variant_binaryview_to_binary;
 
@@ -37,7 +37,7 @@ impl Default for SparkCastToVariant {
 }
 
 impl ScalarUDFImpl for SparkCastToVariant {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "spark_cast_to_variant"
     }
 
@@ -69,8 +69,7 @@ impl ScalarUDFImpl for SparkCastToVariant {
         let input_type = args
             .arg_fields
             .first()
-            .map(|f| f.data_type().clone())
-            .unwrap_or(DataType::Null);
+            .map_or(DataType::Null, |f| f.data_type().clone());
 
         // Reject Map and Struct (Spark doesn't support CAST to VARIANT for these)
         if matches!(input_type, DataType::Map(_, _)) {

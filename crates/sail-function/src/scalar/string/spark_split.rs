@@ -55,10 +55,10 @@ impl ScalarUDFImpl for SparkSplit {
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
         let err = || {
             Err(unsupported_data_types_exec_err(
-            Self::NAME,
-            "Expected (STRING, STRING) or (STRING, STRING, INT). Adjust the value to match the syntax, or change its target type. Use try_cast to handle malformed input and return NULL instead",
-            arg_types,
-        ))
+                Self::NAME,
+                "Expected (STRING, STRING) or (STRING, STRING, INT). Adjust the value to match the syntax, or change its target type. Use try_cast to handle malformed input and return NULL instead",
+                arg_types,
+            ))
         };
 
         let mut res_types = vec![];
@@ -146,7 +146,7 @@ where
                     let limit = limit_scalar_opt.unwrap_or_else(|| limit.value(i));
 
                     let values_format: Vec<Option<String>> =
-                        split_to_array(values.value(i), &format_regex, limit)?;
+                        split_to_array(values.value(i), &format_regex, limit);
                     builder.append_value(values_format);
                 }
             }
@@ -164,14 +164,14 @@ pub fn parse_regex(format: &str) -> Result<Regex> {
     Regex::new(format).map_err(|_| generic_exec_err(SparkSplit::NAME, "Invalid regex"))
 }
 
-pub fn split_to_array(value: &str, format: &Regex, limit: i32) -> Result<Vec<Option<String>>> {
+pub fn split_to_array(value: &str, format: &Regex, limit: i32) -> Vec<Option<String>> {
     let values: Vec<&str> = if limit > 0 {
         format.splitn(value, limit as usize).collect::<Vec<&str>>()
     } else {
         format.split(value).collect::<Vec<&str>>()
     };
-    Ok(values
+    values
         .iter()
         .map(|value| Some(value.to_string()))
-        .collect::<Vec<Option<String>>>())
+        .collect::<Vec<Option<String>>>()
 }

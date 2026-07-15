@@ -1,5 +1,5 @@
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::{exec_err, Result};
+use datafusion::common::{Result, exec_err};
 use datafusion_expr::{ScalarFunctionArgs, ScalarUDFImpl};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::signature::{Signature, Volatility};
@@ -29,7 +29,7 @@ impl SparkMonotonicallyIncreasingId {
 }
 
 impl ScalarUDFImpl for SparkMonotonicallyIncreasingId {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "monotonically_increasing_id"
     }
 

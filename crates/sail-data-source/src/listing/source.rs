@@ -12,15 +12,15 @@ use datafusion::physical_expr::LexRequirement;
 use datafusion::physical_expr_common::sort_expr::LexOrdering;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_common::parsers::CompressionTypeVariant;
-use datafusion_common::{not_impl_err, plan_err, Result, Statistics};
+use datafusion_common::{Result, Statistics, not_impl_err, plan_err};
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::{ListingTableUrl, TableSchema};
 use futures::TryStreamExt;
 use object_store::{ObjectMeta, ObjectStore};
 use sail_common_datafusion::datasource::{
-    find_path_in_options, get_partition_columns_and_file_schema, OptionLayer, SinkInfo, SinkMode,
-    SourceInfo, TableFormat,
+    OptionLayer, SinkInfo, SinkMode, SourceInfo, TableFormat, find_path_in_options,
+    get_partition_columns_and_file_schema,
 };
 use url::Url;
 
@@ -296,12 +296,11 @@ impl<T: FormatFactory> TableFormat for ListingTableFormat<T> {
 }
 async fn listing_target_exists(ctx: &dyn Session, url: &Url) -> Result<bool> {
     // For file systems, treat the target as existing even if it is an empty directory.
-    if url.scheme() == "file" {
-        if let Ok(path) = url.to_file_path() {
-            if path.exists() {
-                return Ok(true);
-            }
-        }
+    if url.scheme() == "file"
+        && let Ok(path) = url.to_file_path()
+        && path.exists()
+    {
+        return Ok(true);
     }
     listing_target_nonempty(ctx, url).await
 }

@@ -1,7 +1,7 @@
 //! Port of Spark's XORShiftRandom
 //!
 //! This is a Rust implementation of Apache Spark's XORShiftRandom class:
-//! https://github.com/apache/spark/blob/master/core/src/main/scala/org/apache/spark/util/random/XORShiftRandom.scala
+//! <https://github.com/apache/spark/blob/master/core/src/main/scala/org/apache/spark/util/random/XORShiftRandom.scala>
 //!
 //! The implementation includes:
 //! - MurmurHash3 seed hashing (matching Scala's scala.util.hashing.MurmurHash3)
@@ -117,7 +117,7 @@ impl SparkXorShiftRandom {
     fn next(&mut self, bits: i32) -> i32 {
         let mut next_seed = self.seed ^ (self.seed << 21);
         // >>> in Java/Scala is unsigned right shift
-        next_seed ^= ((next_seed as u64) >> 35) as i64;
+        next_seed ^= (next_seed.cast_unsigned() >> 35).cast_signed();
         next_seed ^= next_seed << 4;
         self.seed = next_seed;
 
@@ -145,15 +145,15 @@ impl SparkXorShiftRandom {
     /// This is equivalent to Java's `Random.nextGaussian()`: polar Box-Muller using
     /// `next_double()` as the source of randomness, with the spare value from each
     /// pair cached for the following call.
-    /// Ref: https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/Random.java#L695-L762
+    /// Ref: <https://github.com/openjdk/jdk/blob/master/src/java.base/share/classes/java/util/Random.java#L695-L762>
     pub fn next_gaussian(&mut self) -> f64 {
         if self.have_next_next_gaussian {
             self.have_next_next_gaussian = false;
             return self.next_next_gaussian;
         }
         let (v1, v2, s) = loop {
-            let v1 = 2.0 * self.next_double() - 1.0;
-            let v2 = 2.0 * self.next_double() - 1.0;
+            let v1 = 2.0f64.mul_add(self.next_double(), -1.0);
+            let v2 = 2.0f64.mul_add(self.next_double(), -1.0);
             let s = v1 * v1 + v2 * v2;
             if s < 1.0 && s != 0.0 {
                 break (v1, v2, s);
