@@ -56,14 +56,8 @@ impl PlanResolver<'_> {
             let resolved_value = self
                 .resolve_expression(value_expr, &df_schema_for_resolution, state)
                 .await?;
-            let rewritten_value = expression_before_rename(
-                &resolved_value,
-                &field_ids,
-                &original_arrow_schema,
-                true,
-            )?;
-            // Cast the assignment value to the target column's data type to avoid
-            // type mismatches at execution time (e.g., literal Float64 vs column Float32).
+            // Cast to target column type BEFORE expression_before_rename,
+            // so column references (#N) are still consistent with df_schema_for_resolution (#N fields).
             let target_field_name = col_name
                 .parts()
                 .last()
@@ -73,13 +67,15 @@ impl PlanResolver<'_> {
                 .field_with_name(target_field_name)
                 .ok()
                 .map(|field| {
-                    rewritten_value
+                    resolved_value
                         .clone()
                         .cast_to(field.data_type(), df_schema_for_resolution.as_ref())
                 })
                 .transpose()?
-                .unwrap_or(rewritten_value);
-            resolved_assignments.push((col_name_str, ExprWithSource::new(cast_value, None)));
+                .unwrap_or(resolved_value);
+            let rewritten_value =
+                expression_before_rename(&cast_value, &field_ids, &original_arrow_schema, true)?;
+            resolved_assignments.push((col_name_str, ExprWithSource::new(rewritten_value, None)));
         }
 
         // Convert the condition expression if present
