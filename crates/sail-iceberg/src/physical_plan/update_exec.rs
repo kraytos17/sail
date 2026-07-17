@@ -36,9 +36,7 @@ use crate::table::find_latest_metadata_file_with_catalog_fallback;
 use crate::table::metadata_loader::{load_metadata_file_bytes, metadata_file_version_from_path};
 use crate::table_format::metadata_location_from_properties;
 use crate::utils::get_object_store_from_context;
-use crate::utils::metadata::{
-    get_metadata_file_timestamp, is_stale_metadata_file, metadata_files_for_version,
-};
+use crate::utils::metadata::metadata_files_for_version;
 
 const MAX_COMMIT_RETRIES: usize = 5;
 
@@ -326,25 +324,26 @@ impl ExecutionPlan for IcebergUpdateExec {
                 }
 
                 let current_version = metadata_file_version_from_path(&current_latest).unwrap_or(0);
-                let next_version = current_version + 1;
 
-                let existing_for_next =
-                    metadata_files_for_version(&store_ctx, next_version).await?;
-                if !existing_for_next.is_empty() {
-                    let current_ts =
-                        get_metadata_file_timestamp(&store_ctx, &current_latest).await?;
-                    let has_real_conflict = existing_for_next
-                        .iter()
-                        .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
-                    if has_real_conflict {
-                        if attempt >= MAX_COMMIT_RETRIES {
+                // Probe forward to find the first unoccupied version number.
+                // Ghost files from a previous table instance may occupy lower version numbers
+                // even though the current metadata is at an earlier version.
+                let _next_version = {
+                    let mut candidate = current_version + 1;
+                    loop {
+                        let existing = metadata_files_for_version(&store_ctx, candidate).await?;
+                        if existing.is_empty() {
+                            break candidate;
+                        }
+                        candidate += 1;
+                        if candidate > current_version + MAX_COMMIT_RETRIES as i32 + 5 {
                             return Err(DataFusionError::Execution(
-                                "Iceberg UPDATE commit conflict".to_string(),
+                                "Iceberg UPDATE commit conflict: too many occupied versions"
+                                    .to_string(),
                             ));
                         }
-                        continue;
                     }
-                }
+                };
 
                 let current_schema = current_table_meta
                     .current_schema()
