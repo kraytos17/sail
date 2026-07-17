@@ -2322,28 +2322,24 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
             })
         } else if let Some(update_exec) = node.downcast_ref::<IcebergUpdateExec>() {
             let schema = try_encode_schema(update_exec.schema().as_ref())?;
-            let (condition_source, condition_physical) = match update_exec
-                .condition()
-                .as_ref()
-                .and_then(|c| c.source.clone())
-            {
-                Some(src) => (src, vec![]),
-                None => {
-                    let exec_schema = update_exec
-                        .table_schema()
-                        .cloned()
-                        .unwrap_or_else(|| update_exec.schema());
-                    let phys_expr = Self::encode_expr_as_physical(
-                        self,
-                        update_exec
-                            .condition()
-                            .as_ref()
-                            .expect("UPDATE condition should be present for update exec"),
-                        update_exec.session_state(),
-                        &exec_schema,
-                    )?;
-                    (String::new(), phys_expr)
-                }
+            let (condition_source, condition_physical) = match update_exec.condition() {
+                None => (String::new(), vec![]),
+                Some(cond) => match cond.source.clone() {
+                    Some(src) => (src, vec![]),
+                    None => {
+                        let exec_schema = update_exec
+                            .table_schema()
+                            .cloned()
+                            .unwrap_or_else(|| update_exec.schema());
+                        let phys_expr = Self::encode_expr_as_physical(
+                            self,
+                            cond,
+                            update_exec.session_state(),
+                            &exec_schema,
+                        )?;
+                        (String::new(), phys_expr)
+                    }
+                },
             };
             let lakehouse_table_json =
                 self.try_encode_lakehouse_table(update_exec.lakehouse_table())?;

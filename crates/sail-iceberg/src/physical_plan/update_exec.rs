@@ -177,7 +177,7 @@ impl ExecutionPlan for IcebergUpdateExec {
         let session_state = self.session_state.clone();
         let lakehouse_table = self.lakehouse_table.clone();
         let table_properties = self.table_properties.clone();
-        let catalog_metadata_location = metadata_location_from_properties(&table_properties);
+        let mut catalog_metadata_location = metadata_location_from_properties(&table_properties);
         let future = async move {
             let table_url_parsed = url::Url::parse(&table_url)
                 .map_err(|e| DataFusionError::Plan(format!("Invalid URL: {e}")))?;
@@ -302,6 +302,16 @@ impl ExecutionPlan for IcebergUpdateExec {
                 let mut current_table_meta = TableMetadata::from_json(&current_bytes)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
+                if attempt > 1 {
+                    let current_props: Vec<(String, String)> = current_table_meta
+                        .properties
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    catalog_metadata_location = metadata_location_from_properties(&current_props)
+                        .or(catalog_metadata_location);
+                }
+
                 let current_snapshot_id = current_table_meta
                     .current_snapshot()
                     .map(|s| s.snapshot_id());
@@ -384,7 +394,7 @@ impl ExecutionPlan for IcebergUpdateExec {
                     lakehouse_table.as_ref(),
                     &table_properties,
                     &current_latest,
-                    None,
+                    catalog_metadata_location.clone(),
                 )
                 .await
                 {
