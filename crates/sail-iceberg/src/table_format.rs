@@ -422,6 +422,8 @@ impl TableFormat for IcebergTableFormat {
                 self.alter_table_column_position(runtime_env, path, column_path, &position)
                     .await
             }
+            // Rename is purely a catalog-level operation — no storage-level changes needed.
+            TableFormatAlterTableOperation::RenameTable => Ok(()),
             op => not_impl_err!("unsupported Iceberg ALTER TABLE operation: {op:?}"),
         }
     }

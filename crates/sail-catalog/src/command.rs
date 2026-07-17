@@ -508,7 +508,9 @@ impl CatalogCommand {
                     // writes a new metadata file (v{next_version}.metadata.json).
                     // Update the catalog's metadata-location pointer so subsequent
                     // reads find the new metadata.
-                    if format.eq_ignore_ascii_case("iceberg") {
+                    if format.eq_ignore_ascii_case("iceberg")
+                        && !matches!(options, AlterTableOptions::RenameTable { .. })
+                    {
                         let props: Vec<(&str, &str)> = table_status
                             .kind
                             .properties()
