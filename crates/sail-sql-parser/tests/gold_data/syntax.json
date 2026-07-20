@@ -6276,6 +6276,14 @@
               }
             },
             {
+              "name": "Keyword(Truncate)",
+              "node": {
+                "terminal": {
+                  "keyword": "TRUNCATE"
+                }
+              }
+            },
+            {
               "name": "Keyword(TryCast)",
               "node": {
                 "terminal": {
@@ -9937,6 +9945,19 @@
                       },
                       {
                         "nonTerminal": "Option(Tuple(Keyword(If), Keyword(Exists)))"
+                      },
+                      {
+                        "nonTerminal": "ObjectName"
+                      }
+                    ]
+                  },
+                  {
+                    "sequence": [
+                      {
+                        "nonTerminal": "Keyword(Truncate)"
+                      },
+                      {
+                        "nonTerminal": "Keyword(Table)"
                       },
                       {
                         "nonTerminal": "ObjectName"

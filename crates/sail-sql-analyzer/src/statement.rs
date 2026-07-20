@@ -1031,6 +1031,16 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::TruncateTable {
+            truncate: _,
+            table: _,
+            name,
+        } => {
+            let node = spec::CommandNode::TruncateTable {
+                table: from_ast_object_name(name)?,
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
         Statement::LoadData {
             load_data: _,
             local,

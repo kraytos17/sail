@@ -1121,9 +1121,31 @@ impl CatalogProvider for IcebergRestCatalogProvider {
         }
 
         if mode.is_replace() {
-            return Err(CatalogError::NotSupported(
-                "Replace table is not supported yet".to_string(),
-            ));
+            match self.get_table(database, table).await {
+                Ok(_) => {
+                    self.drop_table(
+                        database,
+                        table,
+                        DropTableOptions {
+                            if_exists: false,
+                            purge: false,
+                        },
+                    )
+                    .await?;
+                }
+                Err(CatalogError::NotFound(_, _)) if !mode.replace_requires_existing() => {}
+                Err(CatalogError::NotFound(_, _)) => {
+                    return Err(CatalogError::NotFound(
+                        CatalogObject::Table,
+                        format!(
+                            "{}.{}",
+                            quote_namespace_if_needed(database),
+                            quote_name_if_needed(table)
+                        ),
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         let format_version = requested_iceberg_format_version(&properties)?;

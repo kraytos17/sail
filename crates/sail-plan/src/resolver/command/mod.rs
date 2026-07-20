@@ -293,6 +293,14 @@ impl PlanResolver<'_> {
                 };
                 self.resolve_command_delete(delete, state).await
             }
+            CommandNode::TruncateTable { table } => {
+                let delete = spec::Delete {
+                    table,
+                    table_alias: None,
+                    condition: None,
+                };
+                self.resolve_command_delete(delete, state).await
+            }
             CommandNode::AlterTable {
                 table,
                 if_exists,

@@ -479,6 +479,9 @@ pub enum CommandNode {
         table_alias: Option<Identifier>,
         condition: Option<ExprWithSource>,
     },
+    TruncateTable {
+        table: ObjectName,
+    },
     AlterTable {
         table: ObjectName,
         if_exists: bool,
