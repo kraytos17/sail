@@ -2652,7 +2652,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_add_column_default_boolean() -> TestResult {
+    fn test_parse_add_column_default_boolean() -> SqlResult<()> {
         let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x boolean DEFAULT true")?;
         assert_eq!(defs.len(), 1);
         assert!(

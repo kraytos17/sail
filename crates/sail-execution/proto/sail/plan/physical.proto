@@ -68,6 +68,7 @@ message ExtendedPhysicalPlanNode {
     IcebergDeleteExecNode iceberg_delete = 53;
     IcebergUpdateExecNode iceberg_update = 54;
     IcebergCompactExecNode iceberg_compact = 55;
+    IcebergMergeExecNode iceberg_merge = 56;
   }
 }
 
@@ -1046,4 +1047,12 @@ message IcebergCompactExecNode {
   string lakehouse_table_json = 4;
   repeated StringPair properties = 5;
   bytes table_schema = 6;
+}
+
+message IcebergMergeExecNode {
+  string table_url = 1;
+  bytes schema = 2;
+  string lakehouse_table_json = 3;
+  repeated StringPair properties = 4;
+  bytes table_schema = 5;
 }

@@ -65,7 +65,9 @@ impl ProcessEnvGuard {
             self.previous
                 .push((name.to_string(), std::env::var_os(name)));
         }
-        std::env::set_var(name, value.into());
+        unsafe {
+            std::env::set_var(name, value.into());
+        }
     }
 }
 
@@ -73,8 +75,8 @@ impl Drop for ProcessEnvGuard {
     fn drop(&mut self) {
         for (name, value) in self.previous.drain(..).rev() {
             match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
             }
         }
     }
@@ -427,8 +429,10 @@ async fn shared_kerberos_infrastructure() -> &'static SharedKerberosInfrastructu
     // Set Kerberos env vars permanently for the process (not per-test).
     // KRB5_CONFIG must be set before any GSSAPI call so the library can
     // locate the KDC. SAIL_HMS_KRB_TRACE enables readiness diagnostics.
-    std::env::set_var("KRB5_CONFIG", &host_krb5_conf_path);
-    std::env::set_var("SAIL_HMS_KRB_TRACE", "1");
+    unsafe {
+        std::env::set_var("KRB5_CONFIG", &host_krb5_conf_path);
+        std::env::set_var("SAIL_HMS_KRB_TRACE", "1");
+    }
 
     let _ = SHARED_KRB.set(SharedKerberosInfrastructure {
         canonical_host,

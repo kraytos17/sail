@@ -32,15 +32,15 @@ use sail_common_datafusion::catalog::{
     CatalogPartitionField, LakehouseExecutionContext, PartitionTransform, ScanAuthority,
 };
 use sail_common_datafusion::datasource::{
-    BucketBy, DeleteInfo, OptionLayer, PhysicalSinkMode, SinkInfo, SinkMode, SourceInfo,
-    TableFormat, TableFormatAlterTableOperation, TableFormatCreateTableColumn,
-    TableFormatCreateTableInfo, TableFormatCreateTableResult, TableFormatRegistry, UpdateInfo,
-    create_sort_order, find_path_in_options,
+    BucketBy, DeleteInfo, MERGE_FILE_COLUMN, MergeInfo, OptionLayer, PhysicalSinkMode, SinkInfo,
+    SinkMode, SourceInfo, TableFormat, TableFormatAlterTableOperation,
+    TableFormatCreateTableColumn, TableFormatCreateTableInfo, TableFormatCreateTableResult,
+    TableFormatRegistry, UpdateInfo, create_sort_order, find_path_in_options,
 };
 use sail_common_datafusion::utils::items::ItemTaker;
 use sail_common_datafusion::variant::with_variant_extension_if_marked_storage;
 use sail_data_source::options::ResolveOptions;
-use sail_logical_plan::merge::RowLevelWriteNode;
+use sail_logical_plan::merge::{RowLevelWriteNode, expand_merge};
 use url::Url;
 
 use crate::datasource::provider::IcebergTableProvider;
@@ -375,6 +375,26 @@ impl TableFormat for IcebergTableFormat {
             table_name,
             options,
             lakehouse_table,
+        );
+        Ok(LogicalPlan::Extension(Extension {
+            node: Arc::new(write_node),
+        }))
+    }
+
+    async fn create_merger(&self, _ctx: &dyn Session, info: MergeInfo) -> Result<LogicalPlan> {
+        let raw_target = Arc::clone(&info.target);
+        let raw_source = Arc::clone(&info.source);
+        let raw_input_schema = info.input_schema.clone();
+        let expansion = expand_merge(info, MERGE_FILE_COLUMN, None)?;
+        let write_node = RowLevelWriteNode::new_merge(
+            raw_target,
+            raw_source,
+            raw_input_schema,
+            Arc::new(expansion.write_plan),
+            Arc::new(expansion.touched_files_plan),
+            expansion.deletion_vector_plan.map(Arc::new),
+            expansion.options,
+            expansion.output_schema,
         );
         Ok(LogicalPlan::Extension(Extension {
             node: Arc::new(write_node),

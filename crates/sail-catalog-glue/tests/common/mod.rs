@@ -49,8 +49,12 @@ pub async fn setup_glue_catalog(
 
     // Set AWS credentials via environment for the test
     // Moto accepts any credentials when endpoint_url is set
-    std::env::set_var("AWS_ACCESS_KEY_ID", "testing");
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", "testing");
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "testing");
+    }
+    unsafe {
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "testing");
+    }
 
     let config = GlueCatalogConfig {
         region: Some("us-east-1".to_string()),

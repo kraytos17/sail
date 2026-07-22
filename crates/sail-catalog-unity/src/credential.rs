@@ -506,7 +506,9 @@ mod tests {
     async fn test_managed_identity() {
         let server = MockServer::start().await;
 
-        std::env::set_var(MSI_SECRET_ENV_KEY, "env-secret");
+        unsafe {
+            std::env::set_var(MSI_SECRET_ENV_KEY, "env-secret");
+        }
 
         let client = Client::new();
 

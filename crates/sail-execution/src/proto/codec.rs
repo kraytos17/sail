@@ -237,8 +237,8 @@ use sail_function::window::{SparkFirstLastValue, SparkFirstLastValueKind, SparkN
 use sail_iceberg::IcebergWriterExecOptions;
 use sail_iceberg::physical_plan::{
     IcebergCommitExec, IcebergCompactExec, IcebergDeleteApplyExec, IcebergDeleteExec,
-    IcebergDiscoveryExec, IcebergManifestScanExec, IcebergScanByDataFilesExec, IcebergUpdateExec,
-    IcebergWriterExec,
+    IcebergDiscoveryExec, IcebergManifestScanExec, IcebergMergeExec, IcebergScanByDataFilesExec,
+    IcebergUpdateExec, IcebergWriterExec,
 };
 use sail_logical_plan::range::Range;
 use sail_logical_plan::show_string::{ShowStringFormat, ShowStringStyle};
@@ -1548,6 +1548,36 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     decoded_table_schema,
                 )))
             }
+            NodeKind::IcebergMerge(gen_::IcebergMergeExecNode {
+                table_url,
+                schema,
+                lakehouse_table_json,
+                properties,
+                table_schema: table_schema_bytes,
+            }) => {
+                let _schema = Arc::new(try_decode_schema(&schema)?);
+                let lakehouse_table = self.try_decode_lakehouse_table(&lakehouse_table_json)?;
+                let table_properties = properties.into_iter().map(|p| (p.key, p.value)).collect();
+                let decoded_table_schema = if !table_schema_bytes.is_empty() {
+                    Some(Arc::new(try_decode_schema(&table_schema_bytes)?))
+                } else {
+                    None
+                };
+                let session_state =
+                    datafusion::execution::session_state::SessionStateBuilder::new()
+                        .with_config(ctx.session_config().clone())
+                        .with_runtime_env(ctx.runtime_env().clone())
+                        .with_default_features()
+                        .build();
+                Ok(Arc::new(IcebergMergeExec::new(
+                    table_url,
+                    None,
+                    session_state,
+                    lakehouse_table,
+                    table_properties,
+                    decoded_table_schema,
+                )))
+            }
             _ => plan_err!("unsupported physical plan node: {node_kind:?}"),
         }
     }
@@ -2412,6 +2442,29 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 lakehouse_table_json,
                 properties,
                 table_schema: compact_exec
+                    .table_schema()
+                    .map(|s| try_encode_schema(s.as_ref()))
+                    .transpose()?
+                    .unwrap_or_default(),
+            })
+        } else if let Some(merge_exec) = node.downcast_ref::<IcebergMergeExec>() {
+            let schema = try_encode_schema(merge_exec.schema().as_ref())?;
+            let lakehouse_table_json =
+                self.try_encode_lakehouse_table(merge_exec.lakehouse_table())?;
+            let properties = merge_exec
+                .table_properties()
+                .iter()
+                .map(|(k, v)| gen_::StringPair {
+                    key: k.clone(),
+                    value: v.clone(),
+                })
+                .collect();
+            NodeKind::IcebergMerge(gen_::IcebergMergeExecNode {
+                table_url: merge_exec.table_url().to_string(),
+                schema,
+                lakehouse_table_json,
+                properties,
+                table_schema: merge_exec
                     .table_schema()
                     .map(|s| try_encode_schema(s.as_ref()))
                     .transpose()?
@@ -4967,7 +5020,6 @@ mod tests {
     use datafusion::common::ScalarValue;
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::execution::TaskContext;
-    use datafusion::execution::runtime_env::RuntimeEnv;
     use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator, col, lit};
     use datafusion::physical_expr::HigherOrderFunctionExpr;

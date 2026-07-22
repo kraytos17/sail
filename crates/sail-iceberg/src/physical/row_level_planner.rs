@@ -10,6 +10,7 @@ use sail_logical_plan::merge::RowLevelWriteNode;
 use crate::catalog_support::commit_helper::extract_table_properties;
 use crate::datasource::type_converter::iceberg_schema_to_arrow;
 use crate::physical_plan::delete_exec::IcebergDeleteExec;
+use crate::physical_plan::merge_exec::IcebergMergeExec;
 use crate::physical_plan::update_exec::IcebergUpdateExec;
 use crate::table::Table;
 
@@ -60,9 +61,16 @@ pub(crate) async fn plan_iceberg_row_level_write(
                 table_schema,
             )))
         }
-        _ => datafusion_common::not_impl_err!(
-            "Unsupported row-level operation: {:?}",
-            node.command()
-        ),
+        RowLevelCommand::Merge => {
+            let merge_options = node.merge_options().cloned();
+            Ok(Arc::new(IcebergMergeExec::new(
+                table_url.to_string(),
+                merge_options,
+                session_state.clone(),
+                lakehouse_table,
+                table_properties,
+                table_schema,
+            )))
+        }
     }
 }
