@@ -91,7 +91,11 @@ pub fn create_spark_session_manager(
         })
     };
     let options = SessionManagerOptions::new(runtime.clone(), system, factory)
-        .with_session_timeout(Duration::from_secs(config.spark.session_timeout_secs))
+        // no explicit session_timeout — defaults to Duration::MAX
+        // (infinite). Matches Spark (JVM) behavior where sessions live
+        // until spark.stop() or driver death. A finite timeout would kill
+        // sessions between dbt model executions within a single run,
+        // forcing costly driver+worker re-creation per model.
         .with_options(config.raw().map_err(SparkError::from)?);
     Ok(SessionManager::try_new(options)?)
 }

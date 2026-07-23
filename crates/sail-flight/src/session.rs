@@ -77,10 +77,11 @@ pub fn create_flight_session_manager(
             create_flight_session_factory(config.clone(), runtime.clone(), system.clone())
         })
     };
-    let options = SessionManagerOptions::new(runtime.clone(), system, factory)
-        .with_session_timeout(std::time::Duration::from_secs(
-            config.flight.session_timeout_secs,
-        ));
+    // no explicit session_timeout — defaults to Duration::MAX (infinite).
+    // Matches Spark (JVM) behavior where sessions live until spark.stop()
+    // or driver death. A finite timeout would kill sessions between dbt model
+    // executions within a single run, forcing costly driver+worker re-creation.
+    let options = SessionManagerOptions::new(runtime.clone(), system, factory);
     SessionManager::try_new(options).map_err(|e| {
         FlightError::DataFusion(internal_datafusion_err!(
             "Failed to create session manager: {}",
