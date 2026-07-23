@@ -1195,7 +1195,7 @@ impl CatalogProvider for IcebergRestCatalogProvider {
 
         let request = crate::models::CreateTableRequest {
             name: table.to_string(),
-            location,
+            location: None,
             schema: Box::new(schema),
             partition_spec,
             write_order,
