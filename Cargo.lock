@@ -7515,7 +7515,9 @@ version = "0.6.5"
 dependencies = [
  "arrow",
  "async-trait",
+ "futures",
  "log",
+ "object_store",
  "percent-encoding",
  "reqwest 0.12.28",
  "sail-catalog",

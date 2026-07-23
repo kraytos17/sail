@@ -15,6 +15,10 @@ use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
+use futures::{StreamExt, TryStreamExt};
+use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
+use object_store::path::Path as ObjectStorePath;
 use percent_encoding::percent_decode_str;
 use sail_catalog::credentials::CatalogCredentials;
 use sail_catalog::error::{CatalogError, CatalogObject, CatalogResult};
@@ -1279,6 +1283,37 @@ impl CatalogProvider for IcebergRestCatalogProvider {
         let catalog_config = self.resolved_catalog_config().await?;
         let client = self.client().await?;
         let DropTableOptions { if_exists, purge } = options;
+
+        if purge {
+            match self
+                .load_table_result(database, table, Some("vended_credentials"))
+                .await
+            {
+                Ok(result) => {
+                    if let Some(location) = result.metadata.location.as_ref() {
+                        if let Err(e) = purge_table_data(location, &result).await {
+                            log::warn!(
+                                "PURGE: failed to delete S3 data for {}.{} at {location}: {e}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table),
+                            );
+                        }
+                    } else {
+                        log::warn!(
+                            "PURGE: no table location for {}.{}",
+                            quote_namespace_if_needed(database),
+                            quote_name_if_needed(table),
+                        );
+                    }
+                }
+                Err(e) => {
+                    if !if_exists {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
         match client
             .catalog_api_api()
             .drop_table(
@@ -2193,6 +2228,62 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             Err(e) => Err(CatalogError::External(format!("Failed to drop view: {e}"))),
         }
     }
+}
+
+async fn purge_table_data(
+    location: &str,
+    result: &crate::models::LoadTableResult,
+) -> CatalogResult<()> {
+    let url = url::Url::parse(location).map_err(|e| {
+        CatalogError::External(format!("Invalid table location URL {location}: {e}"))
+    })?;
+
+    let bucket = url.host_str().ok_or_else(|| {
+        CatalogError::External(format!("No bucket in table location URL {location}"))
+    })?;
+    let prefix = url.path().trim_start_matches('/');
+
+    let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+
+    // Apply vended storage credentials if available
+    if let Some(config) = result
+        .storage_credentials
+        .as_ref()
+        .and_then(|creds| creds.iter().find(|c| location.starts_with(&c.prefix)))
+        .map(|c| &c.config)
+        .or_else(|| result.config.as_ref())
+    {
+        if let Some(val) = config.get("s3.access-key-id") {
+            builder = builder.with_access_key_id(val);
+        }
+        if let Some(val) = config.get("s3.secret-access-key") {
+            builder = builder.with_secret_access_key(val);
+        }
+        if let Some(val) = config.get("s3.session-token") {
+            builder = builder.with_token(val);
+        }
+        if let Some(region) = config.get("client.region") {
+            builder = builder.with_region(region);
+        }
+    }
+
+    let store = builder.build().map_err(|e| {
+        CatalogError::External(format!("Failed to create S3 store for {location}: {e}"))
+    })?;
+
+    let path = ObjectStorePath::from(prefix);
+
+    log::info!("Purging table data at {location}");
+    let delete_stream = store.list(Some(&path)).map_ok(|meta| meta.location).boxed();
+    store
+        .delete_stream(delete_stream)
+        .try_for_each(|_| futures::future::ready(Ok(())))
+        .await
+        .map_err(|e| {
+            CatalogError::External(format!("Failed to delete files at {location}: {e}"))
+        })?;
+
+    Ok(())
 }
 
 /// Finds an item by ID, falling back to the last item if not found or no ID is provided.
