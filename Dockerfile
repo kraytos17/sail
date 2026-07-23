@@ -10,13 +10,15 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=apt-cache \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked,id=apt-lists \
     apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gcc libc6-dev git pkg-config \
-        protobuf-compiler libprotobuf-dev mold python3 python3-dev && \
+        protobuf-compiler libprotobuf-dev mold && \
     rm -rf /var/lib/apt/lists/*
 
 RUN rustup component add rustfmt && \
     curl -L --proto '=https' --tlsv1.2 -sSf \
         https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash && \
     cargo binstall --no-confirm cargo-chef sccache
+
+FROM python:3.14-slim-trixie AS python
 
 FROM base AS planner
 WORKDIR /app
@@ -45,6 +47,8 @@ ENV RUSTC_WRAPPER=sccache \
     CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
 WORKDIR /app
+
+COPY --from=python /usr/local/ /usr/local/
 
 COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/root/.cache/sccache,id=sccache \
