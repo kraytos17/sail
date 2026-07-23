@@ -5,6 +5,7 @@ use datafusion::arrow::array::UInt64Array;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::{SessionState, TaskContext};
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr::{Distribution, EquivalenceProperties};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -41,6 +42,8 @@ const MAX_COMMIT_RETRIES: usize = 5;
 pub struct IcebergMergeExec {
     table_url: String,
     merge_options: Option<MergeIntoOptions>,
+    source_plan: Option<Arc<LogicalPlan>>,
+    source_data: Option<Vec<RecordBatch>>,
     schema: SchemaRef,
     session_state: SessionState,
     lakehouse_table: Option<LakehouseExecutionContext>,
@@ -53,6 +56,8 @@ impl IcebergMergeExec {
     pub fn new(
         table_url: String,
         merge_options: Option<MergeIntoOptions>,
+        source_plan: Option<Arc<LogicalPlan>>,
+        source_data: Option<Vec<RecordBatch>>,
         session_state: SessionState,
         lakehouse_table: Option<LakehouseExecutionContext>,
         table_properties: Vec<(String, String)>,
@@ -67,6 +72,8 @@ impl IcebergMergeExec {
         Self {
             table_url,
             merge_options,
+            source_plan,
+            source_data,
             schema,
             session_state,
             lakehouse_table,
@@ -98,6 +105,27 @@ impl IcebergMergeExec {
 
     pub fn session_state(&self) -> &datafusion::execution::SessionState {
         &self.session_state
+    }
+
+    /// Evaluate the source plan into RecordBatches, using cached source_data if available.
+    pub async fn evaluate_source_plan(&self) -> Result<Vec<RecordBatch>> {
+        if let Some(ref data) = self.source_data {
+            return Ok(data.clone());
+        }
+        if let Some(ref plan) = self.source_plan {
+            use datafusion::execution::context::SessionContext;
+            let ctx = SessionContext::new_with_state(self.session_state.clone());
+            let df = ctx
+                .execute_logical_plan(LogicalPlan::clone(plan.as_ref()))
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("Source plan: {e}")))?;
+            let batches = df
+                .collect()
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("Source collect: {e}")))?;
+            return Ok(batches);
+        }
+        Ok(vec![])
     }
 
     fn compute_properties(schema: SchemaRef) -> Arc<PlanProperties> {
@@ -164,6 +192,7 @@ impl ExecutionPlan for IcebergMergeExec {
         let table_properties = self.table_properties.clone();
         let schema = self.schema.clone();
         let merge_options = self.merge_options.clone();
+        let source_plan = self.source_plan.clone();
 
         let future = async move {
             let table_url_parsed = url::Url::parse(&table_url)
@@ -237,10 +266,9 @@ impl ExecutionPlan for IcebergMergeExec {
             let mut total_updated_rows: u64 = 0;
 
             if let (Some(options), Some(target_batch)) = (&merge_options, &target_batch) {
-                // Get source data by executing the source LogicalPlan
+                // Get source data by evaluating the source plan (or from cached source_data)
                 let source_batches =
-                    execute_logical_plan(&_session_state, &context, &options.target, &arrow_schema)
-                        .await;
+                    evaluate_source_plan_internal(&source_plan, &_session_state).await;
 
                 let source_batch = match source_batches {
                     Ok(batches) => {
@@ -260,7 +288,8 @@ impl ExecutionPlan for IcebergMergeExec {
                     &options.on_condition.expr,
                     &_session_state,
                     &file_schema,
-                )?;
+                )
+                .await?;
 
                 // Count matching rows for output
                 total_updated_rows = matching_mask.true_count() as u64;
@@ -282,7 +311,8 @@ impl ExecutionPlan for IcebergMergeExec {
                                     &options.on_condition.expr,
                                     &_session_state,
                                     &file_schema,
-                                )?;
+                                )
+                                .await?;
                                 if insert_batch.num_rows() > 0 {
                                     let new_file = write_data_file(
                                         &store_ctx,
@@ -478,42 +508,120 @@ async fn read_parquet_file(
     Ok(batches)
 }
 
-fn evaluate_on_condition(
+async fn evaluate_on_condition(
     target_batch: &RecordBatch,
     source_batch: Option<&RecordBatch>,
     condition: &Expr,
     session_state: &SessionState,
-    schema: &SchemaRef,
+    _schema: &SchemaRef,
 ) -> Result<datafusion::arrow::array::BooleanArray> {
-    // Simple evaluation: if no source data, no rows match
-    let _ = (source_batch, condition, session_state, schema);
-    Ok(datafusion::arrow::array::BooleanArray::from(
-        vec![false; target_batch.num_rows()],
-    ))
+    let batch = match source_batch {
+        Some(source) => {
+            use datafusion::execution::context::SessionContext;
+            use datafusion::logical_expr::JoinType;
+            let ctx = SessionContext::new_with_state(session_state.clone());
+            let target_df = ctx
+                .read_batch(target_batch.clone())
+                .map_err(|e| DataFusionError::Execution(format!("Read target: {e}")))?;
+            let source_df = ctx
+                .read_batch(source.clone())
+                .map_err(|e| DataFusionError::Execution(format!("Read source: {e}")))?;
+            // Cross join requires a dummy true condition
+            let joined = target_df
+                .join(
+                    source_df,
+                    JoinType::Inner,
+                    &[],
+                    &[],
+                    Some(Expr::Literal(
+                        datafusion::common::ScalarValue::Boolean(Some(true)),
+                        None,
+                    )),
+                )
+                .map_err(|e| DataFusionError::Execution(format!("Join target/source: {e}")))?;
+            let batches = joined
+                .collect()
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("Collect joined: {e}")))?;
+            if batches.is_empty() {
+                return Ok(datafusion::arrow::array::BooleanArray::from(
+                    vec![false; target_batch.num_rows()],
+                ));
+            }
+            let arrow_schema = batches[0].schema();
+            concat_batches(&arrow_schema, &batches)?
+        }
+        None => target_batch.clone(),
+    };
+
+    use datafusion::common::ToDFSchema;
+    let df_schema = batch
+        .schema()
+        .to_dfschema()
+        .map_err(|e| DataFusionError::Execution(format!("Schema conversion: {e}")))?;
+
+    let phys_expr = session_state
+        .create_physical_expr(condition.clone(), &df_schema)
+        .map_err(|e| DataFusionError::Execution(format!("ON condition: {e}")))?;
+
+    let mask = phys_expr
+        .evaluate(&batch)
+        .map_err(|e| DataFusionError::Execution(format!("ON eval: {e}")))?
+        .into_array(batch.num_rows())
+        .map_err(|e| DataFusionError::Execution(format!("ON array: {e}")))?;
+
+    mask.as_any()
+        .downcast_ref::<datafusion::arrow::array::BooleanArray>()
+        .cloned()
+        .ok_or_else(|| {
+            DataFusionError::Execution("ON condition did not produce BooleanArray".to_string())
+        })
 }
 
-fn filter_insert_rows(
+async fn filter_insert_rows(
     target_batch: &RecordBatch,
     source_batch: &RecordBatch,
     condition: &Expr,
     session_state: &SessionState,
     schema: &SchemaRef,
 ) -> Result<RecordBatch> {
-    // Simple implementation: return all source rows as insert rows
-    // For INSERT-only MERGE, this is correct.
-    // For full MERGE, this needs to filter source rows that don't match any target row.
-    let _ = (target_batch, condition, session_state, schema);
-    Ok(source_batch.clone())
-}
+    use datafusion::execution::context::SessionContext;
+    use datafusion::logical_expr::JoinType;
 
-async fn execute_logical_plan(
-    session_state: &SessionState,
-    context: &TaskContext,
-    _target_info: &sail_common_datafusion::datasource::MergeTargetInfo,
-    _schema: &SchemaRef,
-) -> Result<Vec<RecordBatch>> {
-    let _ = (session_state, context);
-    Ok(vec![])
+    let ctx = SessionContext::new_with_state(session_state.clone());
+    ctx.register_batch("__target", target_batch.clone())
+        .map_err(|e| DataFusionError::Execution(format!("Register target: {e}")))?;
+    ctx.register_batch("__source", source_batch.clone())
+        .map_err(|e| DataFusionError::Execution(format!("Register source: {e}")))?;
+
+    let target_df = ctx
+        .table("__target")
+        .await
+        .map_err(|e| DataFusionError::Execution(format!("Get target: {e}")))?;
+    let source_df = ctx
+        .table("__source")
+        .await
+        .map_err(|e| DataFusionError::Execution(format!("Get source: {e}")))?;
+
+    let anti_joined = source_df
+        .join(
+            target_df,
+            JoinType::LeftAnti,
+            &[],
+            &[],
+            Some(condition.clone()),
+        )
+        .map_err(|e| DataFusionError::Execution(format!("Anti join: {e}")))?;
+
+    let batches = anti_joined
+        .collect()
+        .await
+        .map_err(|e| DataFusionError::Execution(format!("Collect anti: {e}")))?;
+
+    if batches.is_empty() {
+        return Ok(source_batch.slice(0, 0));
+    }
+    concat_batches(schema, &batches)
 }
 
 async fn write_data_file(
@@ -592,6 +700,28 @@ async fn write_data_file(
         content_offset: None,
         content_size_in_bytes: None,
     })
+}
+
+async fn evaluate_source_plan_internal(
+    source_plan: &Option<Arc<LogicalPlan>>,
+    session_state: &SessionState,
+) -> Result<Vec<RecordBatch>> {
+    match source_plan {
+        Some(plan) => {
+            use datafusion::execution::context::SessionContext;
+            let ctx = SessionContext::new_with_state(session_state.clone());
+            let df = ctx
+                .execute_logical_plan(LogicalPlan::clone(plan.as_ref()))
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("Source plan: {e}")))?;
+            let batches = df
+                .collect()
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("Source collect: {e}")))?;
+            Ok(batches)
+        }
+        None => Ok(vec![]),
+    }
 }
 
 async fn load_manifest_list_internal(

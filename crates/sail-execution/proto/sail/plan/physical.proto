@@ -1055,4 +1055,5 @@ message IcebergMergeExecNode {
   string lakehouse_table_json = 3;
   repeated StringPair properties = 4;
   bytes table_schema = 5;
+  bytes source_data = 6;
 }

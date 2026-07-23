@@ -63,9 +63,12 @@ pub(crate) async fn plan_iceberg_row_level_write(
         }
         RowLevelCommand::Merge => {
             let merge_options = node.merge_options().cloned();
+            let source_plan = node.raw_source().cloned();
             Ok(Arc::new(IcebergMergeExec::new(
                 table_url.to_string(),
                 merge_options,
+                source_plan,
+                None,
                 session_state.clone(),
                 lakehouse_table,
                 table_properties,

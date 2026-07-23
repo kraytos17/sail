@@ -6,10 +6,13 @@ use std::sync::Arc;
 
 use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use datafusion::arrow::ipc::reader::FileReader;
+use datafusion::arrow::ipc::writer::FileWriter;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::parsers::CompressionTypeVariant;
 use datafusion::common::{
-    Constraint, Constraints, JoinSide, Result, ScalarValue, Statistics, plan_datafusion_err,
-    plan_err,
+    Constraint, Constraints, DataFusionError, JoinSide, Result, ScalarValue, Statistics,
+    plan_datafusion_err, plan_err,
 };
 use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -1554,6 +1557,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 lakehouse_table_json,
                 properties,
                 table_schema: table_schema_bytes,
+                source_data,
             }) => {
                 let _schema = Arc::new(try_decode_schema(&schema)?);
                 let lakehouse_table = self.try_decode_lakehouse_table(&lakehouse_table_json)?;
@@ -1563,6 +1567,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 } else {
                     None
                 };
+                let source_data = merge_decode_source_data(&source_data);
                 let session_state =
                     datafusion::execution::session_state::SessionStateBuilder::new()
                         .with_config(ctx.session_config().clone())
@@ -1572,6 +1577,8 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 Ok(Arc::new(IcebergMergeExec::new(
                     table_url,
                     None,
+                    None,
+                    source_data,
                     session_state,
                     lakehouse_table,
                     table_properties,
@@ -2469,6 +2476,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     .map(|s| try_encode_schema(s.as_ref()))
                     .transpose()?
                     .unwrap_or_default(),
+                source_data: merge_encode_source_data(merge_exec),
             })
         } else {
             return plan_err!("unsupported physical plan node: {node:?}");
@@ -5010,6 +5018,53 @@ impl RemoteExecutionCodec {
     }
 }
 
+/// Encode the source_data for IcebergMergeExec by evaluating the source plan
+/// and serializing the result as Arrow IPC bytes.
+fn merge_encode_source_data(merge_exec: &IcebergMergeExec) -> Vec<u8> {
+    let batches = futures::executor::block_on(merge_exec.evaluate_source_plan()).ok();
+    match batches {
+        Some(batches) if !batches.is_empty() => {
+            serialize_batches_to_ipc(&batches).unwrap_or_default()
+        }
+        _ => vec![],
+    }
+}
+
+fn serialize_batches_to_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    let schema = batches[0].schema();
+    let mut writer = FileWriter::try_new(Vec::new(), &schema)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    for batch in batches {
+        writer
+            .write(batch)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    }
+    writer
+        .finish()
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    writer
+        .into_inner()
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+fn deserialize_batches_from_ipc(data: &[u8]) -> Result<Vec<RecordBatch>> {
+    let reader = FileReader::try_new(std::io::Cursor::new(data), None)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let mut batches = Vec::new();
+    for result in reader {
+        let batch = result.map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
+fn merge_decode_source_data(data: &[u8]) -> Option<Vec<RecordBatch>> {
+    if data.is_empty() {
+        return None;
+    }
+    deserialize_batches_from_ipc(data).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -5017,8 +5072,8 @@ mod tests {
 
     use datafusion::arrow::array::{Array, ArrayRef, RecordBatch};
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use datafusion::common::ScalarValue;
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::common::{ScalarValue, ToDFSchema};
     use datafusion::execution::TaskContext;
     use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator, col, lit};
@@ -7742,5 +7797,130 @@ mod tests {
         assert_eq!(decoded_update.table_url(), "s3://bucket/table");
         assert!(decoded_update.condition().is_some());
         assert_eq!(decoded_update.assignments().len(), 2);
+    }
+
+    #[test]
+    fn test_iceberg_merge_codec_round_trip() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("score", DataType::Float64, true),
+        ]));
+        let merge_exec = Arc::new(IcebergMergeExec::new(
+            "s3://bucket/table".to_string(),
+            None,
+            None,
+            None,
+            SessionStateBuilder::new().with_default_features().build(),
+            None,
+            vec![],
+            Some(schema),
+        ));
+
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        codec.try_encode(merge_exec.clone(), &mut buf).unwrap();
+
+        let config = SessionConfig::new();
+        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+            .build_arc()
+            .unwrap();
+        let ctx = Arc::new(TaskContext::new(
+            None,
+            "test_session".to_string(),
+            config,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            runtime,
+        ));
+        let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
+
+        let decoded_merge = decoded.as_ref().downcast_ref::<IcebergMergeExec>().unwrap();
+        assert_eq!(decoded_merge.table_url(), "s3://bucket/table");
+        assert!(decoded_merge.merge_options().is_none());
+    }
+
+    #[test]
+    fn test_iceberg_merge_codec_round_trip_with_options() {
+        use sail_common_datafusion::datasource::{
+            MergeIntoOptions, MergeMatchedAction, MergeMatchedClause,
+            MergeNotMatchedByTargetAction, MergeNotMatchedByTargetClause, MergeTargetInfo,
+        };
+        use sail_common_datafusion::logical_expr::ExprWithSource;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("score", DataType::Float64, true),
+        ]));
+        let target_info = MergeTargetInfo {
+            table_name: vec!["test".to_string(), "target".to_string()],
+            format: "iceberg".to_string(),
+            location: "s3://bucket/table".to_string(),
+            partition_by: vec![],
+            options: vec![],
+            lakehouse_table: None,
+        };
+        let merge_options = MergeIntoOptions {
+            target_alias: None,
+            source_alias: None,
+            target: target_info,
+            with_schema_evolution: false,
+            resolved_target_schema: Arc::new(schema.clone().to_dfschema().unwrap()),
+            resolved_source_schema: Arc::new(schema.to_dfschema().unwrap()),
+            resolved_target_field_names: vec!["id".to_string(), "score".to_string()],
+            resolved_source_field_names: vec!["id".to_string(), "score".to_string()],
+            on_condition: ExprWithSource {
+                expr: col("id").eq(col("id")),
+                source: Some("id = source.id".to_string()),
+            },
+            matched_clauses: vec![MergeMatchedClause {
+                condition: None,
+                action: MergeMatchedAction::UpdateSet(vec![]),
+            }],
+            not_matched_by_source_clauses: vec![],
+            not_matched_by_target_clauses: vec![MergeNotMatchedByTargetClause {
+                condition: None,
+                action: MergeNotMatchedByTargetAction::InsertAll,
+            }],
+            join_key_pairs: vec![],
+            residual_predicates: vec![],
+            target_only_predicates: vec![],
+            generated_column_exprs: vec![],
+            check_constraint_exprs: vec![],
+        };
+        let merge_exec = Arc::new(IcebergMergeExec::new(
+            "s3://bucket/table".to_string(),
+            Some(merge_options),
+            None,
+            None,
+            SessionStateBuilder::new().with_default_features().build(),
+            None,
+            vec![],
+            None,
+        ));
+
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        codec.try_encode(merge_exec.clone(), &mut buf).unwrap();
+
+        let config = SessionConfig::new();
+        let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+            .build_arc()
+            .unwrap();
+        let ctx = Arc::new(TaskContext::new(
+            None,
+            "test_session".to_string(),
+            config,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            runtime,
+        ));
+        let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
+
+        let decoded_merge = decoded.as_ref().downcast_ref::<IcebergMergeExec>().unwrap();
+        assert_eq!(decoded_merge.table_url(), "s3://bucket/table");
     }
 }
