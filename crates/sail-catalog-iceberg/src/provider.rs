@@ -1098,7 +1098,7 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             columns,
             comment,
             constraints,
-            location,
+            location: _,
             format,
             partition_by,
             sort_by,
@@ -1207,16 +1207,52 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             properties: if props.is_empty() { None } else { Some(props) },
         };
 
-        let result = client
-            .catalog_api_api()
-            .create_table(
-                &catalog_config.namespace_string(database)?,
-                request,
-                None,
-                catalog_config.prefix(),
-            )
-            .await
-            .map_err(|e| CatalogError::External(format!("Failed to create table: {e}")))?;
+        let result = {
+            let max_retries = 3u32;
+            let mut last_result = None;
+            for attempt in 0..max_retries {
+                if attempt > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100u64 * (1u64 << (attempt - 1)),
+                    ))
+                    .await;
+                }
+                match client
+                    .catalog_api_api()
+                    .create_table(
+                        &catalog_config.namespace_string(database)?,
+                        request.clone(),
+                        None,
+                        catalog_config.prefix(),
+                    )
+                    .await
+                {
+                    Ok(r) => {
+                        last_result = Some(r);
+                        break;
+                    }
+                    Err(e) => {
+                        let err_str = format!("{e}");
+                        let is_transient = err_str.contains("status code 5");
+                        if is_transient && attempt + 1 < max_retries {
+                            log::warn!(
+                                "transient error creating table '{:?}.{}', retrying (attempt {}/{}): {}",
+                                database,
+                                table,
+                                attempt + 1,
+                                max_retries,
+                                err_str
+                            );
+                            continue;
+                        }
+                        return Err(CatalogError::External(format!(
+                            "Failed to create table: {e}"
+                        )));
+                    }
+                }
+            }
+            last_result.expect("loop should return on error or assign result")
+        };
 
         if is_write_precondition {
             Self::validate_create_table_access_session_requirements(
@@ -3378,6 +3414,35 @@ mod tests {
         let ctx = TestContext::new(name).await;
         let namespace = Namespace::try_from(vec!["ns1".to_string()]).unwrap();
 
+        Mock::given(method("GET"))
+            .and(path(ctx.path("/namespaces/ns1/tables/table1").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata-location": null,
+                "metadata": {
+                    "format-version": 2,
+                    "table-uuid": "12345678-1234-1234-1234-123456789012",
+                    "last-column-id": 3,
+                    "current-schema-id": 0,
+                    "schemas": [{
+                        "type": "struct",
+                        "schema-id": 0,
+                        "fields": [
+                            {"id": 1, "name": "id", "required": true, "type": "int"},
+                            {"id": 2, "name": "name", "required": false, "type": "string"}
+                        ]
+                    }],
+                    "partition-specs": [{"spec-id": 0, "fields": []}],
+                    "default-spec-id": 0,
+                    "last-partition-id": 0,
+                    "properties": {},
+                    "current-snapshot-id": null,
+                    "snapshots": [],
+                    "snapshot-log": [],
+                    "metadata-log": []
+                }
+            })))
+            .mount(&ctx.server)
+            .await;
         Mock::given(method("DELETE"))
             .and(path(ctx.path("/namespaces/ns1/tables/table1").as_str()))
             .and(query_param("purgeRequested", "true"))

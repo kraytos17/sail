@@ -79,8 +79,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked,id=apt-cache \
     useradd --system --gid sail --no-create-home --shell /usr/sbin/nologin sail && \
     apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/* && \
-    python3 -m pip install --no-cache-dir "pyspark-client==${PYSPARK_VERSION}"
+    rm -rf /var/lib/apt/lists/*
+RUN python3 -m pip install --no-cache-dir "pyspark[connect]==${PYSPARK_VERSION}" pandas
 
 COPY --link --from=builder /usr/local/bin/sail /usr/local/bin/sail
 

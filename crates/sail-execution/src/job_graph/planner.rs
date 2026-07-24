@@ -451,13 +451,13 @@ fn rewrite_inputs(
     Ok((result.data()?, inputs))
 }
 
-// TODO: support driver stage with inputs
 fn create_driver_stage(
     plan: &Arc<dyn ExecutionPlan>,
     graph: &mut JobGraph,
 ) -> ExecutionResult<Arc<dyn ExecutionPlan>> {
+    let (plan, inputs) = rewrite_inputs(plan.clone())?;
     let stage = Stage {
-        inputs: vec![],
+        inputs,
         plan: plan.clone(),
         group: String::new(),
         mode: OutputMode::Pipelined,

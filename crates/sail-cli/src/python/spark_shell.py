@@ -1,10 +1,22 @@
 import code
+import os
 import platform
 import readline
+import sys
 from rlcompleter import Completer
 
-import pyspark
+# pyspark-client needs env vars set before any import that touches pyspark.
+os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+
 from pyspark.sql import SparkSession
+
+try:
+    import pyspark
+
+    _version = pyspark.__version__
+except Exception:
+    _version = "unknown"
 
 
 def run_pyspark_shell(port: int):
@@ -22,12 +34,11 @@ def _run(endpoint: str, spark: SparkSession):
 
     python_version = platform.python_version()
     (build_number, build_date) = platform.python_build()
-    # Simulate the messages similar to `shell.py` in PySpark.
     banner = rf"""Welcome to
       ____              __
      / __/__  ___ _____/ /__
     _\ \/ _ \/ _ `/ __/  '_/
-   /__ / .__/\_,_/_/ /_/\_\   version {pyspark.__version__}
+   /__ / .__/\_,_/_/ /_/\_\   version {_version}
       /_/
 
 Using Python version {python_version} ({build_number}, {build_date})
