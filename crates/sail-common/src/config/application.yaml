@@ -763,6 +763,9 @@
     The duration in seconds allowed for the session to be idle.
     If the server does not receive any requests from the client after this duration,
     the session will be removed from the server.
+    A value of `-1` disables the timeout (sessions live until `spark.stop()` or driver death).
+    This is required for dbt, since models run sequentially and sessions must persist
+    between model executions within a single `dbt run` / `dbt build` invocation.
 
 - key: spark.execution_heartbeat_interval_secs
   type: number
@@ -775,10 +778,11 @@
 
 - key: flight.session_timeout_secs
   type: number
-  default: "3600"
+  default: "900"
   description: |
     The timeout in seconds for idle Flight SQL sessions.
     Sessions that have been inactive for longer than this duration will be cleaned up.
+    A value of `-1` disables the timeout (sessions live until explicit close or driver death).
   experimental: true
 
 - key: telemetry.export_traces

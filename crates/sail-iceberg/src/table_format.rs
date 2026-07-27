@@ -26,6 +26,7 @@ use datafusion_expr::{Expr, Extension, UserDefinedLogicalNodeCore};
 use educe::Educe;
 use log::warn;
 use object_store::ObjectStoreExt;
+use sail_common::retry::sleep_with_jitter;
 use sail_common_datafusion::catalog::iceberg::is_iceberg_table_marker;
 use sail_common_datafusion::catalog::managed::metadata_location_value;
 use sail_common_datafusion::catalog::{
@@ -74,7 +75,7 @@ use crate::utils::partition_transform::{
 use crate::utils::timestamp::monotonic_timestamp_ms;
 use crate::utils::{parse_absolute_url, url_to_object_path};
 
-const MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES: usize = 5;
+const MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES: usize = 3;
 
 /// Iceberg implementation of [`TableFormat`].
 #[derive(Debug, Default)]
@@ -697,41 +698,40 @@ pub(crate) async fn plan_iceberg_write(
 }
 
 impl IcebergTableFormat {
-    async fn alter_table_properties(
-        &self,
-        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
-        path: &str,
-        changes: Vec<(String, Option<String>)>,
-        if_exists: bool,
-    ) -> Result<()> {
-        let table_url = Self::parse_table_url(vec![path.to_string()]).await?;
-        let object_store = runtime_env
-            .object_store_registry
-            .get_store(&table_url)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
-
-        let initial_latest_meta = find_latest_metadata_file(&object_store, &table_url).await?;
+    async fn retry_metadata_commit<F>(
+        object_store: Arc<dyn object_store::ObjectStore>,
+        store_ctx: &StoreContext,
+        table_url: &Url,
+        initial_latest_meta: String,
+        check_post_write: bool,
+        mutate: F,
+    ) -> Result<()>
+    where
+        F: Fn(&mut TableMetadata) -> Result<()>,
+    {
         let mut attempt = 0;
         loop {
             attempt += 1;
+            if attempt > 1 {
+                sleep_with_jitter(5, attempt - 2).await;
+            }
             let latest_meta = if attempt == 1 {
                 initial_latest_meta.clone()
             } else {
-                find_latest_metadata_file(&object_store, &table_url).await?
+                find_latest_metadata_file(&object_store, table_url).await?
             };
 
             let bytes = load_metadata_file_bytes(&object_store, &latest_meta).await?;
             let mut table_meta = TableMetadata::from_json(&bytes)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            crate::properties::apply_table_property_changes(&mut table_meta, &changes, if_exists)?;
+            mutate(&mut table_meta)?;
 
             let current_version = metadata_file_version_from_path(&latest_meta).unwrap_or(0);
             let next_version = current_version + 1;
-            let existing_for_next = metadata_files_for_version(&store_ctx, next_version).await?;
+            let existing_for_next = metadata_files_for_version(store_ctx, next_version).await?;
             if !existing_for_next.is_empty() {
-                let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+                let current_ts = get_metadata_file_timestamp(store_ctx, &latest_meta).await?;
                 let has_real_conflict = existing_for_next
                     .iter()
                     .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
@@ -790,30 +790,32 @@ impl IcebergTableFormat {
                 Err(e) => return Err(DataFusionError::External(Box::new(e))),
             }
 
-            let version_files = metadata_files_for_version(&store_ctx, next_version).await?;
-            let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
-            let conflict_after_write = version_files
-                .iter()
-                .filter(|(_, ts)| !is_stale_metadata_file(*ts, current_ts))
-                .any(|(path, _)| *path != new_meta_rel);
-            if conflict_after_write {
-                log::warn!(
-                    "Concurrent Iceberg metadata writes detected for version {}: {:?}. Retrying attempt {}",
-                    next_version,
-                    version_files,
-                    attempt
-                );
-                if let Err(err) = store_ctx.prefixed.delete(&new_meta_path).await {
+            if check_post_write {
+                let version_files = metadata_files_for_version(store_ctx, next_version).await?;
+                let current_ts = get_metadata_file_timestamp(store_ctx, &latest_meta).await?;
+                let conflict_after_write = version_files
+                    .iter()
+                    .filter(|(_, ts)| !is_stale_metadata_file(*ts, current_ts))
+                    .any(|(path, _)| *path != new_meta_rel);
+                if conflict_after_write {
                     log::warn!(
-                        "Failed to delete conflicted Iceberg metadata file {}: {:?}",
-                        new_meta_rel,
-                        err
+                        "Concurrent Iceberg metadata writes detected for version {}: {:?}. Retrying attempt {}",
+                        next_version,
+                        version_files,
+                        attempt
                     );
+                    if let Err(err) = store_ctx.prefixed.delete(&new_meta_path).await {
+                        log::warn!(
+                            "Failed to delete conflicted Iceberg metadata file {}: {:?}",
+                            new_meta_rel,
+                            err
+                        );
+                    }
+                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
+                        return Err(alter_table_properties_conflict_error());
+                    }
+                    continue;
                 }
-                if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                    return Err(alter_table_properties_conflict_error());
-                }
-                continue;
             }
 
             let hint_path = object_store::path::Path::from("metadata/version-hint.text");
@@ -830,6 +832,35 @@ impl IcebergTableFormat {
         }
     }
 
+    async fn alter_table_properties(
+        &self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+        path: &str,
+        changes: Vec<(String, Option<String>)>,
+        if_exists: bool,
+    ) -> Result<()> {
+        let table_url = Self::parse_table_url(vec![path.to_string()]).await?;
+        let object_store = runtime_env
+            .object_store_registry
+            .get_store(&table_url)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
+        let initial_latest_meta = find_latest_metadata_file(&object_store, &table_url).await?;
+
+        Self::retry_metadata_commit(
+            object_store,
+            &store_ctx,
+            &table_url,
+            initial_latest_meta,
+            true,
+            |table_meta| {
+                crate::properties::apply_table_property_changes(table_meta, &changes, if_exists)?;
+                Ok(())
+            },
+        )
+        .await
+    }
+
     async fn alter_table_add_columns(
         &self,
         runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
@@ -842,149 +873,45 @@ impl IcebergTableFormat {
             .get_store(&table_url)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
-
         let initial_latest_meta = find_latest_metadata_file(&object_store, &table_url).await?;
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let latest_meta = if attempt == 1 {
-                initial_latest_meta.clone()
-            } else {
-                find_latest_metadata_file(&object_store, &table_url).await?
-            };
 
-            let bytes = load_metadata_file_bytes(&object_store, &latest_meta).await?;
-            let mut table_meta = TableMetadata::from_json(&bytes)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Self::retry_metadata_commit(
+            object_store,
+            &store_ctx,
+            &table_url,
+            initial_latest_meta,
+            true,
+            |table_meta| {
+                let current_schema = table_meta.current_schema().cloned().ok_or_else(|| {
+                    DataFusionError::Plan("No current schema in table metadata".to_string())
+                })?;
 
-            let current_schema = table_meta.current_schema().cloned().ok_or_else(|| {
-                DataFusionError::Plan("No current schema in table metadata".to_string())
-            })?;
+                let mut new_fields: Vec<std::sync::Arc<crate::spec::types::NestedField>> =
+                    current_schema.fields().to_vec();
+                let mut next_id = table_meta.last_column_id + 1;
 
-            let mut new_fields: Vec<std::sync::Arc<crate::spec::types::NestedField>> =
-                current_schema.fields().to_vec();
-            let mut next_id = table_meta.last_column_id + 1;
-
-            for col in &columns {
-                let iceberg_type = arrow_type_to_iceberg(&col.data_type)?;
-                let field =
-                    crate::spec::types::NestedField::optional(next_id, &col.name, iceberg_type);
-                new_fields.push(std::sync::Arc::new(field));
-                next_id += 1;
-            }
-            let new_schema_id = next_schema_id(&table_meta);
-
-            let new_schema = crate::spec::Schema::builder()
-                .with_schema_id(new_schema_id)
-                .with_fields(new_fields)
-                .build()
-                .map_err(|e| DataFusionError::Plan(format!("Schema build error: {e}")))?;
-
-            table_meta.last_column_id = next_id - 1;
-            table_meta.schemas.push(new_schema.clone());
-            table_meta.current_schema_id = new_schema_id;
-
-            let current_version = metadata_file_version_from_path(&latest_meta).unwrap_or(0);
-            let next_version = current_version + 1;
-            let existing_for_next = metadata_files_for_version(&store_ctx, next_version).await?;
-            if !existing_for_next.is_empty() {
-                let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
-                let has_real_conflict = existing_for_next
-                    .iter()
-                    .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
-                if has_real_conflict {
-                    log::warn!(
-                        "Detected existing Iceberg metadata files for version {}: {:?}. Retrying attempt {}",
-                        next_version,
-                        existing_for_next,
-                        attempt
-                    );
-                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                        return Err(alter_table_properties_conflict_error());
-                    }
-                    continue;
+                for col in columns.iter() {
+                    let iceberg_type = arrow_type_to_iceberg(&col.data_type)?;
+                    let field =
+                        crate::spec::types::NestedField::optional(next_id, &col.name, iceberg_type);
+                    new_fields.push(std::sync::Arc::new(field));
+                    next_id += 1;
                 }
-            }
+                let new_schema_id = next_schema_id(table_meta);
 
-            let timestamp_ms = monotonic_timestamp_ms();
-            table_meta.last_updated_ms = timestamp_ms;
-            table_meta.metadata_log.push(MetadataLog {
-                timestamp_ms,
-                metadata_file: latest_meta.clone(),
-            });
+                let new_schema = crate::spec::Schema::builder()
+                    .with_schema_id(new_schema_id)
+                    .with_fields(new_fields)
+                    .build()
+                    .map_err(|e| DataFusionError::Plan(format!("Schema build error: {e}")))?;
 
-            let new_meta_bytes = table_meta
-                .to_json()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let file_extension = metadata_file_extension_from_properties(&table_meta.properties)?;
-            let new_meta_rel = format!("metadata/v{next_version}{file_extension}");
-            let new_meta_bytes = encode_metadata_file(&new_meta_rel, &new_meta_bytes)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let new_meta_path = object_store::path::Path::from(new_meta_rel.as_str());
-            let put_opts = object_store::PutOptions {
-                mode: object_store::PutMode::Create,
-                ..Default::default()
-            };
-            let payload = object_store::PutPayload::from(Bytes::from(new_meta_bytes));
-            match store_ctx
-                .prefixed
-                .put_opts(&new_meta_path, payload, put_opts)
-                .await
-            {
-                Ok(_) => {}
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    log::warn!(
-                        "Iceberg metadata file {} already exists for version {}. Retrying attempt {}",
-                        new_meta_rel,
-                        next_version,
-                        attempt
-                    );
-                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                        return Err(alter_table_properties_conflict_error());
-                    }
-                    continue;
-                }
-                Err(e) => return Err(DataFusionError::External(Box::new(e))),
-            }
-
-            let version_files = metadata_files_for_version(&store_ctx, next_version).await?;
-            let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
-            let conflict_after_write = version_files
-                .iter()
-                .filter(|(_, ts)| !is_stale_metadata_file(*ts, current_ts))
-                .any(|(path, _)| *path != new_meta_rel);
-            if conflict_after_write {
-                log::warn!(
-                    "Concurrent Iceberg metadata writes detected for version {}: {:?}. Retrying attempt {}",
-                    next_version,
-                    version_files,
-                    attempt
-                );
-                if let Err(err) = store_ctx.prefixed.delete(&new_meta_path).await {
-                    log::warn!(
-                        "Failed to delete conflicted Iceberg metadata file {}: {:?}",
-                        new_meta_rel,
-                        err
-                    );
-                }
-                if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                    return Err(alter_table_properties_conflict_error());
-                }
-                continue;
-            }
-
-            let hint_path = object_store::path::Path::from("metadata/version-hint.text");
-            store_ctx
-                .prefixed
-                .put(
-                    &hint_path,
-                    object_store::PutPayload::from(Bytes::from(next_version.to_string())),
-                )
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-            return Ok(());
-        }
+                table_meta.last_column_id = next_id - 1;
+                table_meta.schemas.push(new_schema.clone());
+                table_meta.current_schema_id = new_schema_id;
+                Ok(())
+            },
+        )
+        .await
     }
 
     async fn alter_table_drop_columns(
@@ -1000,120 +927,52 @@ impl IcebergTableFormat {
             .get_store(&table_url)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
-
         let initial_latest_meta = find_latest_metadata_file(&object_store, &table_url).await?;
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let latest_meta = if attempt == 1 {
-                initial_latest_meta.clone()
-            } else {
-                find_latest_metadata_file(&object_store, &table_url).await?
-            };
 
-            let bytes = load_metadata_file_bytes(&object_store, &latest_meta).await?;
-            let mut table_meta = TableMetadata::from_json(&bytes)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Self::retry_metadata_commit(
+            object_store,
+            &store_ctx,
+            &table_url,
+            initial_latest_meta,
+            true,
+            |table_meta| {
+                let current_schema = table_meta.current_schema().cloned().ok_or_else(|| {
+                    DataFusionError::Plan("No current schema in table metadata".to_string())
+                })?;
 
-            let current_schema = table_meta.current_schema().cloned().ok_or_else(|| {
-                DataFusionError::Plan("No current schema in table metadata".to_string())
-            })?;
-
-            let mut new_fields: Vec<std::sync::Arc<crate::spec::types::NestedField>> =
-                current_schema.fields().to_vec();
-            for name in &names {
-                let pos = new_fields.iter().position(|f| f.name == *name);
-                match pos {
-                    Some(idx) => {
-                        new_fields.remove(idx);
-                    }
-                    None => {
-                        if !if_exists {
-                            return Err(DataFusionError::Plan(format!(
-                                "Column '{}' not found in Iceberg table schema",
-                                name
-                            )));
+                let mut new_fields: Vec<std::sync::Arc<crate::spec::types::NestedField>> =
+                    current_schema.fields().to_vec();
+                for name in &names {
+                    let pos = new_fields.iter().position(|f| f.name == *name);
+                    match pos {
+                        Some(idx) => {
+                            new_fields.remove(idx);
+                        }
+                        None => {
+                            if !if_exists {
+                                return Err(DataFusionError::Plan(format!(
+                                    "Column '{}' not found in Iceberg table schema",
+                                    name
+                                )));
+                            }
                         }
                     }
                 }
-            }
 
-            let new_schema_id = next_schema_id(&table_meta);
+                let new_schema_id = next_schema_id(table_meta);
 
-            let new_schema = crate::spec::Schema::builder()
-                .with_schema_id(new_schema_id)
-                .with_fields(new_fields)
-                .build()
-                .map_err(|e| DataFusionError::Plan(format!("Schema build error: {e}")))?;
+                let new_schema = crate::spec::Schema::builder()
+                    .with_schema_id(new_schema_id)
+                    .with_fields(new_fields)
+                    .build()
+                    .map_err(|e| DataFusionError::Plan(format!("Schema build error: {e}")))?;
 
-            table_meta.schemas.push(new_schema.clone());
-            table_meta.current_schema_id = new_schema_id;
-
-            let current_version = metadata_file_version_from_path(&latest_meta).unwrap_or(0);
-            let next_version = current_version + 1;
-
-            // Same retry + write pattern as alter_table_add_columns
-            let existing_for_next = metadata_files_for_version(&store_ctx, next_version).await?;
-            if !existing_for_next.is_empty() {
-                let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
-                let has_real_conflict = existing_for_next
-                    .iter()
-                    .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
-                if has_real_conflict {
-                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                        return Err(alter_table_properties_conflict_error());
-                    }
-                    continue;
-                }
-            }
-
-            let timestamp_ms = monotonic_timestamp_ms();
-            table_meta.last_updated_ms = timestamp_ms;
-            table_meta.metadata_log.push(MetadataLog {
-                timestamp_ms,
-                metadata_file: latest_meta.clone(),
-            });
-
-            let new_meta_bytes = table_meta
-                .to_json()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let file_extension = metadata_file_extension_from_properties(&table_meta.properties)?;
-            let new_meta_rel = format!("metadata/v{next_version}{file_extension}");
-            let new_meta_bytes = encode_metadata_file(&new_meta_rel, &new_meta_bytes)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let new_meta_path = object_store::path::Path::from(new_meta_rel.as_str());
-            let put_opts = object_store::PutOptions {
-                mode: object_store::PutMode::Create,
-                ..Default::default()
-            };
-            let payload = object_store::PutPayload::from(Bytes::from(new_meta_bytes));
-            match store_ctx
-                .prefixed
-                .put_opts(&new_meta_path, payload, put_opts)
-                .await
-            {
-                Ok(_) => {}
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                        return Err(alter_table_properties_conflict_error());
-                    }
-                    continue;
-                }
-                Err(e) => return Err(DataFusionError::External(Box::new(e))),
-            }
-
-            let hint_path = object_store::path::Path::from("metadata/version-hint.text");
-            store_ctx
-                .prefixed
-                .put(
-                    &hint_path,
-                    object_store::PutPayload::from(Bytes::from(next_version.to_string())),
-                )
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-            return Ok(());
-        }
+                table_meta.schemas.push(new_schema.clone());
+                table_meta.current_schema_id = new_schema_id;
+                Ok(())
+            },
+        )
+        .await
     }
 
     async fn alter_table_column_comment(
@@ -1131,107 +990,53 @@ impl IcebergTableFormat {
         let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
         let column_name = column_path
             .last()
-            .ok_or_else(|| DataFusionError::Plan("empty column path".to_string()))?;
+            .ok_or_else(|| DataFusionError::Plan("empty column path".to_string()))?
+            .clone();
         let initial_latest_meta = find_latest_metadata_file(&object_store, &table_url).await?;
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let latest_meta = if attempt == 1 {
-                initial_latest_meta.clone()
-            } else {
-                find_latest_metadata_file(&object_store, &table_url).await?
-            };
-            let bytes = load_metadata_file_bytes(&object_store, &latest_meta).await?;
-            let mut table_meta = TableMetadata::from_json(&bytes)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let current_schema = table_meta.current_schema().cloned().ok_or_else(|| {
-                DataFusionError::Plan("No current schema in table metadata".to_string())
-            })?;
-            let mut new_fields: Vec<std::sync::Arc<crate::spec::types::NestedField>> =
-                current_schema.fields().to_vec();
-            let pos = new_fields.iter().position(|f| f.name == *column_name);
-            match pos {
-                Some(idx) => {
-                    let old = &new_fields[idx];
-                    new_fields[idx] = std::sync::Arc::new(crate::spec::types::NestedField {
-                        doc: comment.clone(),
-                        ..(**old).clone()
-                    });
-                }
-                None => {
-                    return Err(DataFusionError::Plan(format!(
-                        "Column '{}' not found in Iceberg table schema",
-                        column_name
-                    )));
-                }
-            }
-            let new_schema_id = next_schema_id(&table_meta);
-            let new_schema = crate::spec::Schema::builder()
-                .with_schema_id(new_schema_id)
-                .with_fields(new_fields)
-                .build()
-                .map_err(|e| DataFusionError::Plan(format!("Schema build error: {e}")))?;
-            table_meta.schemas.push(new_schema.clone());
-            table_meta.current_schema_id = new_schema_id;
-            let current_version = metadata_file_version_from_path(&latest_meta).unwrap_or(0);
-            let next_version = current_version + 1;
-            let existing_for_next = metadata_files_for_version(&store_ctx, next_version).await?;
-            if !existing_for_next.is_empty() {
-                let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
-                let has_real_conflict = existing_for_next
-                    .iter()
-                    .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
-                if has_real_conflict {
-                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                        return Err(alter_table_properties_conflict_error());
+
+        Self::retry_metadata_commit(
+            object_store,
+            &store_ctx,
+            &table_url,
+            initial_latest_meta,
+            true,
+            |table_meta| {
+                let current_schema = table_meta.current_schema().cloned().ok_or_else(|| {
+                    DataFusionError::Plan("No current schema in table metadata".to_string())
+                })?;
+
+                let mut new_fields: Vec<std::sync::Arc<crate::spec::types::NestedField>> =
+                    current_schema.fields().to_vec();
+                let pos = new_fields.iter().position(|f| f.name == column_name);
+                match pos {
+                    Some(idx) => {
+                        let old = &new_fields[idx];
+                        new_fields[idx] = std::sync::Arc::new(crate::spec::types::NestedField {
+                            doc: comment.clone(),
+                            ..(**old).clone()
+                        });
                     }
-                    continue;
-                }
-            }
-            let timestamp_ms = monotonic_timestamp_ms();
-            table_meta.last_updated_ms = timestamp_ms;
-            table_meta.metadata_log.push(MetadataLog {
-                timestamp_ms,
-                metadata_file: latest_meta.clone(),
-            });
-            let new_meta_bytes = table_meta
-                .to_json()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let file_extension = metadata_file_extension_from_properties(&table_meta.properties)?;
-            let new_meta_rel = format!("metadata/v{next_version}{file_extension}");
-            let new_meta_bytes = encode_metadata_file(&new_meta_rel, &new_meta_bytes)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let new_meta_path = object_store::path::Path::from(new_meta_rel.as_str());
-            let put_opts = object_store::PutOptions {
-                mode: object_store::PutMode::Create,
-                ..Default::default()
-            };
-            let payload = object_store::PutPayload::from(Bytes::from(new_meta_bytes));
-            match store_ctx
-                .prefixed
-                .put_opts(&new_meta_path, payload, put_opts)
-                .await
-            {
-                Ok(_) => {}
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                        return Err(alter_table_properties_conflict_error());
+                    None => {
+                        return Err(DataFusionError::Plan(format!(
+                            "Column '{}' not found in Iceberg table schema",
+                            column_name
+                        )));
                     }
-                    continue;
                 }
-                Err(e) => return Err(DataFusionError::External(Box::new(e))),
-            }
-            let hint_path = object_store::path::Path::from("metadata/version-hint.text");
-            store_ctx
-                .prefixed
-                .put(
-                    &hint_path,
-                    object_store::PutPayload::from(Bytes::from(next_version.to_string())),
-                )
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            return Ok(());
-        }
+
+                let new_schema_id = next_schema_id(table_meta);
+                let new_schema = crate::spec::Schema::builder()
+                    .with_schema_id(new_schema_id)
+                    .with_fields(new_fields)
+                    .build()
+                    .map_err(|e| DataFusionError::Plan(format!("Schema build error: {e}")))?;
+
+                table_meta.schemas.push(new_schema.clone());
+                table_meta.current_schema_id = new_schema_id;
+                Ok(())
+            },
+        )
+        .await
     }
 
     async fn alter_table_column_nullability(
@@ -1249,107 +1054,53 @@ impl IcebergTableFormat {
         let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
         let column_name = column_path
             .last()
-            .ok_or_else(|| DataFusionError::Plan("empty column path".to_string()))?;
+            .ok_or_else(|| DataFusionError::Plan("empty column path".to_string()))?
+            .clone();
         let initial_latest_meta = find_latest_metadata_file(&object_store, &table_url).await?;
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let latest_meta = if attempt == 1 {
-                initial_latest_meta.clone()
-            } else {
-                find_latest_metadata_file(&object_store, &table_url).await?
-            };
-            let bytes = load_metadata_file_bytes(&object_store, &latest_meta).await?;
-            let mut table_meta = TableMetadata::from_json(&bytes)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let current_schema = table_meta.current_schema().cloned().ok_or_else(|| {
-                DataFusionError::Plan("No current schema in table metadata".to_string())
-            })?;
-            let mut new_fields: Vec<std::sync::Arc<crate::spec::types::NestedField>> =
-                current_schema.fields().to_vec();
-            let pos = new_fields.iter().position(|f| f.name == *column_name);
-            match pos {
-                Some(idx) => {
-                    let old = &new_fields[idx];
-                    new_fields[idx] = std::sync::Arc::new(crate::spec::types::NestedField {
-                        required: !nullable,
-                        ..(**old).clone()
-                    });
-                }
-                None => {
-                    return Err(DataFusionError::Plan(format!(
-                        "Column '{}' not found in Iceberg table schema",
-                        column_name
-                    )));
-                }
-            }
-            let new_schema_id = next_schema_id(&table_meta);
-            let new_schema = crate::spec::Schema::builder()
-                .with_schema_id(new_schema_id)
-                .with_fields(new_fields)
-                .build()
-                .map_err(|e| DataFusionError::Plan(format!("Schema build error: {e}")))?;
-            table_meta.schemas.push(new_schema.clone());
-            table_meta.current_schema_id = new_schema_id;
-            let current_version = metadata_file_version_from_path(&latest_meta).unwrap_or(0);
-            let next_version = current_version + 1;
-            let existing_for_next = metadata_files_for_version(&store_ctx, next_version).await?;
-            if !existing_for_next.is_empty() {
-                let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
-                let has_real_conflict = existing_for_next
-                    .iter()
-                    .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
-                if has_real_conflict {
-                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                        return Err(alter_table_properties_conflict_error());
+
+        Self::retry_metadata_commit(
+            object_store,
+            &store_ctx,
+            &table_url,
+            initial_latest_meta,
+            true,
+            |table_meta| {
+                let current_schema = table_meta.current_schema().cloned().ok_or_else(|| {
+                    DataFusionError::Plan("No current schema in table metadata".to_string())
+                })?;
+
+                let mut new_fields: Vec<std::sync::Arc<crate::spec::types::NestedField>> =
+                    current_schema.fields().to_vec();
+                let pos = new_fields.iter().position(|f| f.name == column_name);
+                match pos {
+                    Some(idx) => {
+                        let old = &new_fields[idx];
+                        new_fields[idx] = std::sync::Arc::new(crate::spec::types::NestedField {
+                            required: !nullable,
+                            ..(**old).clone()
+                        });
                     }
-                    continue;
-                }
-            }
-            let timestamp_ms = monotonic_timestamp_ms();
-            table_meta.last_updated_ms = timestamp_ms;
-            table_meta.metadata_log.push(MetadataLog {
-                timestamp_ms,
-                metadata_file: latest_meta.clone(),
-            });
-            let new_meta_bytes = table_meta
-                .to_json()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let file_extension = metadata_file_extension_from_properties(&table_meta.properties)?;
-            let new_meta_rel = format!("metadata/v{next_version}{file_extension}");
-            let new_meta_bytes = encode_metadata_file(&new_meta_rel, &new_meta_bytes)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let new_meta_path = object_store::path::Path::from(new_meta_rel.as_str());
-            let put_opts = object_store::PutOptions {
-                mode: object_store::PutMode::Create,
-                ..Default::default()
-            };
-            let payload = object_store::PutPayload::from(Bytes::from(new_meta_bytes));
-            match store_ctx
-                .prefixed
-                .put_opts(&new_meta_path, payload, put_opts)
-                .await
-            {
-                Ok(_) => {}
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                        return Err(alter_table_properties_conflict_error());
+                    None => {
+                        return Err(DataFusionError::Plan(format!(
+                            "Column '{}' not found in Iceberg table schema",
+                            column_name
+                        )));
                     }
-                    continue;
                 }
-                Err(e) => return Err(DataFusionError::External(Box::new(e))),
-            }
-            let hint_path = object_store::path::Path::from("metadata/version-hint.text");
-            store_ctx
-                .prefixed
-                .put(
-                    &hint_path,
-                    object_store::PutPayload::from(Bytes::from(next_version.to_string())),
-                )
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            return Ok(());
-        }
+
+                let new_schema_id = next_schema_id(table_meta);
+                let new_schema = crate::spec::Schema::builder()
+                    .with_schema_id(new_schema_id)
+                    .with_fields(new_fields)
+                    .build()
+                    .map_err(|e| DataFusionError::Plan(format!("Schema build error: {e}")))?;
+
+                table_meta.schemas.push(new_schema.clone());
+                table_meta.current_schema_id = new_schema_id;
+                Ok(())
+            },
+        )
+        .await
     }
 
     async fn alter_table_column_position(
@@ -1367,125 +1118,71 @@ impl IcebergTableFormat {
         let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
         let column_name = column_path
             .last()
-            .ok_or_else(|| DataFusionError::Plan("empty column path".to_string()))?;
+            .ok_or_else(|| DataFusionError::Plan("empty column path".to_string()))?
+            .clone();
+        let position = position.clone();
         let initial_latest_meta = find_latest_metadata_file(&object_store, &table_url).await?;
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let latest_meta = if attempt == 1 {
-                initial_latest_meta.clone()
-            } else {
-                find_latest_metadata_file(&object_store, &table_url).await?
-            };
-            let bytes = load_metadata_file_bytes(&object_store, &latest_meta).await?;
-            let mut table_meta = TableMetadata::from_json(&bytes)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let current_schema = table_meta.current_schema().cloned().ok_or_else(|| {
-                DataFusionError::Plan("No current schema in table metadata".to_string())
-            })?;
-            let mut new_fields: Vec<std::sync::Arc<crate::spec::types::NestedField>> =
-                current_schema.fields().to_vec();
-            let pos = new_fields.iter().position(|f| f.name == *column_name);
-            let idx = match pos {
-                Some(idx) => idx,
-                None => {
-                    return Err(DataFusionError::Plan(format!(
-                        "Column '{}' not found in Iceberg table schema",
-                        column_name
-                    )));
-                }
-            };
-            let field = new_fields.remove(idx);
-            match position {
-                sail_common::spec::ColumnPosition::First => {
-                    new_fields.insert(0, field);
-                }
-                sail_common::spec::ColumnPosition::After(after_name) => {
-                    let after_name_parts: Vec<String> = after_name.clone().into();
-                    let after_name_str = after_name_parts.join(".");
-                    let after_pos = new_fields.iter().position(|f| {
-                        f.name == after_name_parts.last().map(|s| s.as_str()).unwrap_or("")
-                    });
-                    match after_pos {
-                        Some(after_idx) => {
-                            new_fields.insert(after_idx + 1, field);
-                        }
-                        None => {
-                            return Err(DataFusionError::Plan(format!(
-                                "Target column '{}' not found for AFTER position",
-                                after_name_str
-                            )));
+
+        Self::retry_metadata_commit(
+            object_store,
+            &store_ctx,
+            &table_url,
+            initial_latest_meta,
+            true,
+            |table_meta| {
+                let current_schema = table_meta.current_schema().cloned().ok_or_else(|| {
+                    DataFusionError::Plan("No current schema in table metadata".to_string())
+                })?;
+
+                let mut new_fields: Vec<std::sync::Arc<crate::spec::types::NestedField>> =
+                    current_schema.fields().to_vec();
+                let pos = new_fields.iter().position(|f| f.name == column_name);
+                let idx = match pos {
+                    Some(idx) => idx,
+                    None => {
+                        return Err(DataFusionError::Plan(format!(
+                            "Column '{}' not found in Iceberg table schema",
+                            column_name
+                        )));
+                    }
+                };
+                let field = new_fields.remove(idx);
+                match &position {
+                    sail_common::spec::ColumnPosition::First => {
+                        new_fields.insert(0, field);
+                    }
+                    sail_common::spec::ColumnPosition::After(after_name) => {
+                        let after_name_parts: Vec<String> = after_name.clone().into();
+                        let after_pos = new_fields.iter().position(|f| {
+                            f.name == after_name_parts.last().map(|s| s.as_str()).unwrap_or("")
+                        });
+                        match after_pos {
+                            Some(after_idx) => {
+                                new_fields.insert(after_idx + 1, field);
+                            }
+                            None => {
+                                return Err(DataFusionError::Plan(format!(
+                                    "Target column '{}' not found for AFTER position",
+                                    after_name_parts.join(".")
+                                )));
+                            }
                         }
                     }
                 }
-            }
-            let new_schema_id = next_schema_id(&table_meta);
-            let new_schema = crate::spec::Schema::builder()
-                .with_schema_id(new_schema_id)
-                .with_fields(new_fields)
-                .build()
-                .map_err(|e| DataFusionError::Plan(format!("Schema build error: {e}")))?;
-            table_meta.schemas.push(new_schema.clone());
-            table_meta.current_schema_id = new_schema_id;
-            let current_version = metadata_file_version_from_path(&latest_meta).unwrap_or(0);
-            let next_version = current_version + 1;
-            let existing_for_next = metadata_files_for_version(&store_ctx, next_version).await?;
-            if !existing_for_next.is_empty() {
-                let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
-                let has_real_conflict = existing_for_next
-                    .iter()
-                    .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
-                if has_real_conflict {
-                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                        return Err(alter_table_properties_conflict_error());
-                    }
-                    continue;
-                }
-            }
-            let timestamp_ms = monotonic_timestamp_ms();
-            table_meta.last_updated_ms = timestamp_ms;
-            table_meta.metadata_log.push(MetadataLog {
-                timestamp_ms,
-                metadata_file: latest_meta.clone(),
-            });
-            let new_meta_bytes = table_meta
-                .to_json()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let file_extension = metadata_file_extension_from_properties(&table_meta.properties)?;
-            let new_meta_rel = format!("metadata/v{next_version}{file_extension}");
-            let new_meta_bytes = encode_metadata_file(&new_meta_rel, &new_meta_bytes)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let new_meta_path = object_store::path::Path::from(new_meta_rel.as_str());
-            let put_opts = object_store::PutOptions {
-                mode: object_store::PutMode::Create,
-                ..Default::default()
-            };
-            let payload = object_store::PutPayload::from(Bytes::from(new_meta_bytes));
-            match store_ctx
-                .prefixed
-                .put_opts(&new_meta_path, payload, put_opts)
-                .await
-            {
-                Ok(_) => {}
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                        return Err(alter_table_properties_conflict_error());
-                    }
-                    continue;
-                }
-                Err(e) => return Err(DataFusionError::External(Box::new(e))),
-            }
-            let hint_path = object_store::path::Path::from("metadata/version-hint.text");
-            store_ctx
-                .prefixed
-                .put(
-                    &hint_path,
-                    object_store::PutPayload::from(Bytes::from(next_version.to_string())),
-                )
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            return Ok(());
-        }
+
+                let new_schema_id = next_schema_id(table_meta);
+                let new_schema = crate::spec::Schema::builder()
+                    .with_schema_id(new_schema_id)
+                    .with_fields(new_fields)
+                    .build()
+                    .map_err(|e| DataFusionError::Plan(format!("Schema build error: {e}")))?;
+
+                table_meta.schemas.push(new_schema.clone());
+                table_meta.current_schema_id = new_schema_id;
+                Ok(())
+            },
+        )
+        .await
     }
 }
 

@@ -22,10 +22,12 @@ sail-flight = { path = "../sail-flight" }
 sail-telemetry = { path = "../sail-telemetry" }
 sail-spark-connect = { path = "../sail-spark-connect" }
 sail-session = { path = "../sail-session" }
+sail-rest-service = { path = "../sail-rest-service" }
 
 mimalloc = { workspace = true, optional = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
 pyo3 = { workspace = true }
+axum = { workspace = true }
 rustls = { workspace = true }

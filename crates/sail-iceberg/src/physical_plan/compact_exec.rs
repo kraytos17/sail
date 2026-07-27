@@ -17,6 +17,7 @@ use datafusion::physical_plan::{
 use datafusion_common::{DataFusionError, Result};
 use futures::stream::once;
 use object_store::ObjectStoreExt;
+use sail_common::retry::sleep_with_jitter;
 use sail_common_datafusion::catalog::LakehouseExecutionContext;
 
 use crate::catalog_support::commit_helper::{CommitResult, commit_iceberg_changes};
@@ -37,7 +38,7 @@ use crate::utils::metadata::{
     get_metadata_file_timestamp, is_stale_metadata_file, metadata_files_for_version,
 };
 
-const MAX_COMMIT_RETRIES: usize = 5;
+const MAX_COMMIT_RETRIES: usize = 3;
 const DEFAULT_TARGET_FILE_SIZE: u64 = 128 * 1024 * 1024; // 128 MB
 const SMALL_FILE_THRESHOLD: f64 = 0.75; // Files below 75% of target are candidates
 
@@ -294,6 +295,9 @@ pub(crate) async fn run_compaction(
     let mut attempt = 0;
     loop {
         attempt += 1;
+        if attempt > 1 {
+            sleep_with_jitter(5, attempt - 2).await;
+        }
         let current_latest = if attempt == 1 {
             latest_meta.clone()
         } else {

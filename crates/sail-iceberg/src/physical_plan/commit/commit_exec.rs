@@ -29,6 +29,7 @@ use datafusion_common::{DataFusionError, Result, internal_err};
 use futures::StreamExt;
 use futures::stream::once;
 use object_store::ObjectStoreExt;
+use sail_common::retry::sleep_with_jitter;
 use sail_common_datafusion::catalog::LakehouseExecutionContext;
 use url::Url;
 
@@ -65,7 +66,7 @@ use crate::utils::metadata::{
     get_metadata_file_timestamp, is_stale_metadata_file, metadata_files_for_version,
 };
 use crate::utils::timestamp::monotonic_timestamp_ms;
-const MAX_COMMIT_RETRIES: usize = 5;
+const MAX_COMMIT_RETRIES: usize = 3;
 
 #[derive(Debug)]
 pub struct IcebergCommitExec {
@@ -746,6 +747,7 @@ impl ExecutionPlan for IcebergCommitExec {
                                 if attempt >= MAX_COMMIT_RETRIES {
                                     return Err(commit_conflict_error());
                                 }
+                                sleep_with_jitter(5, attempt - 1).await;
                                 continue;
                             }
                         }
@@ -829,6 +831,7 @@ impl ExecutionPlan for IcebergCommitExec {
                         if attempt >= MAX_COMMIT_RETRIES {
                             return Err(commit_conflict_error());
                         }
+                        sleep_with_jitter(5, attempt - 1).await;
                         continue;
                     }
                 }
@@ -962,6 +965,7 @@ impl ExecutionPlan for IcebergCommitExec {
                             if attempt >= MAX_COMMIT_RETRIES {
                                 return Err(commit_conflict_error());
                             }
+                            sleep_with_jitter(5, attempt - 1).await;
                             continue;
                         }
                     }
@@ -1078,6 +1082,7 @@ impl ExecutionPlan for IcebergCommitExec {
                         if attempt >= MAX_COMMIT_RETRIES {
                             return Err(commit_conflict_error());
                         }
+                        sleep_with_jitter(5, attempt - 1).await;
                         continue;
                     }
                     Err(e) => return Err(DataFusionError::External(Box::new(e))),
@@ -1105,6 +1110,7 @@ impl ExecutionPlan for IcebergCommitExec {
                     if attempt >= MAX_COMMIT_RETRIES {
                         return Err(commit_conflict_error());
                     }
+                    sleep_with_jitter(5, attempt - 1).await;
                     continue;
                 }
                 log::trace!("Metadata written successfully");

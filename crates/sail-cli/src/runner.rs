@@ -4,7 +4,8 @@ use sail_common::error::CommonError;
 use crate::flight::run_flight_server;
 use crate::spark::run::run_pyspark_script;
 use crate::spark::{
-    McpSettings, McpTransport, run_pyspark_shell, run_spark_connect_server, run_spark_mcp_server,
+    McpSettings, McpTransport, run_pyspark_shell, run_rest_server, run_spark_connect_server,
+    run_spark_mcp_server,
 };
 use crate::worker::run_worker;
 
@@ -122,6 +123,21 @@ enum SparkCommand {
         )]
         directory: Option<String>,
     },
+    #[command(about = "Start the REST server (replaces engine/dbt API)")]
+    RestServer {
+        #[arg(
+            long,
+            default_value = "127.0.0.1",
+            help = "The IP address that the server binds to"
+        )]
+        ip: String,
+        #[arg(
+            long,
+            default_value_t = 38119,
+            help = "The port number that the server listens on"
+        )]
+        port: u16,
+    },
 }
 
 pub fn main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -179,6 +195,7 @@ pub fn main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                     spark_remote,
                 )
             }
+            SparkCommand::RestServer { ip, port } => run_rest_server(ip.parse()?, port),
         },
         Command::Flight(command) => match command {
             FlightCommand::Server {

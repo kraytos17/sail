@@ -18,6 +18,7 @@ pub struct WorkerPool {
     worker_manager: Arc<dyn WorkerManager>,
     workers: IndexMap<WorkerId, WorkerDescriptor>,
     worker_id_generator: IdGenerator<WorkerId>,
+    consecutive_worker_failures: u32,
 }
 
 impl WorkerPool {
@@ -28,6 +29,7 @@ impl WorkerPool {
             worker_manager,
             workers: IndexMap::new(),
             worker_id_generator: IdGenerator::new(),
+            consecutive_worker_failures: 0,
         }
     }
 }

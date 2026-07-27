@@ -7602,6 +7602,7 @@ dependencies = [
 name = "sail-cli"
 version = "0.6.5"
 dependencies = [
+ "axum",
  "clap",
  "log",
  "mimalloc",
@@ -7611,6 +7612,7 @@ dependencies = [
  "sail-common",
  "sail-execution",
  "sail-flight",
+ "sail-rest-service",
  "sail-session",
  "sail-spark-connect",
  "sail-telemetry",
@@ -7630,6 +7632,7 @@ dependencies = [
  "iana-time-zone",
  "num-traits",
  "num_enum",
+ "rand 0.10.1",
  "secrecy",
  "serde",
  "serde_json",
@@ -8117,6 +8120,29 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "sail-rest-service"
+version = "0.6.5"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "axum",
+ "chrono",
+ "datafusion",
+ "futures",
+ "log",
+ "sail-common",
+ "sail-common-datafusion",
+ "sail-plan",
+ "sail-server",
+ "sail-session",
+ "sail-sql-analyzer",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

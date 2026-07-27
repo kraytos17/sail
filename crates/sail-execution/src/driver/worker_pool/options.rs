@@ -17,6 +17,11 @@ pub struct WorkerPoolOptions {
     pub task_stream_buffer: usize,
     pub task_stream_creation_timeout: Duration,
     pub rpc_retry_strategy: RetryStrategy,
+    /// The maximum number of consecutive worker launch failures before the
+    /// driver stops launching replacement workers. When this threshold is
+    /// reached, the driver logs an error and lets pending tasks fail with
+    /// a scheduling timeout instead of looping forever.
+    pub max_consecutive_failures: u32,
 }
 
 impl From<&DriverOptions> for WorkerPoolOptions {
@@ -32,6 +37,7 @@ impl From<&DriverOptions> for WorkerPoolOptions {
             task_stream_buffer: options.task_stream_buffer,
             task_stream_creation_timeout: options.task_stream_creation_timeout,
             rpc_retry_strategy: options.rpc_retry_strategy.clone(),
+            max_consecutive_failures: 4,
         }
     }
 }

@@ -97,7 +97,14 @@ impl DriverActor {
     ) -> ActorAction {
         if self.worker_pool.fail_worker_if_pending(worker_id) {
             self.task_assigner.track_worker_failed_to_start();
-            self.scale_up_workers(ctx);
+            if self.worker_pool.max_consecutive_failures_exceeded() {
+                warn!(
+                    "stopping worker replacement after {} consecutive launch failures",
+                    self.worker_pool.consecutive_failures()
+                );
+            } else {
+                self.scale_up_workers(ctx);
+            }
         }
         ActorAction::Continue
     }

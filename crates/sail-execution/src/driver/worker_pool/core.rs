@@ -109,6 +109,7 @@ impl WorkerPool {
         };
         match worker.state {
             WorkerState::Pending => {
+                self.consecutive_worker_failures = 0;
                 worker.state = WorkerState::Running {
                     host,
                     port,
@@ -241,10 +242,19 @@ impl WorkerPool {
             let message = "worker registration timeout".to_string();
             worker.state = WorkerState::Failed;
             worker.messages.push(message);
+            self.consecutive_worker_failures = self.consecutive_worker_failures.saturating_add(1);
             true
         } else {
             false
         }
+    }
+
+    pub fn max_consecutive_failures_exceeded(&self) -> bool {
+        self.consecutive_worker_failures >= self.options.max_consecutive_failures
+    }
+
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_worker_failures
     }
 
     pub fn get_worker_last_update(&mut self, worker_id: WorkerId) -> Option<Instant> {

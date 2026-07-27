@@ -72,6 +72,58 @@ spec:
       port: 50051
       targetPort: 50051
 ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sail-rest-server
+  namespace: sail
+  labels:
+    app.kubernetes.io/name: sail
+    app.kubernetes.io/component: rest-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sail
+      app.kubernetes.io/component: rest-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sail
+        app.kubernetes.io/component: rest-server
+    spec:
+      serviceAccountName: sail-user
+      containers:
+        - name: server
+          image: sail:latest
+          command: ["sail"]
+          args: ["spark", "rest-server", "--ip", "0.0.0.0", "--port", "48119"]
+          ports:
+            - containerPort: 48119
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: SAIL_MODE
+              value: "kubernetes-cluster"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sail-rest-server
+  namespace: sail
+  labels:
+    app.kubernetes.io/name: sail
+    app.kubernetes.io/component: rest-server
+spec:
+  selector:
+    app.kubernetes.io/name: sail
+    app.kubernetes.io/component: rest-server
+  ports:
+    - protocol: TCP
+      port: 48119
+      targetPort: 48119
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

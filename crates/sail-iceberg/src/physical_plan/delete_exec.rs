@@ -19,6 +19,7 @@ use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::Expr;
 use futures::stream::once;
 use object_store::ObjectStoreExt;
+use sail_common::retry::sleep_with_jitter;
 use sail_common_datafusion::catalog::LakehouseExecutionContext;
 use sail_common_datafusion::logical_expr::ExprWithSource;
 
@@ -42,7 +43,7 @@ use crate::utils::metadata::{
     get_metadata_file_timestamp, is_stale_metadata_file, metadata_files_for_version,
 };
 
-const MAX_COMMIT_RETRIES: usize = 5;
+const MAX_COMMIT_RETRIES: usize = 3;
 
 #[derive(Debug)]
 pub struct IcebergDeleteExec {
@@ -264,6 +265,9 @@ impl ExecutionPlan for IcebergDeleteExec {
             let mut attempt = 0;
             loop {
                 attempt += 1;
+                if attempt > 1 {
+                    sleep_with_jitter(5, attempt - 2).await;
+                }
                 let current_latest = if attempt == 1 {
                     latest_meta.clone()
                 } else {

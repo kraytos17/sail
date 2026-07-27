@@ -616,7 +616,7 @@ pub enum CatalogType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SparkConfig {
-    pub session_timeout_secs: u64,
+    pub session_timeout_secs: i64,
     pub execution_heartbeat_interval_secs: u64,
 }
 
@@ -631,7 +631,7 @@ pub struct PythonConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlightConfig {
-    pub session_timeout_secs: u64,
+    pub session_timeout_secs: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

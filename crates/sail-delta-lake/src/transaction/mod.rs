@@ -27,6 +27,7 @@ use chrono::Utc;
 use futures::future::BoxFuture;
 use log::*;
 use object_store::{Error as ObjectStoreError, ObjectStoreExt, PutMode, PutOptions};
+use sail_common::retry::sleep_with_jitter;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use uuid::Uuid;
@@ -1433,6 +1434,7 @@ impl std::future::IntoFuture for PreparedCommit {
                             .abort_commit_entry(version, commit_or_bytes, this.operation_id)
                             .await?;
                         error!("The transaction {version} already exists, will retry!");
+                        sleep_with_jitter(5, attempt_number - 1).await;
                         continue;
                     }
                     Err(err) => {

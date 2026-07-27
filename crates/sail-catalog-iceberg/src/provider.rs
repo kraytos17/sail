@@ -35,6 +35,7 @@ use sail_catalog::provider::{
 use sail_catalog::utils::{get_property, quote_name_if_needed, quote_namespace_if_needed};
 use sail_common::config::IcebergRestAccessDelegation;
 use sail_common::http::SAIL_USER_AGENT;
+use sail_common::retry::sleep_with_jitter;
 use sail_common_datafusion::catalog::managed::METADATA_LOCATION_KEY;
 use sail_common_datafusion::catalog::{
     CapabilityFingerprint, CatalogTableBucketBy, CatalogTableConstraint, CatalogTableSort,
@@ -346,36 +347,69 @@ impl IcebergRestCatalogProvider {
     ) -> CatalogResult<crate::models::LoadTableResult> {
         let client = self.client().await?;
         let catalog_config = self.resolved_catalog_config().await?;
-        client
-            .catalog_api_api()
-            .load_table(
-                &catalog_config.namespace_string(database)?,
-                table,
-                access_delegation,
-                None,
-                None,
-                catalog_config.prefix(),
-            )
-            .await
-            .map_err(|e| match e {
-                apis::Error::ResponseError(apis::ResponseContent { status, .. })
-                    if status == reqwest::StatusCode::NOT_FOUND =>
-                {
-                    CatalogError::NotFound(
-                        CatalogObject::Table,
-                        format!(
-                            "{}.{}",
+
+        let max_retries = 3u32;
+        let mut last_result = None;
+        for attempt in 0..max_retries {
+            if attempt > 0 {
+                sleep_with_jitter(10, (attempt - 1) as usize).await;
+            }
+            match client
+                .catalog_api_api()
+                .load_table(
+                    &catalog_config.namespace_string(database)?,
+                    table,
+                    access_delegation,
+                    None,
+                    None,
+                    catalog_config.prefix(),
+                )
+                .await
+            {
+                Ok(r) => {
+                    last_result = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    let is_not_found = matches!(
+                        e,
+                        apis::Error::ResponseError(apis::ResponseContent { status, .. })
+                            if status == reqwest::StatusCode::NOT_FOUND
+                    );
+                    if is_not_found && attempt + 1 < max_retries {
+                        log::warn!(
+                            "transient NOT_FOUND loading table '{:?}.{}', retrying (attempt {}/{}): {}",
+                            database,
+                            table,
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        continue;
+                    }
+                    return Err(match e {
+                        apis::Error::ResponseError(apis::ResponseContent { status, .. })
+                            if status == reqwest::StatusCode::NOT_FOUND =>
+                        {
+                            CatalogError::NotFound(
+                                CatalogObject::Table,
+                                format!(
+                                    "{}.{}",
+                                    quote_namespace_if_needed(database),
+                                    quote_name_if_needed(table)
+                                ),
+                            )
+                        }
+                        _ => CatalogError::External(format!(
+                            "Failed to load table {}.{}: {e}",
                             quote_namespace_if_needed(database),
                             quote_name_if_needed(table)
-                        ),
-                    )
+                        )),
+                    });
                 }
-                _ => CatalogError::External(format!(
-                    "Failed to load table {}.{}: {e}",
-                    quote_namespace_if_needed(database),
-                    quote_name_if_needed(table)
-                )),
-            })
+            }
+        }
+        Ok(last_result.expect("loop should return on error or assign result"))
     }
 
     fn normalize_scan_planning_mode(value: &str) -> CatalogResult<String> {
@@ -913,41 +947,64 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             properties: if props.is_empty() { None } else { Some(props) },
         };
 
-        let result = client
-            .catalog_api_api()
-            .create_namespace(request, catalog_config.prefix())
-            .await;
-
-        match result {
-            Ok(result) => {
-                let comment = result
-                    .properties
-                    .as_ref()
-                    .and_then(|p| get_property(p, "comment"));
-                let location = result
-                    .properties
-                    .as_ref()
-                    .and_then(|p| get_property(p, "location"));
-                let properties: Vec<_> =
-                    result.properties.unwrap_or_default().into_iter().collect();
-
-                Ok(DatabaseStatus {
-                    catalog: self.name.clone(),
-                    database: result.namespace,
-                    comment,
-                    location,
-                    properties,
-                })
+        let max_retries = 3u32;
+        let mut last_result = None;
+        for attempt in 0..max_retries {
+            if attempt > 0 {
+                sleep_with_jitter(10, (attempt - 1) as usize).await;
             }
-            Err(apis::Error::ResponseError(apis::ResponseContent { status, .. }))
-                if status == reqwest::StatusCode::CONFLICT && if_not_exists =>
+            match client
+                .catalog_api_api()
+                .create_namespace(request.clone(), catalog_config.prefix())
+                .await
             {
-                self.get_database(database).await
+                Ok(result) => {
+                    last_result = Some(result);
+                    break;
+                }
+                Err(e) => {
+                    let err_str = format!("{e}");
+                    let is_server_error = err_str.contains("status code 5");
+                    if is_server_error && attempt + 1 < max_retries {
+                        log::warn!(
+                            "transient error creating namespace '{:?}', retrying (attempt {}/{}): {}",
+                            database,
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        continue;
+                    }
+                    return Err(match e {
+                        apis::Error::ResponseError(apis::ResponseContent { status, .. })
+                            if status == reqwest::StatusCode::CONFLICT && if_not_exists =>
+                        {
+                            return self.get_database(database).await;
+                        }
+                        e => CatalogError::External(format!("Failed to create namespace: {e}")),
+                    });
+                }
             }
-            Err(e) => Err(CatalogError::External(format!(
-                "Failed to create namespace: {e}"
-            ))),
         }
+        let result = last_result.expect("loop should return on error or assign result");
+
+        let comment = result
+            .properties
+            .as_ref()
+            .and_then(|p| get_property(p, "comment"));
+        let location = result
+            .properties
+            .as_ref()
+            .and_then(|p| get_property(p, "location"));
+        let properties: Vec<_> = result.properties.unwrap_or_default().into_iter().collect();
+
+        Ok(DatabaseStatus {
+            catalog: self.name.clone(),
+            database: result.namespace,
+            comment,
+            location,
+            properties,
+        })
     }
 
     async fn get_database(&self, database: &Namespace) -> CatalogResult<DatabaseStatus> {
@@ -955,29 +1012,52 @@ impl CatalogProvider for IcebergRestCatalogProvider {
         let client = self.client().await?;
         let namespace = catalog_config.namespace_string(database)?;
 
-        let result = client
-            .catalog_api_api()
-            .load_namespace_metadata(&namespace, catalog_config.prefix())
-            .await
-            .map_err(|e| match e {
-                apis::Error::ResponseError(apis::ResponseContent { status, .. }) => {
-                    if status == reqwest::StatusCode::NOT_FOUND {
-                        CatalogError::NotFound(
-                            CatalogObject::Namespace,
-                            quote_namespace_if_needed(database),
-                        )
-                    } else {
-                        CatalogError::External(format!(
+        let max_retries = 3u32;
+        let mut last_result = None;
+        for attempt in 0..max_retries {
+            if attempt > 0 {
+                sleep_with_jitter(10, (attempt - 1) as usize).await;
+            }
+            match client
+                .catalog_api_api()
+                .load_namespace_metadata(&namespace, catalog_config.prefix())
+                .await
+            {
+                Ok(r) => {
+                    last_result = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    let err_str = format!("{e}");
+                    let is_server_error = err_str.contains("status code 5");
+                    if is_server_error && attempt + 1 < max_retries {
+                        log::warn!(
+                            "transient error loading namespace '{:?}', retrying (attempt {}/{}): {}",
+                            database,
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        continue;
+                    }
+                    return Err(match e {
+                        apis::Error::ResponseError(apis::ResponseContent { status, .. })
+                            if status == reqwest::StatusCode::NOT_FOUND =>
+                        {
+                            CatalogError::NotFound(
+                                CatalogObject::Namespace,
+                                quote_namespace_if_needed(database),
+                            )
+                        }
+                        _ => CatalogError::External(format!(
                             "Failed to load namespace {}: {e}",
                             quote_namespace_if_needed(database)
-                        ))
-                    }
+                        )),
+                    });
                 }
-                _ => CatalogError::External(format!(
-                    "Failed to load namespace {}: {e}",
-                    quote_namespace_if_needed(database)
-                )),
-            })?;
+            }
+        }
+        let result = last_result.expect("loop should return on error or assign result");
 
         let comment = result
             .properties
@@ -1008,11 +1088,40 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             .map(|namespace| catalog_config.namespace_string(namespace))
             .transpose()?;
 
-        let result = client
-            .catalog_api_api()
-            .list_namespaces(None, None, parent.as_deref(), catalog_config.prefix())
-            .await
-            .map_err(|e| CatalogError::External(format!("Failed to list namespaces: {e}")))?;
+        let max_retries = 3u32;
+        let mut last_result = None;
+        for attempt in 0..max_retries {
+            if attempt > 0 {
+                sleep_with_jitter(10, (attempt - 1) as usize).await;
+            }
+            match client
+                .catalog_api_api()
+                .list_namespaces(None, None, parent.as_deref(), catalog_config.prefix())
+                .await
+            {
+                Ok(r) => {
+                    last_result = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    let err_str = format!("{e}");
+                    let is_server_error = err_str.contains("status code 5");
+                    if is_server_error && attempt + 1 < max_retries {
+                        log::warn!(
+                            "transient error listing namespaces, retrying (attempt {}/{}): {}",
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        continue;
+                    }
+                    return Err(CatalogError::External(format!(
+                        "Failed to list namespaces: {e}"
+                    )));
+                }
+            }
+        }
+        let result = last_result.expect("loop should return on error or assign result");
 
         Ok(result
             .namespaces
@@ -1212,10 +1321,7 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             let mut last_result = None;
             for attempt in 0..max_retries {
                 if attempt > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        100u64 * (1u64 << (attempt - 1)),
-                    ))
-                    .await;
+                    sleep_with_jitter(10, (attempt - 1) as usize).await;
                 }
                 match client
                     .catalog_api_api()
@@ -1275,16 +1381,54 @@ impl CatalogProvider for IcebergRestCatalogProvider {
         let catalog_config = self.resolved_catalog_config().await?;
         let client = self.client().await?;
 
-        let result = client
-            .catalog_api_api()
-            .list_tables(
-                &catalog_config.namespace_string(database)?,
-                None,
-                None,
-                catalog_config.prefix(),
-            )
-            .await
-            .map_err(|e| CatalogError::External(format!("Failed to list tables: {e}")))?;
+        let max_retries = 3u32;
+        let mut last_result = None;
+        for attempt in 0..max_retries {
+            if attempt > 0 {
+                sleep_with_jitter(10, (attempt - 1) as usize).await;
+            }
+            match client
+                .catalog_api_api()
+                .list_tables(
+                    &catalog_config.namespace_string(database)?,
+                    None,
+                    None,
+                    catalog_config.prefix(),
+                )
+                .await
+            {
+                Ok(r) => {
+                    last_result = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    let is_not_found = matches!(
+                        e,
+                        apis::Error::ResponseError(apis::ResponseContent { status, .. })
+                            if status == reqwest::StatusCode::NOT_FOUND
+                    );
+                    let err_str = format!("{e}");
+                    let is_server_error = err_str.contains("status code 5");
+                    if (is_not_found || is_server_error) && attempt + 1 < max_retries {
+                        log::warn!(
+                            "transient error listing tables in '{:?}', retrying (attempt {}/{}): {}",
+                            database,
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        continue;
+                    }
+                    if is_not_found {
+                        return Ok(Vec::new());
+                    }
+                    return Err(CatalogError::External(format!(
+                        "Failed to list tables: {e}"
+                    )));
+                }
+            }
+        }
+        let result = last_result.expect("loop should return on error or assign result");
 
         Ok(result
             .identifiers
@@ -1350,24 +1494,50 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             }
         }
 
-        match client
-            .catalog_api_api()
-            .drop_table(
-                &catalog_config.namespace_string(database)?,
-                table,
-                Some(purge),
-                catalog_config.prefix(),
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(apis::Error::ResponseError(apis::ResponseContent { status, .. }))
-                if status == reqwest::StatusCode::NOT_FOUND && if_exists =>
-            {
-                Ok(())
+        let max_retries = 3u32;
+        let mut last_err = None;
+        for attempt in 0..max_retries {
+            if attempt > 0 {
+                sleep_with_jitter(10, (attempt - 1) as usize).await;
             }
-            Err(e) => Err(CatalogError::External(format!("Failed to drop table: {e}"))),
+            match client
+                .catalog_api_api()
+                .drop_table(
+                    &catalog_config.namespace_string(database)?,
+                    table,
+                    Some(purge),
+                    catalog_config.prefix(),
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(apis::Error::ResponseError(apis::ResponseContent { status, .. }))
+                    if status == reqwest::StatusCode::NOT_FOUND && if_exists =>
+                {
+                    return Ok(());
+                }
+                Err(e) => {
+                    let err_str = format!("{e}");
+                    let is_server_error = err_str.contains("status code 5");
+                    if is_server_error && attempt + 1 < max_retries {
+                        log::warn!(
+                            "transient error dropping table '{:?}.{}', retrying (attempt {}/{}): {}",
+                            database,
+                            table,
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(CatalogError::External(format!("Failed to drop table: {e}")));
+                }
+            }
         }
+        Err(CatalogError::External(format!(
+            "Failed to drop table after {max_retries} retries: {last_err:?}"
+        )))
     }
 
     async fn alter_table(
@@ -1891,62 +2061,112 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             requirements,
             updates,
         };
-        let response = client
-            .catalog_api_api()
-            .update_table(&namespace, table, request, catalog_config.prefix())
-            .await
-            .map_err(|e| match e {
-                apis::Error::ResponseError(apis::ResponseContent {
-                    status, content: _, ..
-                }) if status == reqwest::StatusCode::NOT_FOUND => CatalogError::NotFound(
-                    CatalogObject::Table,
-                    format!(
-                        "{}.{}",
-                        quote_namespace_if_needed(database),
-                        quote_name_if_needed(table)
-                    ),
-                ),
-                apis::Error::ResponseError(apis::ResponseContent {
-                    status, content, ..
-                }) if status == reqwest::StatusCode::CONFLICT => CatalogError::Conflict(format!(
-                    "Iceberg REST catalog commit conflict for {}.{}: {content}",
-                    quote_namespace_if_needed(database),
-                    quote_name_if_needed(table)
-                )),
-                apis::Error::ResponseError(apis::ResponseContent {
-                    status, content, ..
-                }) if status == reqwest::StatusCode::UNAUTHORIZED => {
-                    CatalogError::Unauthorized(format!(
-                        "Iceberg REST catalog commit unauthorized for {}.{}: {content}",
-                        quote_namespace_if_needed(database),
-                        quote_name_if_needed(table)
-                    ))
+        let max_retries = 3u32;
+        let mut last_response = None;
+        for attempt in 0..max_retries {
+            if attempt > 0 {
+                sleep_with_jitter(10, (attempt - 1) as usize).await;
+            }
+            match client
+                .catalog_api_api()
+                .update_table(&namespace, table, request.clone(), catalog_config.prefix())
+                .await
+            {
+                Ok(r) => {
+                    last_response = Some(r);
+                    break;
                 }
-                apis::Error::ResponseError(apis::ResponseContent {
-                    status, content, ..
-                }) if status == reqwest::StatusCode::FORBIDDEN => CatalogError::Forbidden(format!(
-                    "Iceberg REST catalog commit forbidden for {}.{}: {content}",
-                    quote_namespace_if_needed(database),
-                    quote_name_if_needed(table)
-                )),
-                apis::Error::ResponseError(apis::ResponseContent {
-                    status, content, ..
-                }) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
-                    CatalogError::RateLimited(format!(
-                        "Iceberg REST catalog commit rate limited for {}.{}: {content}",
-                        quote_namespace_if_needed(database),
-                        quote_name_if_needed(table)
-                    ))
+                Err(e) => {
+                    let is_not_found = matches!(
+                        e,
+                        apis::Error::ResponseError(apis::ResponseContent { status, .. })
+                            if status == reqwest::StatusCode::NOT_FOUND
+                    );
+                    let err_str = format!("{e}");
+                    let is_server_error = err_str.contains("status code 5");
+                    if (is_not_found || is_server_error) && attempt + 1 < max_retries {
+                        log::warn!(
+                            "transient error committing Iceberg table '{:?}.{}', retrying (attempt {}/{}): {}",
+                            database,
+                            table,
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        continue;
+                    }
+                    return Err(match e {
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status,
+                            content: _,
+                            ..
+                        }) if status == reqwest::StatusCode::NOT_FOUND => CatalogError::NotFound(
+                            CatalogObject::Table,
+                            format!(
+                                "{}.{}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ),
+                        ),
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status,
+                            content,
+                            ..
+                        }) if status == reqwest::StatusCode::CONFLICT => {
+                            CatalogError::Conflict(format!(
+                                "Iceberg REST catalog commit conflict for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status,
+                            content,
+                            ..
+                        }) if status == reqwest::StatusCode::UNAUTHORIZED => {
+                            CatalogError::Unauthorized(format!(
+                                "Iceberg REST catalog commit unauthorized for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status,
+                            content,
+                            ..
+                        }) if status == reqwest::StatusCode::FORBIDDEN => {
+                            CatalogError::Forbidden(format!(
+                                "Iceberg REST catalog commit forbidden for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status,
+                            content,
+                            ..
+                        }) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                            CatalogError::RateLimited(format!(
+                                "Iceberg REST catalog commit rate limited for {}.{}: {content}",
+                                quote_namespace_if_needed(database),
+                                quote_name_if_needed(table)
+                            ))
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent {
+                            status,
+                            content,
+                            ..
+                        }) => CatalogError::External(format!(
+                            "Failed to commit Iceberg table {}.{}: status {status}: {content}",
+                            quote_namespace_if_needed(database),
+                            quote_name_if_needed(table)
+                        )),
+                        e => CatalogError::External(format!("Failed to commit table: {e}")),
+                    });
                 }
-                apis::Error::ResponseError(apis::ResponseContent {
-                    status, content, ..
-                }) => CatalogError::External(format!(
-                    "Failed to commit Iceberg table {}.{}: status {status}: {content}",
-                    quote_namespace_if_needed(database),
-                    quote_name_if_needed(table)
-                )),
-                e => CatalogError::External(format!("Failed to commit table: {e}")),
-            })?;
+            }
+        }
+        let response = last_response.expect("loop should return on error or assign result");
         let payload = match payload {
             Some(payload) => Some(payload),
             None => Some(serde_json::to_value(response).map_err(|e| {
@@ -2130,15 +2350,46 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             properties: props,
         };
 
-        let result = client
-            .catalog_api_api()
-            .create_view(
-                &catalog_config.namespace_string(database)?,
-                request,
-                catalog_config.prefix(),
-            )
-            .await
-            .map_err(|e| CatalogError::External(format!("Failed to create view: {e}")))?;
+        let max_retries = 3u32;
+        let mut last_result = None;
+        for attempt in 0..max_retries {
+            if attempt > 0 {
+                sleep_with_jitter(10, (attempt - 1) as usize).await;
+            }
+            match client
+                .catalog_api_api()
+                .create_view(
+                    &catalog_config.namespace_string(database)?,
+                    request.clone(),
+                    catalog_config.prefix(),
+                )
+                .await
+            {
+                Ok(r) => {
+                    last_result = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    let err_str = format!("{e}");
+                    let is_server_error = err_str.contains("status code 5");
+                    if is_server_error && attempt + 1 < max_retries {
+                        log::warn!(
+                            "transient error creating view '{:?}.{}', retrying (attempt {}/{}): {}",
+                            database,
+                            view,
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        continue;
+                    }
+                    return Err(CatalogError::External(format!(
+                        "Failed to create view: {e}"
+                    )));
+                }
+            }
+        }
+        let result = last_result.expect("loop should return on error or assign result");
 
         Self::load_view_result_to_status(&self.name, database, view, result)
     }
@@ -2146,42 +2397,72 @@ impl CatalogProvider for IcebergRestCatalogProvider {
     async fn get_view(&self, database: &Namespace, view: &str) -> CatalogResult<TableStatus> {
         let catalog_config = self.resolved_catalog_config().await?;
         let client = self.client().await?;
-        let result = client
-            .catalog_api_api()
-            .load_view(
-                &catalog_config.namespace_string(database)?,
-                view,
-                catalog_config.prefix(),
-            )
-            .await
-            .map_err(|e| match e {
-                apis::Error::ResponseError(apis::ResponseContent { status, .. })
-                    if matches!(
-                        status,
-                        reqwest::StatusCode::METHOD_NOT_ALLOWED
-                            | reqwest::StatusCode::NOT_IMPLEMENTED
-                    ) =>
-                {
-                    CatalogError::NotSupported("get view".to_string())
+
+        let max_retries = 3u32;
+        let mut last_result = None;
+        for attempt in 0..max_retries {
+            if attempt > 0 {
+                sleep_with_jitter(10, (attempt - 1) as usize).await;
+            }
+            match client
+                .catalog_api_api()
+                .load_view(
+                    &catalog_config.namespace_string(database)?,
+                    view,
+                    catalog_config.prefix(),
+                )
+                .await
+            {
+                Ok(r) => {
+                    last_result = Some(r);
+                    break;
                 }
-                apis::Error::ResponseError(apis::ResponseContent { status, .. })
-                    if status == reqwest::StatusCode::NOT_FOUND =>
-                {
-                    CatalogError::NotFound(
-                        CatalogObject::View,
-                        format!(
-                            "{}.{}",
+                Err(e) => {
+                    let err_str = format!("{e}");
+                    let is_server_error = err_str.contains("status code 5");
+                    if is_server_error && attempt + 1 < max_retries {
+                        log::warn!(
+                            "transient error loading view '{:?}.{}', retrying (attempt {}/{}): {}",
+                            database,
+                            view,
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        continue;
+                    }
+                    return Err(match e {
+                        apis::Error::ResponseError(apis::ResponseContent { status, .. })
+                            if matches!(
+                                status,
+                                reqwest::StatusCode::METHOD_NOT_ALLOWED
+                                    | reqwest::StatusCode::NOT_IMPLEMENTED
+                            ) =>
+                        {
+                            CatalogError::NotSupported("get view".to_string())
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent { status, .. })
+                            if status == reqwest::StatusCode::NOT_FOUND =>
+                        {
+                            CatalogError::NotFound(
+                                CatalogObject::View,
+                                format!(
+                                    "{}.{}",
+                                    quote_namespace_if_needed(database),
+                                    quote_name_if_needed(view)
+                                ),
+                            )
+                        }
+                        _ => CatalogError::External(format!(
+                            "Failed to load view {}.{}: {e}",
                             quote_namespace_if_needed(database),
                             quote_name_if_needed(view)
-                        ),
-                    )
+                        )),
+                    });
                 }
-                _ => CatalogError::External(format!(
-                    "Failed to load view {}.{}: {e}",
-                    quote_namespace_if_needed(database),
-                    quote_name_if_needed(view)
-                )),
-            })?;
+            }
+        }
+        let result = last_result.expect("loop should return on error or assign result");
         Self::load_view_result_to_status(&self.name, database, view, result)
     }
 
@@ -2189,35 +2470,68 @@ impl CatalogProvider for IcebergRestCatalogProvider {
         let catalog_config = self.resolved_catalog_config().await?;
         let client = self.client().await?;
 
-        let result = client
-            .catalog_api_api()
-            .list_views(
-                &catalog_config.namespace_string(database)?,
-                None,
-                None,
-                catalog_config.prefix(),
-            )
-            .await
-            .map_err(|e| match e {
-                apis::Error::ResponseError(apis::ResponseContent { status, .. })
-                    if matches!(status, reqwest::StatusCode::NOT_FOUND) =>
-                {
-                    CatalogError::NotFound(
-                        CatalogObject::Namespace,
-                        quote_namespace_if_needed(database),
-                    )
+        let max_retries = 3u32;
+        let mut last_result = None;
+        for attempt in 0..max_retries {
+            if attempt > 0 {
+                sleep_with_jitter(10, (attempt - 1) as usize).await;
+            }
+            match client
+                .catalog_api_api()
+                .list_views(
+                    &catalog_config.namespace_string(database)?,
+                    None,
+                    None,
+                    catalog_config.prefix(),
+                )
+                .await
+            {
+                Ok(r) => {
+                    last_result = Some(r);
+                    break;
                 }
-                apis::Error::ResponseError(apis::ResponseContent { status, .. })
-                    if matches!(
-                        status,
-                        reqwest::StatusCode::METHOD_NOT_ALLOWED
-                            | reqwest::StatusCode::NOT_IMPLEMENTED
-                    ) =>
-                {
-                    CatalogError::NotSupported("list views".to_string())
+                Err(e) => {
+                    let is_not_found = matches!(
+                        e,
+                        apis::Error::ResponseError(apis::ResponseContent { status, .. })
+                            if status == reqwest::StatusCode::NOT_FOUND
+                    );
+                    let err_str = format!("{e}");
+                    let is_server_error = err_str.contains("status code 5");
+                    if (is_not_found || is_server_error) && attempt + 1 < max_retries {
+                        log::warn!(
+                            "transient error listing views in '{:?}', retrying (attempt {}/{}): {}",
+                            database,
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        continue;
+                    }
+                    return Err(match e {
+                        apis::Error::ResponseError(apis::ResponseContent { status: _, .. })
+                            if is_not_found =>
+                        {
+                            CatalogError::NotFound(
+                                CatalogObject::Namespace,
+                                quote_namespace_if_needed(database),
+                            )
+                        }
+                        apis::Error::ResponseError(apis::ResponseContent { status, .. })
+                            if matches!(
+                                status,
+                                reqwest::StatusCode::METHOD_NOT_ALLOWED
+                                    | reqwest::StatusCode::NOT_IMPLEMENTED
+                            ) =>
+                        {
+                            CatalogError::NotSupported("list views".to_string())
+                        }
+                        _ => CatalogError::External(format!("Failed to list views: {e}")),
+                    });
                 }
-                _ => CatalogError::External(format!("Failed to list views: {e}")),
-            })?;
+            }
+        }
+        let result = last_result.expect("loop should return on error or assign result");
         let catalog = &self.name;
         Ok(result
             .identifiers
@@ -2246,23 +2560,48 @@ impl CatalogProvider for IcebergRestCatalogProvider {
         let catalog_config = self.resolved_catalog_config().await?;
         let client = self.client().await?;
         let DropViewOptions { if_exists } = options;
-        match client
-            .catalog_api_api()
-            .drop_view(
-                &catalog_config.namespace_string(database)?,
-                view,
-                catalog_config.prefix(),
-            )
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(apis::Error::ResponseError(apis::ResponseContent { status, .. }))
-                if status == reqwest::StatusCode::NOT_FOUND && if_exists =>
-            {
-                Ok(())
+
+        let max_retries = 3u32;
+        for attempt in 0..max_retries {
+            if attempt > 0 {
+                sleep_with_jitter(10, (attempt - 1) as usize).await;
             }
-            Err(e) => Err(CatalogError::External(format!("Failed to drop view: {e}"))),
+            match client
+                .catalog_api_api()
+                .drop_view(
+                    &catalog_config.namespace_string(database)?,
+                    view,
+                    catalog_config.prefix(),
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(apis::Error::ResponseError(apis::ResponseContent { status, .. }))
+                    if status == reqwest::StatusCode::NOT_FOUND && if_exists =>
+                {
+                    return Ok(());
+                }
+                Err(e) => {
+                    let err_str = format!("{e}");
+                    let is_server_error = err_str.contains("status code 5");
+                    if is_server_error && attempt + 1 < max_retries {
+                        log::warn!(
+                            "transient error dropping view '{:?}.{}', retrying (attempt {}/{}): {}",
+                            database,
+                            view,
+                            attempt + 1,
+                            max_retries,
+                            e
+                        );
+                        continue;
+                    }
+                    return Err(CatalogError::External(format!("Failed to drop view: {e}")));
+                }
+            }
         }
+        Err(CatalogError::External(format!(
+            "Failed to drop view after {max_retries} retries"
+        )))
     }
 }
 
