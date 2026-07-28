@@ -1,6 +1,7 @@
 pub mod batch;
 pub mod error;
 pub mod load;
+pub mod locks;
 pub mod query;
 pub mod read;
 pub mod session;
