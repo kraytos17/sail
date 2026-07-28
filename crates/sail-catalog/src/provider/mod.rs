@@ -19,6 +19,7 @@ use crate::lakehouse::{
 };
 
 /// A trait that defines the interface for a catalog.
+///
 /// A catalog contains *databases*, where each database has a multi-level name
 /// that represents a *namespace*.
 /// A database contains *objects* such as *tables* and *views*.

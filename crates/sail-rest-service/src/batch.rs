@@ -45,12 +45,13 @@ pub async fn handle_batch(
             buf.push(b',');
         }
 
+        buf.push(b'{');
         match execute_and_write_result(&ctx, sql, &mut buf, req.timeout_secs).await {
             Ok(()) => {}
             Err(e) => {
                 let _ = write!(
                     buf,
-                    r#"{{"columns":[],"rows":[],"rowCount":0,"status":"error: {}"}}"#,
+                    "\"columns\":[],\"rows\":[],\"rowCount\":0,\"status\":\"error: {}\"",
                     e
                 );
                 if !req.continue_on_error {
@@ -63,6 +64,7 @@ pub async fn handle_batch(
                 }
             }
         }
+        buf.push(b'}');
     }
 
     buf.push(b']');

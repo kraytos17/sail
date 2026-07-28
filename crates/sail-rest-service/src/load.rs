@@ -6,10 +6,18 @@ use axum::response::{IntoResponse, Response};
 use datafusion::prelude::SessionContext;
 use sail_session::session_manager::SessionManager;
 use serde::Deserialize;
+use uuid::Uuid;
 
 use crate::error::{RestError, with_timeout};
 use crate::query::execute_sql_to_batches;
 use crate::session::get_session_context;
+
+fn unique_view_name() -> String {
+    format!(
+        "_sail_load_{}",
+        Uuid::new_v4().to_string().replace('-', "_")
+    )
+}
 
 #[derive(Deserialize)]
 pub struct LoadRequest {
@@ -43,7 +51,7 @@ fn default_session_id() -> String {
     "rest-api".to_string()
 }
 
-fn build_create_view_sql(req: &LoadRequest) -> String {
+fn build_create_view_sql(req: &LoadRequest, view_name: &str) -> String {
     let format = req.file_format.to_lowercase();
     let mut options = req.options.clone();
 
@@ -74,11 +82,12 @@ fn build_create_view_sql(req: &LoadRequest) -> String {
 
     let opts_str: Vec<String> = options
         .iter()
-        .map(|(k, v)| format!("'{}', '{}'", k, v))
+        .map(|(k, v)| format!("{} '{}'", k, v))
         .collect();
 
     format!(
-        "CREATE OR REPLACE TEMPORARY VIEW _sail_load_ USING {} OPTIONS ({})",
+        "CREATE OR REPLACE TEMPORARY VIEW {} USING {} OPTIONS ({})",
+        view_name,
         format,
         opts_str.join(", ")
     )
@@ -98,8 +107,8 @@ struct LoadResponse {
     message: String,
 }
 
-async fn drop_temp_view(ctx: &SessionContext) {
-    let _ = execute_sql_to_batches(ctx, "DROP VIEW IF EXISTS _sail_load_").await;
+async fn drop_temp_view(ctx: &SessionContext, view_name: &str) {
+    let _ = execute_sql_to_batches(ctx, &format!("DROP VIEW IF EXISTS {}", view_name)).await;
 }
 
 pub async fn handle_load(
@@ -111,7 +120,8 @@ pub async fn handle_load(
         Err(e) => return RestError::Session(format!("session error: {e}")).into_response(),
     };
 
-    let create_view_sql = build_create_view_sql(&req);
+    let view_name = unique_view_name();
+    let create_view_sql = build_create_view_sql(&req, &view_name);
 
     if let Err(e) = with_timeout(
         execute_sql_to_batches(&ctx, &create_view_sql),
@@ -124,12 +134,12 @@ pub async fn handle_load(
 
     let insert_sql = match req.mode.as_str() {
         "overwrite" => format!(
-            "INSERT OVERWRITE {}.{} SELECT * FROM _sail_load_",
-            req.schema_name, req.table_name
+            "INSERT OVERWRITE {}.{} SELECT * FROM {}",
+            req.schema_name, req.table_name, view_name
         ),
         _ => format!(
-            "INSERT INTO {}.{} SELECT * FROM _sail_load_",
-            req.schema_name, req.table_name
+            "INSERT INTO {}.{} SELECT * FROM {}",
+            req.schema_name, req.table_name, view_name
         ),
     };
 
@@ -137,14 +147,14 @@ pub async fn handle_load(
         match with_timeout(execute_sql_to_batches(&ctx, &insert_sql), req.timeout_secs).await {
             Ok(batches) => batches,
             Err(e) => {
-                drop_temp_view(&ctx).await;
+                drop_temp_view(&ctx, &view_name).await;
                 return e.into_response();
             }
         };
 
     let rows_loaded: i64 = result.iter().map(|b| b.num_rows() as i64).sum();
 
-    drop_temp_view(&ctx).await;
+    drop_temp_view(&ctx, &view_name).await;
 
     Json(LoadResponse {
         status: "ok".to_string(),

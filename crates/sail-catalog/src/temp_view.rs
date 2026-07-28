@@ -29,10 +29,12 @@ pub struct TemporaryViewColumn {
 }
 
 impl TemporaryView {
-    pub fn plan(&self) -> &Arc<LogicalPlan> {
+    #[must_use]
+    pub const fn plan(&self) -> &Arc<LogicalPlan> {
         &self.plan
     }
 
+    #[must_use]
     pub fn columns(&self) -> &[TableColumnStatus] {
         &self.columns
     }
@@ -107,7 +109,7 @@ impl TemporaryViewManager {
             } else if !replace {
                 return Err(CatalogError::AlreadyExists(
                     CatalogObject::TemporaryView,
-                    name.clone(),
+                    name,
                 ));
             }
         }

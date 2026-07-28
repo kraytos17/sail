@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use sail_session::session_manager::SessionManager;
 use serde::Deserialize;
 
-use crate::error::RestError;
+use crate::error::{RestError, with_timeout};
 use crate::query::{execute_and_write_result, execute_sql_to_batches};
 use crate::session::{default_session_id, get_session_context};
 
@@ -59,7 +59,7 @@ fn build_read_view_sql(req: &ReadRequest) -> String {
 
     let opts_str: Vec<String> = options
         .iter()
-        .map(|(k, v)| format!("'{}', '{}'", k, v))
+        .map(|(k, v)| format!("{} '{}'", k, v))
         .collect();
 
     format!(
@@ -79,7 +79,8 @@ pub async fn handle_read(
     };
 
     let create_sql = build_read_view_sql(&req);
-    if let Err(e) = execute_sql_to_batches(&ctx, &create_sql).await {
+    if let Err(e) = with_timeout(execute_sql_to_batches(&ctx, &create_sql), req.timeout_secs).await
+    {
         return RestError::Session(format!("create view failed: {e}")).into_response();
     }
 

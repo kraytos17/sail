@@ -9,11 +9,13 @@ use arrow::array::{
 };
 use arrow_schema::DataType;
 use axum::Json;
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 use datafusion::prelude::SessionContext;
-use futures::StreamExt;
+use futures::{StreamExt, stream};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::session::job::JobService;
 use sail_plan::config::PlanConfig;
@@ -22,6 +24,7 @@ use sail_session::session_manager::SessionManager;
 use sail_sql_analyzer::parser::parse_one_statement;
 use sail_sql_analyzer::statement::from_ast_statement;
 use serde::Deserialize;
+use tokio::sync::mpsc;
 
 use crate::error::{RestError, with_timeout};
 use crate::session::get_session_context;
@@ -304,7 +307,7 @@ pub(crate) async fn execute_and_write_result(
         while let Some(result) = stream.next().await {
             let batch = result.map_err(|e| RestError::Session(format!("stream error: {e}")))?;
             if first_batch {
-                buf.extend_from_slice(b"{\"columns\":");
+                buf.extend_from_slice(b"\"columns\":");
                 write_columns(buf, batch.schema().as_ref());
                 buf.extend_from_slice(b",\"rows\":[");
                 first_batch = false;
@@ -323,9 +326,9 @@ pub(crate) async fn execute_and_write_result(
     with_timeout(stream_fut, timeout_secs).await?;
 
     if first_batch {
-        buf.extend_from_slice(b"{\"columns\":[],\"rows\":[],\"rowCount\":0}");
+        buf.extend_from_slice(b"\"columns\":[],\"rows\":[],\"rowCount\":0");
     } else {
-        let _ = write!(buf, "],\"rowCount\":{}}}", row_count);
+        let _ = write!(buf, "],\"rowCount\":{}", row_count);
     }
     Ok(())
 }
@@ -339,17 +342,97 @@ pub async fn handle_query(
         Err(e) => return RestError::Session(format!("session error: {e}")).into_response(),
     };
 
-    let mut buf = Vec::new();
-    buf.extend_from_slice(b"{\"status\":\"ok\",");
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::convert::Infallible>>(32);
+    let timeout = req.timeout_secs;
+    let sql = req.sql.clone();
 
-    if let Err(e) = execute_and_write_result(&ctx, &req.sql, &mut buf, req.timeout_secs).await {
-        return e.into_response();
-    }
+    tokio::spawn(async move {
+        let result = with_timeout(
+            async {
+                let statement = parse_one_statement(&sql)
+                    .map_err(|e| RestError::Session(format!("parse error: {e}")))?;
+                let plan = from_ast_statement(statement)
+                    .map_err(|e| RestError::Session(format!("plan error: {e}")))?;
+                let (resolved_plan, _) =
+                    resolve_and_execute_plan(&ctx, Arc::new(PlanConfig::default()), plan)
+                        .await
+                        .map_err(|e| RestError::Session(format!("resolve error: {e}")))?;
+                let service = ctx
+                    .extension::<JobService>()
+                    .map_err(|e| RestError::Session(format!("job service error: {e}")))?;
+                let mut stream = service
+                    .runner()
+                    .execute(&ctx, resolved_plan)
+                    .await
+                    .map_err(|e| RestError::Session(format!("execution error: {e}")))?;
 
-    buf.push(b'}');
+                let mut first_batch = true;
+                let mut has_rows = false;
+                let mut row_count: i64 = 0;
+
+                while let Some(result) = stream.next().await {
+                    let batch =
+                        result.map_err(|e| RestError::Session(format!("stream error: {e}")))?;
+
+                    let mut chunk = Vec::new();
+                    if first_batch {
+                        chunk.extend_from_slice(b"{\"status\":\"ok\",\"columns\":");
+                        write_columns(&mut chunk, batch.schema().as_ref());
+                        chunk.extend_from_slice(b",\"rows\":[");
+                        first_batch = false;
+                    }
+
+                    for row_idx in 0..batch.num_rows() {
+                        if has_rows {
+                            chunk.push(b',');
+                        }
+                        write_row(&mut chunk, &batch, row_idx);
+                        row_count += 1;
+                        has_rows = true;
+                    }
+
+                    if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
+                        return Ok(());
+                    }
+                }
+
+                let tail = if first_batch {
+                    Bytes::from_static(
+                        b"{\"status\":\"ok\",\"columns\":[],\"rows\":[],\"rowCount\":0}",
+                    )
+                } else {
+                    Bytes::from(format!("],\"rowCount\":{}}}", row_count))
+                };
+                let _ = tx.send(Ok(tail)).await;
+                Ok(())
+            },
+            timeout,
+        )
+        .await;
+
+        if let Err(e) = result {
+            let err_json = match e {
+                RestError::Timeout => Bytes::from_static(
+                    b"{\"status\":\"error: query timed out\",\"columns\":[],\"rows\":[],\"rowCount\":0}",
+                ),
+                _ => Bytes::from(
+                    format!(
+                        "{{\"status\":\"error: {}\",\"columns\":[],\"rows\":[],\"rowCount\":0}}",
+                        e
+                    )
+                    .into_bytes(),
+                ),
+            };
+            let _ = tx.send(Ok(err_json)).await;
+        }
+    });
+
+    let rx_stream = stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
 
     Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
-        .body(axum::body::Body::from(buf))
+        .body(Body::from_stream(rx_stream))
         .unwrap()
 }

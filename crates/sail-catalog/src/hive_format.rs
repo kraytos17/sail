@@ -22,7 +22,8 @@ impl HiveStorageFormat {
         }
     }
 
-    pub fn parquet() -> Self {
+    #[must_use]
+    pub const fn parquet() -> Self {
         Self {
             input_format: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
             output_format: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
@@ -30,7 +31,8 @@ impl HiveStorageFormat {
         }
     }
 
-    pub fn csv() -> Self {
+    #[must_use]
+    pub const fn csv() -> Self {
         Self {
             input_format: "org.apache.hadoop.mapred.TextInputFormat",
             output_format: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
@@ -38,7 +40,8 @@ impl HiveStorageFormat {
         }
     }
 
-    pub fn textfile() -> Self {
+    #[must_use]
+    pub const fn textfile() -> Self {
         Self {
             input_format: "org.apache.hadoop.mapred.TextInputFormat",
             output_format: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
@@ -46,7 +49,8 @@ impl HiveStorageFormat {
         }
     }
 
-    pub fn json() -> Self {
+    #[must_use]
+    pub const fn json() -> Self {
         Self {
             input_format: "org.apache.hadoop.mapred.TextInputFormat",
             output_format: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
@@ -54,7 +58,8 @@ impl HiveStorageFormat {
         }
     }
 
-    pub fn orc() -> Self {
+    #[must_use]
+    pub const fn orc() -> Self {
         Self {
             input_format: "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat",
             output_format: "org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat",
@@ -62,7 +67,8 @@ impl HiveStorageFormat {
         }
     }
 
-    pub fn avro() -> Self {
+    #[must_use]
+    pub const fn avro() -> Self {
         Self {
             input_format: "org.apache.hadoop.hive.ql.io.avro.AvroContainerInputFormat",
             output_format: "org.apache.hadoop.hive.ql.io.avro.AvroContainerOutputFormat",
@@ -131,6 +137,7 @@ pub enum HiveDetectedFormat {
 }
 
 impl HiveDetectedFormat {
+    #[must_use]
     pub fn detect(
         serde_library: Option<&str>,
         input_format: Option<&str>,
@@ -161,7 +168,8 @@ impl HiveDetectedFormat {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Parquet => "parquet",
             Self::Csv => "csv",

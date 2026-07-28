@@ -138,7 +138,7 @@ impl CatalogManager {
             // list_views; treat that as "no views" so SHOW TABLES still works there.
             let views = match views_res {
                 Ok(v) => v,
-                Err(CatalogError::NotSupported(_)) | Err(CatalogError::NotFound(_, _)) => vec![],
+                Err(CatalogError::NotSupported(_) | CatalogError::NotFound(_, _)) => vec![],
                 Err(e) => return Err(e),
             };
             tables.extend(views);
@@ -221,7 +221,7 @@ impl CatalogManager {
                 CatalogObject::Table,
                 format!(
                     "[TABLE_OR_VIEW_NOT_FOUND] Table or view not found: {}",
-                    reference.last().map(AsRef::as_ref).unwrap_or("<unknown>")
+                    reference.last().map_or("<unknown>", AsRef::as_ref)
                 ),
             )),
             Err(e) => Err(e),

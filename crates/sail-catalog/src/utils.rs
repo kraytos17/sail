@@ -15,6 +15,7 @@ lazy_static! {
 // Translation of Spark's `filterPattern` function.
 // Only '*' and '|' are allowed as wildcards, others will follow regular expression convention.
 // Will do a case-insensitive match, and white spaces on both ends will be ignored.
+#[must_use]
 pub fn filter_pattern(names: Vec<&str>, pattern: Option<&str>) -> Vec<String> {
     let pattern = match pattern {
         Some(pattern) => pattern.to_string(),
@@ -26,28 +27,27 @@ pub fn filter_pattern(names: Vec<&str>, pattern: Option<&str>) -> Vec<String> {
 
     for sub_pattern in patterns {
         let regex_pattern = format!("(?i)^{}$", sub_pattern.replace('*', ".*"));
-        match Regex::new(&regex_pattern) {
-            Ok(regex) => {
-                for &name in &names {
-                    let name = name.to_string();
-                    if regex.is_match(&name) && !func_names.contains(&name) {
-                        func_names.push(name);
-                    }
+        if let Ok(regex) = Regex::new(&regex_pattern) {
+            for &name in &names {
+                let name = name.to_string();
+                if regex.is_match(&name) && !func_names.contains(&name) {
+                    func_names.push(name);
                 }
             }
-            Err(_) => {
-                // The Spark implementation ignores pattern syntax errors, so we do the same.
-            }
+        } else {
+            // The Spark implementation ignores pattern syntax errors, so we do the same.
         }
     }
 
     func_names
 }
 
+#[must_use]
 pub fn match_pattern(name: &str, pattern: Option<&str>) -> bool {
     !filter_pattern(vec![name], pattern).is_empty()
 }
 
+#[must_use]
 pub fn quote_name_if_needed(name: &str) -> String {
     if VALID_IDENTIFIER_REGEX.is_match(name) {
         name.to_string()
@@ -64,6 +64,7 @@ pub fn quote_names_if_needed<T: AsRef<str>>(names: &[T]) -> String {
         .join(".")
 }
 
+#[must_use]
 pub fn quote_namespace_if_needed(namespace: &Namespace) -> String {
     let mut quoted = quote_name_if_needed(&namespace.head);
     for part in &namespace.tail {
@@ -73,6 +74,7 @@ pub fn quote_namespace_if_needed(namespace: &Namespace) -> String {
     quoted
 }
 
+#[must_use]
 pub fn get_property(properties: &HashMap<String, String>, key: &str) -> Option<String> {
     properties
         .iter()

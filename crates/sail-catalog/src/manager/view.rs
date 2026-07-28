@@ -121,7 +121,7 @@ impl CatalogManager {
     ) -> CatalogResult<()> {
         if let [name] = view {
             match self.temporary_views.drop_view(name.as_ref(), false) {
-                Ok(_) => return Ok(()),
+                Ok(()) => return Ok(()),
                 Err(CatalogError::NotFound(_, _)) => {}
                 Err(e) => return Err(e),
             }
@@ -130,7 +130,7 @@ impl CatalogManager {
             && self.state()?.is_global_temporary_view_database(x)
         {
             match GLOBAL_TEMPORARY_VIEW_MANAGER.drop_view(name.as_ref(), false) {
-                Ok(_) => return Ok(()),
+                Ok(()) => return Ok(()),
                 Err(CatalogError::NotFound(_, _)) => {}
                 Err(e) => return Err(e),
             }

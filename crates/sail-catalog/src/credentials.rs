@@ -23,7 +23,8 @@ pub struct StaticCatalogCredentials {
 }
 
 impl StaticCatalogCredentials {
-    pub fn new(credential: String) -> Self {
+    #[must_use]
+    pub const fn new(credential: String) -> Self {
         Self { credential }
     }
 }

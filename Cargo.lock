@@ -8129,6 +8129,7 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "axum",
+ "bytes",
  "chrono",
  "datafusion",
  "futures",

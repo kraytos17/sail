@@ -55,6 +55,7 @@ pub enum TableFormatCreateMetadataMode {
     CatalogCoordinated,
 }
 
+#[must_use]
 pub fn plain_lakehouse_create_table_metadata_requirement(
     options: &CreateTableOptions,
 ) -> CreateTableMetadataRequirement {

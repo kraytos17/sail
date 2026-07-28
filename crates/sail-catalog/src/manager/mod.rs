@@ -62,7 +62,7 @@ impl CatalogManager {
             default_database: options.default_database.try_into()?,
             global_temporary_database: options.global_temporary_database.try_into()?,
         };
-        Ok(CatalogManager {
+        Ok(Self {
             state: Arc::new(Mutex::new(state)),
             temporary_views: Default::default(),
             tracker: Default::default(),

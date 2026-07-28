@@ -38,6 +38,7 @@ impl Default for CatalogCacheManager {
 }
 
 impl CatalogCacheManager {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             caches: RwLock::new(HashMap::new()),
@@ -134,6 +135,7 @@ impl<P: CatalogProvider + ?Sized> CachingCatalogProvider<P> {
         }
     }
 
+    #[must_use]
     pub fn get_cache_bundle(&self) -> Arc<CatalogCacheBundle> {
         Arc::new(CatalogCacheBundle {
             database_cache: self.database_cache.clone(),
@@ -144,6 +146,7 @@ impl<P: CatalogProvider + ?Sized> CachingCatalogProvider<P> {
 }
 
 impl CatalogCacheBundle {
+    #[must_use]
     pub fn new(config: &CatalogCacheConfig) -> Self {
         let database_cache = if matches!(
             config.database_cache_type,
@@ -231,7 +234,7 @@ impl<P: CatalogProvider + ?Sized + 'static> CatalogProvider for CachingCatalogPr
         if let Some(c) = self.database_cache.as_ref() {
             let c: &Cache<Option<Namespace>, Vec<DatabaseStatus>> = c;
             let key = prefix.cloned();
-            log::debug!("CachingCatalogProvider::list_databases(prefix={:?})", key);
+            log::debug!("CachingCatalogProvider::list_databases(prefix={key:?})");
             if let Some(v) = c.get(&key).await {
                 return Ok(v);
             }

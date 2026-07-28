@@ -55,7 +55,7 @@ pub struct LakehouseCreateRequest {
     pub options: CreateTableOptions,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LakehouseCreatePlan {
     pub table: LakehouseResolvedTable,
     pub materialization: LakehouseCreateMaterialization,
@@ -64,7 +64,7 @@ pub struct LakehouseCreatePlan {
 // TODO: Replace this compatibility materialization shape with protocol-specific
 // staged create/register/commit/abort state machines for UC Delta, Iceberg REST,
 // Spark CTAS/RTAS staging, and provider-native Glue OpenTableFormat flows.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LakehouseCreateMaterialization {
     None,
     BeforeCatalogTableFormat {
@@ -106,7 +106,7 @@ pub struct TableAccessSession {
     pub capability_fingerprint: CapabilityFingerprint,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LakehouseScanPlanningRequest {
     pub context: LakehouseExecutionContext,
     pub filters: Vec<serde_json::Value>,
@@ -114,7 +114,7 @@ pub struct LakehouseScanPlanningRequest {
     pub limit: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LakehouseScanPlanningResponse {
     pub authority: ScanAuthority,
     pub files: Option<Vec<serde_json::Value>>,
@@ -122,7 +122,7 @@ pub struct LakehouseScanPlanningResponse {
     pub payload: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LakehouseCommitRequest {
     pub context: LakehouseExecutionContext,
     pub format: String,
@@ -135,7 +135,7 @@ pub struct LakehouseCommitRequest {
 // cleanup policy before wiring providers that can return commit-state-unknown
 // after side effects. Keep REST requirements/updates, metadata-location CAS,
 // Delta ratification, and provider-native update outcomes distinct.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LakehouseCommitOutcome {
     Committed {
         context: LakehouseExecutionContext,
@@ -311,6 +311,7 @@ pub fn plan_lakehouse_create_from_requirement(
     }
 }
 
+#[must_use]
 pub fn catalog_coordinated_create_authority(
     format: &LakehouseFormat,
     lifecycle: TableLifecycle,
@@ -404,7 +405,7 @@ fn resolved_scan_authority(
     }
 }
 
-fn table_lifecycle(is_external: bool) -> TableLifecycle {
+const fn table_lifecycle(is_external: bool) -> TableLifecycle {
     if is_external {
         TableLifecycle::External
     } else {

@@ -21,15 +21,15 @@ pub enum CatalogObject {
 impl fmt::Display for CatalogObject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
-            CatalogObject::Catalog => "Catalog",
-            CatalogObject::Database => "Database",
-            CatalogObject::Schema => "Schema",
-            CatalogObject::Namespace => "Namespace",
-            CatalogObject::Table => "Table",
-            CatalogObject::View => "View",
-            CatalogObject::Function => "Function",
-            CatalogObject::TemporaryView => "Temporary View",
-            CatalogObject::LogicalPlan => "Logical Plan",
+            Self::Catalog => "Catalog",
+            Self::Database => "Database",
+            Self::Schema => "Schema",
+            Self::Namespace => "Namespace",
+            Self::Table => "Table",
+            Self::View => "View",
+            Self::Function => "Function",
+            Self::TemporaryView => "Temporary View",
+            Self::LogicalPlan => "Logical Plan",
         };
         write!(f, "{name}")
     }

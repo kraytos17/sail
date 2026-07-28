@@ -74,7 +74,7 @@ impl CatalogManager {
                 CatalogObject::Function,
                 function
                     .iter()
-                    .map(|part| part.as_ref())
+                    .map(std::convert::AsRef::as_ref)
                     .collect::<Vec<_>>()
                     .join("."),
             ));

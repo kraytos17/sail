@@ -21,7 +21,7 @@ impl From<Namespace> for Vec<Arc<str>> {
 impl From<Namespace> for Vec<String> {
     fn from(namespace: Namespace) -> Self {
         let mut result = vec![namespace.head.to_string()];
-        result.extend(namespace.tail.iter().map(|s| s.to_string()));
+        result.extend(namespace.tail.iter().map(std::string::ToString::to_string));
         result
     }
 }
@@ -48,7 +48,7 @@ impl<T: AsRef<str>> TryFrom<&[T]> for Namespace {
             .next()
             .ok_or_else(|| CatalogError::InvalidArgument("empty namespace".to_string()))?
             .into();
-        let tail = iter.map(|s| s.into()).collect();
+        let tail = iter.map(std::convert::Into::into).collect();
         Ok(Self { head, tail })
     }
 }
@@ -59,22 +59,25 @@ impl<T: AsRef<str>> PartialEq<&[T]> for Namespace {
         iter.next()
             .is_some_and(|x| x.as_ref() == self.head.as_ref())
             && iter
-                .map(|x| x.as_ref())
-                .eq(self.tail.iter().map(|x| x.as_ref()))
+                .map(std::convert::AsRef::as_ref)
+                .eq(self.tail.iter().map(std::convert::AsRef::as_ref))
     }
 }
 
 impl Namespace {
+    #[must_use]
     pub fn is_child_of(&self, other: &Self) -> bool {
         self.head == other.head
             && self.tail.len() == other.tail.len() + 1
             && self.tail.iter().zip(other.tail.iter()).all(|(a, b)| a == b)
     }
 
+    #[must_use]
     pub fn is_parent_of(&self, other: &Self) -> bool {
         other.is_child_of(self)
     }
 
+    #[must_use]
     pub fn starts_with(&self, other: &Self) -> bool {
         self.head == other.head
             && self.tail.len() >= other.tail.len()
