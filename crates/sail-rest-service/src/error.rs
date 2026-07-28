@@ -34,9 +34,11 @@ impl IntoResponse for RestError {
                     .to_string(),
             ),
             _ => {
+                let escaped = serde_json::to_string(&self.to_string())
+                    .unwrap_or_else(|_| "\"unknown\"".to_string());
                 let body = format!(
-                    r#"{{"status":"error: {}","columns":[],"rows":[],"rowCount":0}}"#,
-                    self
+                    r#"{{"status":{},"columns":[],"rows":[],"rowCount":0}}"#,
+                    escaped
                 );
                 (StatusCode::INTERNAL_SERVER_ERROR, body)
             }

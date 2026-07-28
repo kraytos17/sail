@@ -9,7 +9,7 @@ use sail_session::session_manager::SessionManager;
 use serde::Deserialize;
 
 use crate::error::RestError;
-use crate::query::execute_and_write_result;
+use crate::query::{execute_and_write_result, write_json_string};
 use crate::session::{default_session_id, get_session_context};
 
 #[derive(Deserialize)]
@@ -49,11 +49,8 @@ pub async fn handle_batch(
         match execute_and_write_result(&ctx, sql, &mut buf, req.timeout_secs).await {
             Ok(()) => {}
             Err(e) => {
-                let _ = write!(
-                    buf,
-                    "\"columns\":[],\"rows\":[],\"rowCount\":0,\"status\":\"error: {}\"",
-                    e
-                );
+                buf.extend_from_slice(b"\"columns\":[],\"rows\":[],\"rowCount\":0,\"status\":");
+                write_json_string(&mut buf, &format!("error: {}", e));
                 if !req.continue_on_error {
                     for _ in (idx + 1)..total {
                         buf.extend_from_slice(

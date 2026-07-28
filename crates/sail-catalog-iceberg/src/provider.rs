@@ -2082,9 +2082,15 @@ impl CatalogProvider for IcebergRestCatalogProvider {
                         apis::Error::ResponseError(apis::ResponseContent { status, .. })
                             if status == reqwest::StatusCode::NOT_FOUND
                     );
+                    let is_conflict = matches!(
+                        e,
+                        apis::Error::ResponseError(apis::ResponseContent { status, .. })
+                            if status == reqwest::StatusCode::CONFLICT
+                    );
                     let err_str = format!("{e}");
                     let is_server_error = err_str.contains("status code 5");
-                    if (is_not_found || is_server_error) && attempt + 1 < max_retries {
+                    if (is_not_found || is_server_error || is_conflict) && attempt + 1 < max_retries
+                    {
                         log::warn!(
                             "transient error committing Iceberg table '{:?}.{}', retrying (attempt {}/{}): {}",
                             database,

@@ -24,7 +24,17 @@ impl WorkerActor {
         signal: oneshot::Sender<()>,
     ) -> ActorAction {
         let worker_id = self.options.worker_id;
-        info!("worker {worker_id} server is ready on port {port}");
+        info!(
+            "worker={} status=ready driver={}:{} listen={}:{} external={}:{} heartbeat={}s",
+            worker_id,
+            self.options.driver_host,
+            self.options.driver_port,
+            self.options.worker_listen_host,
+            port,
+            self.options.worker_external_host,
+            port,
+            self.options.worker_heartbeat_interval.as_secs(),
+        );
         let server = mem::take(&mut self.server);
         self.server = match server.ready(signal) {
             Ok(x) => x,
@@ -104,9 +114,23 @@ impl WorkerActor {
         definition: TaskDefinition,
         peers: Vec<WorkerLocation>,
     ) -> ActorAction {
+        log::info!(
+            "worker={} task job={} stage={} partition={} attempt={} status=running plan_bytes={}",
+            self.options.worker_id,
+            key.job_id,
+            key.stage,
+            key.partition,
+            key.attempt,
+            definition.plan.len(),
+        );
         self.peer_tracker.track(ctx, peers);
-        self.task_runner
-            .run_task(ctx, key, definition, self.options.session.task_ctx());
+        self.task_runner.run_task(
+            ctx,
+            key,
+            definition,
+            self.options.session.task_ctx(),
+            self.options.worker_id,
+        );
         ActorAction::Continue
     }
 

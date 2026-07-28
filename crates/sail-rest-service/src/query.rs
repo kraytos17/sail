@@ -415,13 +415,15 @@ pub async fn handle_query(
                 RestError::Timeout => Bytes::from_static(
                     b"{\"status\":\"error: query timed out\",\"columns\":[],\"rows\":[],\"rowCount\":0}",
                 ),
-                _ => Bytes::from(
-                    format!(
-                        "{{\"status\":\"error: {}\",\"columns\":[],\"rows\":[],\"rowCount\":0}}",
-                        e
-                    )
-                    .into_bytes(),
-                ),
+                _ => {
+                    let escaped = serde_json::to_string(&e.to_string())
+                        .unwrap_or_else(|_| "\"unknown\"".to_string());
+                    let json = format!(
+                        "{{\"status\":{},\"columns\":[],\"rows\":[],\"rowCount\":0}}",
+                        escaped
+                    );
+                    Bytes::from(json.into_bytes())
+                },
             };
             let _ = tx.send(Ok(err_json)).await;
         }

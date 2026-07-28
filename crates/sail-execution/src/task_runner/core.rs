@@ -20,7 +20,7 @@ use tokio::sync::oneshot;
 
 use crate::driver::TaskStatus;
 use crate::error::{ExecutionError, ExecutionResult};
-use crate::id::{TaskKey, TaskKeyDisplay};
+use crate::id::{TaskKey, TaskKeyDisplay, WorkerId};
 use crate::plan::{ShuffleReadExec, ShuffleWriteExec, StageInputExec};
 use crate::proto::codec::RemoteExecutionCodec;
 use crate::proto::decode::try_decode_physical_plan;
@@ -43,6 +43,7 @@ impl TaskRunner {
         key: TaskKey,
         definition: TaskDefinition,
         context: Arc<TaskContext>,
+        worker_id: WorkerId,
     ) where
         T::Message: TaskRunnerMessage + StreamAccessorMessage,
     {
@@ -62,7 +63,7 @@ impl TaskRunner {
         let handle = ctx.handle().clone();
         let (tx, rx) = oneshot::channel();
         self.signals.insert(key.clone(), tx);
-        let monitor = TaskMonitor::new(handle, key, stream, rx);
+        let monitor = TaskMonitor::new(handle, key, stream, rx, worker_id);
         ctx.spawn(monitor.run());
     }
 

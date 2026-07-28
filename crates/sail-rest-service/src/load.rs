@@ -9,7 +9,6 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::{RestError, with_timeout};
-use crate::locks::table_locks;
 use crate::query::execute_sql_to_batches;
 use crate::session::get_session_context;
 
@@ -143,9 +142,6 @@ pub async fn handle_load(
             req.schema_name, req.table_name, view_name
         ),
     };
-
-    let table_key = format!("{}.{}", req.schema_name, req.table_name);
-    let _table_lock = table_locks().lock(&table_key).await;
 
     let result =
         match with_timeout(execute_sql_to_batches(&ctx, &insert_sql), req.timeout_secs).await {

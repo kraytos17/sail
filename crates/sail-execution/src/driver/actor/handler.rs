@@ -569,9 +569,13 @@ impl DriverActor {
                 self.job_scheduler
                     .update_task(&entry.key, TaskState::Scheduled, None, None);
                 match assignment.assignment {
-                    TaskAssignment::Driver => self
-                        .task_runner
-                        .run_task(ctx, entry.key, definition, context),
+                    TaskAssignment::Driver => self.task_runner.run_task(
+                        ctx,
+                        entry.key,
+                        definition,
+                        context,
+                        WorkerId::from(0),
+                    ),
                     TaskAssignment::Worker { worker_id, slot: _ } => self
                         .worker_pool
                         .run_task(ctx, worker_id, entry.key, definition),

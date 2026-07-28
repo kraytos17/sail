@@ -2322,15 +2322,23 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                         .table_schema()
                         .cloned()
                         .unwrap_or_else(|| delete_exec.schema());
-                    let phys_expr = Self::encode_expr_as_physical(
-                        self,
-                        delete_exec
-                            .condition()
-                            .as_ref()
-                            .expect("DELETE condition should be present for delete exec"),
-                        delete_exec.session_state(),
-                        &exec_schema,
-                    )?;
+                    let phys_expr = match delete_exec.condition().as_ref() {
+                        Some(cond) => Self::encode_expr_as_physical(
+                            self,
+                            cond,
+                            delete_exec.session_state(),
+                            &exec_schema,
+                        )?,
+                        None => Self::encode_expr_as_physical(
+                            self,
+                            &ExprWithSource {
+                                expr: Expr::Literal(ScalarValue::Boolean(Some(true)), None),
+                                source: None,
+                            },
+                            delete_exec.session_state(),
+                            &exec_schema,
+                        )?,
+                    };
                     (String::new(), phys_expr)
                 }
             };
@@ -2626,13 +2634,19 @@ fn spec_expr_to_datafusion_expr(
             if arguments.len() == 2 {
                 let mut args = arguments.into_iter();
                 let left = spec_expr_to_datafusion_expr(
-                    args.next()
-                        .expect("2-arg function confirmed to have 2 elements"),
+                    args.next().ok_or_else(|| {
+                        plan_datafusion_err!(
+                            "internal error: expected 2 arguments for '{op_name}', got 0"
+                        )
+                    })?,
                     column_types,
                 )?;
                 let right = spec_expr_to_datafusion_expr(
-                    args.next()
-                        .expect("2-arg function confirmed to have 2 elements"),
+                    args.next().ok_or_else(|| {
+                        plan_datafusion_err!(
+                            "internal error: expected 2 arguments for '{op_name}', got 1"
+                        )
+                    })?,
                     column_types,
                 )?;
                 let op = match op_name.as_str() {
@@ -2663,10 +2677,11 @@ fn spec_expr_to_datafusion_expr(
                 })
             } else if arguments.len() == 1 {
                 let inner = spec_expr_to_datafusion_expr(
-                    arguments
-                        .into_iter()
-                        .next()
-                        .expect("1-arg function confirmed to have 1 element"),
+                    arguments.into_iter().next().ok_or_else(|| {
+                        plan_datafusion_err!(
+                            "internal error: expected 1 argument for '{op_name}', got 0"
+                        )
+                    })?,
                     column_types,
                 )?;
                 match op_name.as_str() {
@@ -2693,13 +2708,19 @@ fn spec_expr_to_datafusion_expr(
             if f.arguments.len() == 2 {
                 let mut args = f.arguments.into_iter();
                 let left = spec_expr_to_datafusion_expr(
-                    args.next()
-                        .expect("2-arg function confirmed to have 2 elements"),
+                    args.next().ok_or_else(|| {
+                        plan_datafusion_err!(
+                            "internal error: expected 2 arguments for '{op_name}', got 0"
+                        )
+                    })?,
                     column_types,
                 )?;
                 let right = spec_expr_to_datafusion_expr(
-                    args.next()
-                        .expect("2-arg function confirmed to have 2 elements"),
+                    args.next().ok_or_else(|| {
+                        plan_datafusion_err!(
+                            "internal error: expected 2 arguments for '{op_name}', got 1"
+                        )
+                    })?,
                     column_types,
                 )?;
                 let op = match op_name.as_str() {
@@ -2730,10 +2751,11 @@ fn spec_expr_to_datafusion_expr(
                 })
             } else if f.arguments.len() == 1 {
                 let inner = spec_expr_to_datafusion_expr(
-                    f.arguments
-                        .into_iter()
-                        .next()
-                        .expect("1-arg function confirmed to have 1 element"),
+                    f.arguments.into_iter().next().ok_or_else(|| {
+                        plan_datafusion_err!(
+                            "internal error: expected 1 argument for '{op_name}', got 0"
+                        )
+                    })?,
                     column_types,
                 )?;
                 match op_name.as_str() {

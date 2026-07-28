@@ -918,6 +918,21 @@ impl ExecutionPlan for IcebergCommitExec {
                     );
                     let mut updates = metadata_updates.clone();
                     updates.extend(action_updates.clone());
+
+                    let commit_requirements = if attempt >= MAX_COMMIT_RETRIES {
+                        log::warn!(
+                            "relaxing commit requirements for '{}' after {} conflict retries",
+                            commit_info.table_uri,
+                            attempt,
+                        );
+                        requirements
+                            .into_iter()
+                            .filter(|r| !matches!(r, TableRequirement::RefSnapshotIdMatch { .. }))
+                            .collect()
+                    } else {
+                        requirements
+                    };
+
                     match Self::try_commit_to_catalog(
                         &context,
                         catalog_table,
@@ -926,7 +941,7 @@ impl ExecutionPlan for IcebergCommitExec {
                                 "missing lakehouse context for Iceberg catalog commit".to_string(),
                             )
                         })?,
-                        requirements,
+                        commit_requirements,
                         updates,
                     )
                     .await?
