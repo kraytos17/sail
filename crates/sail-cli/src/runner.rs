@@ -4,8 +4,8 @@ use sail_common::error::CommonError;
 use crate::flight::run_flight_server;
 use crate::spark::run::run_pyspark_script;
 use crate::spark::{
-    McpSettings, McpTransport, run_pyspark_shell, run_rest_server, run_spark_connect_server,
-    run_spark_mcp_server,
+    McpSettings, McpTransport, run_all_in_one, run_pyspark_shell, run_rest_server,
+    run_spark_connect_server, run_spark_mcp_server,
 };
 use crate::worker::run_worker;
 
@@ -138,6 +138,17 @@ enum SparkCommand {
         )]
         port: u16,
     },
+    #[command(about = "Start both Spark Connect and REST servers in one process")]
+    AllInOne {
+        #[arg(long, default_value = "0.0.0.0", help = "Spark Connect gRPC bind IP")]
+        grpc_ip: String,
+        #[arg(long, default_value_t = 50051, help = "Spark Connect gRPC port")]
+        grpc_port: u16,
+        #[arg(long, default_value = "0.0.0.0", help = "REST HTTP bind IP")]
+        rest_ip: String,
+        #[arg(long, default_value_t = 48119, help = "REST HTTP port")]
+        rest_port: u16,
+    },
 }
 
 pub fn main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -196,6 +207,12 @@ pub fn main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 )
             }
             SparkCommand::RestServer { ip, port } => run_rest_server(ip.parse()?, port),
+            SparkCommand::AllInOne {
+                grpc_ip,
+                grpc_port,
+                rest_ip,
+                rest_port,
+            } => run_all_in_one(grpc_ip.parse()?, grpc_port, rest_ip.parse()?, rest_port),
         },
         Command::Flight(command) => match command {
             FlightCommand::Server {

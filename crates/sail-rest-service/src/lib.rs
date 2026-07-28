@@ -45,6 +45,10 @@ impl RestService {
         Ok(Self { session_manager })
     }
 
+    pub fn from_session_manager(session_manager: Arc<SessionManager>) -> Self {
+        Self { session_manager }
+    }
+
     pub fn session_manager(&self) -> &Arc<SessionManager> {
         &self.session_manager
     }

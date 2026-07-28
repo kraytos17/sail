@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_stream;
 use datafusion::prelude::SessionContext;
 use log::debug;
@@ -25,11 +27,11 @@ use crate::spark::connect::{
 
 #[derive(Debug)]
 pub struct SparkConnectServer {
-    session_manager: SessionManager,
+    session_manager: Arc<SessionManager>,
 }
 
 impl SparkConnectServer {
-    pub fn new(session_manager: SessionManager) -> Self {
+    pub fn new(session_manager: Arc<SessionManager>) -> Self {
         Self { session_manager }
     }
 }

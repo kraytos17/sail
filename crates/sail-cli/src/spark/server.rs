@@ -2,10 +2,13 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use axum::serve;
 use log::{error, info};
 use sail_common::config::AppConfig;
 use sail_common::runtime::RuntimeManager;
-use sail_spark_connect::entrypoint::serve;
+use sail_rest_service::RestService;
+use sail_spark_connect::entrypoint::serve as spark_connect_serve;
+use sail_spark_connect::session_manager::create_spark_session_manager;
 use tokio::net::TcpListener;
 
 /// Handles graceful shutdown by waiting for a `SIGINT` signal in [tokio].
@@ -92,7 +95,7 @@ where
         let server_address = listener.local_addr()?;
         let server_task = async move {
             info!("Starting the Spark Connect server on {server_address}...");
-            match serve(listener, signal, config, handle).await {
+            match spark_connect_serve(listener, signal, config, handle).await {
                 Ok(()) => {
                     info!("The Spark Connect server has stopped.");
                     Ok(())
@@ -122,4 +125,63 @@ where
 
 pub fn run_spark_connect_server(ip: IpAddr, port: u16) -> Result<(), Box<dyn std::error::Error>> {
     with_spark_connect_server((ip, port), shutdown(), |_| async { Ok(()) })
+}
+
+pub fn run_all_in_one(
+    grpc_ip: IpAddr,
+    grpc_port: u16,
+    rest_ip: IpAddr,
+    rest_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = Arc::new(AppConfig::load()?);
+    let runtime = RuntimeManager::try_new(&config.runtime)?;
+
+    let _telemetry = runtime
+        .handle()
+        .primary()
+        .block_on(async { telemetry::TelemetryGuard::try_new(&config) })?;
+
+    runtime.handle().primary().block_on(async {
+        let session_manager = Arc::new(create_spark_session_manager(
+            config,
+            runtime.handle().clone(),
+        )?);
+
+        let grpc_listener = TcpListener::bind((grpc_ip, grpc_port)).await?;
+        info!(
+            "Starting the Spark Connect server on {}...",
+            grpc_listener.local_addr()?
+        );
+
+        let rest_listener = TcpListener::bind((rest_ip, rest_port)).await?;
+        info!(
+            "Starting the REST server on {}...",
+            rest_listener.local_addr()?
+        );
+
+        let sm = session_manager.clone();
+        let grpc = async {
+            sail_spark_connect::entrypoint::serve_with_session_manager(
+                grpc_listener,
+                shutdown(),
+                sm,
+            )
+            .await
+        };
+
+        let rest_service = RestService::from_session_manager(session_manager);
+        let rest_router = rest_service.router();
+        let rest = async {
+            serve(rest_listener, rest_router)
+                .with_graceful_shutdown(shutdown())
+                .await
+        };
+
+        tokio::select! {
+            r = grpc => { if let Err(e) = r { error!("gRPC server error: {e}"); } }
+            r = rest => { if let Err(e) = r { error!("REST server error: {e}"); } }
+        }
+
+        Ok(())
+    })
 }
