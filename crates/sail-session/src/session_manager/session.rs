@@ -63,9 +63,15 @@ impl ServerSession {
 }
 
 pub enum ServerSessionState {
-    Running { context: SessionContext },
+    Running {
+        context: SessionContext,
+    },
     Deleting,
-    Deleted { history: Arc<SessionHistory> },
+    #[allow(dead_code)]
+    Deleted {
+        history: Arc<SessionHistory>,
+    },
+    #[allow(dead_code)]
     Failed,
 }
 

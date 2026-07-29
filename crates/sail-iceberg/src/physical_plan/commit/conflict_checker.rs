@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use datafusion_common::{DataFusionError, Result};
 use log::{debug, warn};
@@ -73,19 +73,24 @@ pub enum ConflictReason {
     Unknown { message: String },
 }
 
-/// Result of running conflict detection.
+/// Result of running conflict detection (internal).
+/// On success, contains the updated metadata reflecting the winning commit.
 #[derive(Debug)]
-pub enum ConflictCheckResult {
-    /// No semantic conflict — transaction can proceed with updated state.
-    NoConflict {
-        /// Updated metadata reflecting winning commit's changes.
-        updated_metadata: TableMetadata,
-    },
+pub(crate) struct ConflictCheckResult {
+    pub updated_metadata: TableMetadata,
+}
+
+/// Outcome of semantic conflict checking (integration layer).
+#[derive(Debug)]
+pub enum ConflictCheckOutcome {
+    /// No semantic conflict — transaction can retry with updated state.
+    NoConflict { updated_metadata: TableMetadata },
     /// Semantic conflict detected — transaction must fail.
-    Conflict {
-        /// Reason for the conflict.
-        reason: ConflictReason,
-    },
+    SemanticConflict { reason: ConflictReason },
+    /// Could not load winning commit — fall back to blind retry.
+    Fallback,
+    /// Conflict checker failed with an error — fall back to blind retry.
+    Error { error: String },
 }
 
 /// Information about the current (rejected) transaction.
@@ -184,7 +189,7 @@ pub struct ConflictChecker {
 
 impl ConflictChecker {
     /// Run all conflict checks and return the result.
-    pub fn check_conflicts(&self) -> Result<ConflictCheckResult> {
+    pub(crate) fn check_conflicts(&self) -> Result<ConflictCheckResult> {
         debug!(
             "Starting Iceberg conflict check: our_op={:?}, winning_op={:?}",
             self.transaction.operation, self.winning_commit.operation
@@ -199,7 +204,7 @@ impl ConflictChecker {
 
         let updated_metadata = self.winning_commit.metadata.clone();
 
-        Ok(ConflictCheckResult::NoConflict { updated_metadata })
+        Ok(ConflictCheckResult { updated_metadata })
     }
 
     fn check_table_uuid(&self) -> Result<()> {
@@ -374,6 +379,32 @@ impl ConflictChecker {
         }
 
         Ok(())
+    }
+}
+
+/// Cache for winning commit summaries to avoid redundant
+/// catalog and object-store loads across retry attempts.
+///
+/// Keyed by `snapshot_id` — each commit produces a unique snapshot.
+/// When multiple transactions conflict against the same winning
+/// commit, only the first one loads manifests from storage.
+pub struct WinningCommitCache {
+    entries: HashMap<i64, WinningCommitSummary>,
+}
+
+impl WinningCommitCache {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    pub fn get(&self, snapshot_id: i64) -> Option<&WinningCommitSummary> {
+        self.entries.get(&snapshot_id)
+    }
+
+    pub fn insert(&mut self, snapshot_id: i64, summary: WinningCommitSummary) {
+        self.entries.entry(snapshot_id).or_insert(summary);
     }
 }
 

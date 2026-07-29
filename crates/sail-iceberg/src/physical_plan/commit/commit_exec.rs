@@ -10,6 +10,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -46,14 +47,18 @@ use crate::operations::helpers::format_version_for_schema;
 use crate::operations::{Transaction, TransactionAction};
 use crate::physical_plan::action_schema::decode_actions_and_meta_from_batch;
 use crate::physical_plan::commit::IcebergCommitInfo;
+use crate::physical_plan::commit::conflict_checker::{
+    ConflictCheckOutcome, ConflictChecker, ConflictReason, TransactionInfo, WinningCommitCache,
+    WinningCommitSummary,
+};
 use crate::spec::catalog::TableUpdate;
 use crate::spec::manifest_list::ManifestFile;
 use crate::spec::metadata::table_metadata::SnapshotLog;
 use crate::spec::partition::{UnboundPartitionField, UnboundPartitionSpec};
 use crate::spec::snapshots::MAIN_BRANCH;
 use crate::spec::{
-    FormatVersion, ManifestList, MetadataLog, Operation, PartitionSpec, Schema as IcebergSchema,
-    Snapshot, TableMetadata, TableRequirement,
+    DataFile, FormatVersion, ManifestList, ManifestStatus, MetadataLog, Operation, PartitionSpec,
+    Schema as IcebergSchema, Snapshot, TableMetadata, TableRequirement,
 };
 use crate::table::find_latest_metadata_file;
 use crate::table::metadata_loader::{
@@ -367,6 +372,211 @@ impl IcebergCommitExec {
     fn table_metadata_location(table_url: &Url, metadata_file: &str) -> Result<String> {
         table_metadata_location(table_url, metadata_file)
     }
+
+    async fn load_manifest_data_files(
+        store_ctx: &StoreContext,
+        manifest_list_path: &str,
+        format_version: FormatVersion,
+    ) -> Result<(Vec<DataFile>, Vec<DataFile>)> {
+        let manifest_list_bytes = store_ctx
+            .prefixed
+            .get(&object_store::path::Path::from(manifest_list_path))
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .bytes()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let manifest_list = ManifestList::parse_with_version(&manifest_list_bytes, format_version)
+            .map_err(|e| DataFusionError::Execution(e))?;
+
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+
+        for manifest_file in manifest_list.entries() {
+            let manifest_bytes = store_ctx
+                .prefixed
+                .get(&object_store::path::Path::from(
+                    manifest_file.manifest_path.as_str(),
+                ))
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+                .bytes()
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let manifest = crate::spec::manifest::Manifest::parse_avro(&manifest_bytes)
+                .map_err(|e| DataFusionError::Execution(e))?;
+
+            for entry in manifest.entries() {
+                match entry.status {
+                    ManifestStatus::Added => {
+                        added.push(entry.data_file.clone());
+                    }
+                    ManifestStatus::Deleted => {
+                        removed.push(entry.data_file.clone());
+                    }
+                    ManifestStatus::Existing => {}
+                }
+            }
+        }
+
+        Ok((added, removed))
+    }
+
+    async fn try_semantic_conflict_check(
+        context: &Arc<TaskContext>,
+        store_ctx: &StoreContext,
+        catalog_table: &[String],
+        commit_info: &IcebergCommitInfo,
+        table_meta: &TableMetadata,
+        cache: &mut WinningCommitCache,
+    ) -> ConflictCheckOutcome {
+        let catalog_table_info = match Self::load_catalog_table_info(context, catalog_table).await {
+            Ok(info) => info,
+            Err(e) => {
+                log::debug!("Could not load catalog table info for conflict check: {e}");
+                return ConflictCheckOutcome::Fallback;
+            }
+        };
+
+        let metadata_location = match catalog_table_info.metadata_location {
+            Some(loc) => loc,
+            None => {
+                log::debug!("No metadata location for conflict check");
+                return ConflictCheckOutcome::Fallback;
+            }
+        };
+
+        let latest_meta = match metadata_location_to_object_path_string(&metadata_location) {
+            Ok(path) => path,
+            Err(e) => {
+                log::debug!("Invalid metadata location for conflict check: {e}");
+                return ConflictCheckOutcome::Fallback;
+            }
+        };
+
+        let bytes = match load_metadata_file_bytes(&store_ctx.prefixed, &latest_meta).await {
+            Ok(b) => b,
+            Err(e) => {
+                log::debug!("Could not load winning metadata for conflict check: {e}");
+                return ConflictCheckOutcome::Fallback;
+            }
+        };
+
+        let winning_metadata = match TableMetadata::from_json(&bytes)
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+        {
+            Ok(m) => m,
+            Err(e) => {
+                log::debug!("Could not parse winning metadata for conflict check: {e}");
+                return ConflictCheckOutcome::Fallback;
+            }
+        };
+
+        let snapshot_info = match winning_metadata.current_snapshot() {
+            Some(s) => (
+                s.summary.operation.clone(),
+                s.snapshot_id,
+                s.parent_snapshot_id,
+                s.manifest_list.clone(),
+            ),
+            None => {
+                log::debug!("No current snapshot in winning metadata for conflict check");
+                return ConflictCheckOutcome::Fallback;
+            }
+        };
+
+        // Check cache before loading manifests
+        let cache_key = snapshot_info.1;
+        let (added_files, removed_files, partition_values) = if let Some(cached) =
+            cache.get(cache_key)
+        {
+            log::debug!("Winning commit cache hit for snapshot {}", cache_key);
+            (
+                cached.added_files.clone(),
+                cached.removed_files.clone(),
+                cached.partition_values.clone(),
+            )
+        } else {
+            let format_version = winning_metadata.format_version;
+            let (added, removed) =
+                match Self::load_manifest_data_files(store_ctx, &snapshot_info.3, format_version)
+                    .await
+                {
+                    Ok(files) => files,
+                    Err(e) => {
+                        log::debug!("Could not load manifest data for conflict check: {e}");
+                        (Vec::new(), Vec::new())
+                    }
+                };
+
+            let partition_spec = winning_metadata
+                .default_partition_spec()
+                .cloned()
+                .unwrap_or_else(PartitionSpec::unpartitioned_spec);
+            let partitions: HashSet<
+                crate::physical_plan::commit::conflict_checker::PartitionKey,
+            > = added
+                .iter()
+                .chain(removed.iter())
+                .map(|f| {
+                    crate::physical_plan::commit::conflict_checker::PartitionKey::from_data_file(
+                        f,
+                        &partition_spec,
+                    )
+                })
+                .collect();
+
+            // Cache for future retries
+            cache.insert(
+                cache_key,
+                WinningCommitSummary {
+                    operation: snapshot_info.0.clone(),
+                    added_files: added.clone(),
+                    removed_files: removed.clone(),
+                    partition_values: partitions.clone(),
+                    schema_changes: None,
+                    snapshot_id: cache_key,
+                    parent_snapshot_id: snapshot_info.2,
+                    metadata: winning_metadata.clone(),
+                },
+            );
+
+            (added, removed, partitions)
+        };
+
+        let transaction_info = TransactionInfo::new(table_meta, commit_info);
+
+        let winning_summary = WinningCommitSummary {
+            operation: snapshot_info.0,
+            added_files,
+            removed_files,
+            partition_values,
+            schema_changes: None,
+            snapshot_id: snapshot_info.1,
+            parent_snapshot_id: snapshot_info.2,
+            metadata: winning_metadata,
+        };
+
+        let checker = ConflictChecker {
+            transaction: transaction_info,
+            winning_commit: winning_summary,
+        };
+
+        match checker.check_conflicts() {
+            Ok(result) => ConflictCheckOutcome::NoConflict {
+                updated_metadata: result.updated_metadata,
+            },
+            Err(e) => {
+                log::warn!("Semantic conflict detected during commit: {e}");
+                ConflictCheckOutcome::SemanticConflict {
+                    reason: ConflictReason::Unknown {
+                        message: e.to_string(),
+                    },
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -587,6 +797,7 @@ impl ExecutionPlan for IcebergCommitExec {
 
             let initial_latest_meta = latest_meta_res?;
 
+            let mut conflict_cache = WinningCommitCache::new();
             let mut attempt = 0;
             loop {
                 attempt += 1;
@@ -979,6 +1190,48 @@ impl ExecutionPlan for IcebergCommitExec {
                         CatalogCommitOutcome::Conflict => {
                             if attempt >= MAX_COMMIT_RETRIES {
                                 return Err(commit_conflict_error());
+                            }
+
+                            if let Some(catalog_table) = catalog_commit_table {
+                                match Self::try_semantic_conflict_check(
+                                    &context,
+                                    &store_ctx,
+                                    catalog_table,
+                                    &commit_info,
+                                    &table_meta,
+                                    &mut conflict_cache,
+                                )
+                                .await
+                                {
+                                    ConflictCheckOutcome::NoConflict {
+                                        updated_metadata: _,
+                                    } => {
+                                        log::info!(
+                                            "Iceberg commit conflict resolved: \
+                                             no semantic conflict, retrying with updated metadata"
+                                        );
+                                        sleep_with_jitter(5, attempt - 1).await;
+                                        continue;
+                                    }
+                                    ConflictCheckOutcome::SemanticConflict { reason } => {
+                                        return Err(DataFusionError::Plan(format!(
+                                            "Iceberg commit failed due to semantic conflict: {:?}",
+                                            reason
+                                        )));
+                                    }
+                                    ConflictCheckOutcome::Fallback => {
+                                        log::debug!(
+                                            "Iceberg conflict checker: fallback to blind retry"
+                                        );
+                                    }
+                                    ConflictCheckOutcome::Error { error } => {
+                                        log::warn!(
+                                            "Iceberg conflict checker error: {}, \
+                                             falling back to blind retry",
+                                            error
+                                        );
+                                    }
+                                }
                             }
                             sleep_with_jitter(5, attempt - 1).await;
                             continue;

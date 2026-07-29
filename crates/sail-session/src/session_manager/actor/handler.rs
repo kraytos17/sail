@@ -53,7 +53,7 @@ impl SessionManagerActor {
         }
 
         // Session doesn't exist or is in non-Running state — remove stale entry and create new
-        self.sessions.remove(&session_id);
+        self.sessions.swap_remove(&session_id);
 
         info!("creating session {session_id}");
         let span = Span::root(
@@ -153,7 +153,7 @@ impl SessionManagerActor {
         session_id: String,
         _history: SessionHistory,
     ) -> ActorAction {
-        if self.sessions.remove(&session_id).is_some() {
+        if self.sessions.swap_remove(&session_id).is_some() {
             info!("removed terminated session {session_id}");
         } else {
             warn!("session not found: {session_id}");
@@ -166,7 +166,7 @@ impl SessionManagerActor {
         _ctx: &mut ActorContext<Self>,
         session_id: String,
     ) -> ActorAction {
-        if self.sessions.remove(&session_id).is_some() {
+        if self.sessions.swap_remove(&session_id).is_some() {
             warn!("removed failed session {session_id}");
         } else {
             warn!("session not found: {session_id}");
