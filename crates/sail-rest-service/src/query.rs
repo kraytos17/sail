@@ -307,7 +307,7 @@ pub(crate) async fn execute_and_write_result(
         while let Some(result) = stream.next().await {
             let batch = result.map_err(|e| RestError::Session(format!("stream error: {e}")))?;
             if first_batch {
-                buf.extend_from_slice(b"\"columns\":");
+                buf.extend_from_slice(b"\"status\":\"ok\",\"columns\":");
                 write_columns(buf, batch.schema().as_ref());
                 buf.extend_from_slice(b",\"rows\":[");
                 first_batch = false;
@@ -326,7 +326,7 @@ pub(crate) async fn execute_and_write_result(
     with_timeout(stream_fut, timeout_secs).await?;
 
     if first_batch {
-        buf.extend_from_slice(b"\"columns\":[],\"rows\":[],\"rowCount\":0");
+        buf.extend_from_slice(b"\"status\":\"ok\",\"columns\":[],\"rows\":[],\"rowCount\":0");
     } else {
         let _ = write!(buf, "],\"rowCount\":{}", row_count);
     }

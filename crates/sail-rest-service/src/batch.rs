@@ -57,6 +57,7 @@ pub async fn handle_batch(
                             b",{\"columns\":[],\"rows\":[],\"rowCount\":0,\"status\":\"skipped\"}",
                         );
                     }
+                    buf.push(b'}');
                     break;
                 }
             }

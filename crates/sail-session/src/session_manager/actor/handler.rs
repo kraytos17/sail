@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use chrono::Utc;
 use datafusion::prelude::SessionContext;
 use fastrace::Span;
@@ -29,43 +27,61 @@ impl SessionManagerActor {
         user_id: String,
         result: oneshot::Sender<SessionResult<SessionContext>>,
     ) -> ActorAction {
-        let context = if let Some(session) = self.sessions.get(&session_id) {
+        let running_context = self.sessions.get(&session_id).and_then(|session| {
             if let ServerSessionState::Running { context } = &session.state {
-                Ok(context.clone())
+                Some(context.clone())
             } else {
-                Err(SessionError::invalid(format!(
-                    "session {session_id} is not running"
-                )))
+                None
             }
-        } else {
-            let session_id = session_id.clone();
-            info!("creating session {session_id}");
-            let span = Span::root(
-                "SessionManagerActor::create_session_context",
-                SpanContext::random(),
-            );
-            let _guard = span.set_local_parent();
-            let info = ServerSessionInfo {
-                session_id: session_id.clone(),
-                user_id: user_id.clone(),
-                session_manager: ctx.handle().clone(),
-            };
-            match self.factory.create(info) {
-                Ok(context) => {
-                    let session = ServerSession {
-                        user_id,
-                        created_at: Utc::now(),
-                        deleted_at: None,
-                        state: ServerSessionState::Running {
-                            context: context.clone(),
-                        },
-                    };
-                    self.sessions.insert(session_id, session);
-                    Ok(context)
-                }
-                Err(e) => Err(e.into()),
+        });
+
+        if let Some(context) = running_context {
+            if let Ok(active_at) = context
+                .extension::<ActivityTracker>()
+                .and_then(|tracker| tracker.track_activity())
+            {
+                ctx.send_with_delay(
+                    SessionManagerEvent::ProbeIdleSession {
+                        session_id,
+                        instant: active_at,
+                    },
+                    self.options.session_timeout,
+                );
             }
+            let _ = result.send(Ok(context));
+            return ActorAction::Continue;
+        }
+
+        // Session doesn't exist or is in non-Running state — remove stale entry and create new
+        self.sessions.remove(&session_id);
+
+        info!("creating session {session_id}");
+        let span = Span::root(
+            "SessionManagerActor::create_session_context",
+            SpanContext::random(),
+        );
+        let _guard = span.set_local_parent();
+        let info = ServerSessionInfo {
+            session_id: session_id.clone(),
+            user_id: user_id.clone(),
+            session_manager: ctx.handle().clone(),
         };
+        let context = match self.factory.create(info) {
+            Ok(context) => {
+                let session = ServerSession {
+                    user_id,
+                    created_at: Utc::now(),
+                    deleted_at: None,
+                    state: ServerSessionState::Running {
+                        context: context.clone(),
+                    },
+                };
+                self.sessions.insert(session_id.clone(), session);
+                Ok(context)
+            }
+            Err(e) => Err(e.into()),
+        };
+
         if let Ok(context) = &context
             && let Ok(active_at) = context
                 .extension::<ActivityTracker>()
@@ -135,18 +151,12 @@ impl SessionManagerActor {
         &mut self,
         _ctx: &mut ActorContext<Self>,
         session_id: String,
-        history: SessionHistory,
+        _history: SessionHistory,
     ) -> ActorAction {
-        let Some(session) = self.sessions.get_mut(&session_id) else {
-            warn!("session not found: {session_id}");
-            return ActorAction::Continue;
-        };
-        if matches!(session.state, ServerSessionState::Deleting) {
-            session.state = ServerSessionState::Deleted {
-                history: Arc::new(history),
-            };
+        if self.sessions.remove(&session_id).is_some() {
+            info!("removed terminated session {session_id}");
         } else {
-            warn!("session is not being deleted: {session_id}");
+            warn!("session not found: {session_id}");
         }
         ActorAction::Continue
     }
@@ -156,11 +166,11 @@ impl SessionManagerActor {
         _ctx: &mut ActorContext<Self>,
         session_id: String,
     ) -> ActorAction {
-        let Some(session) = self.sessions.get_mut(&session_id) else {
+        if self.sessions.remove(&session_id).is_some() {
+            warn!("removed failed session {session_id}");
+        } else {
             warn!("session not found: {session_id}");
-            return ActorAction::Continue;
-        };
-        session.state = ServerSessionState::Failed;
+        }
         ActorAction::Continue
     }
 

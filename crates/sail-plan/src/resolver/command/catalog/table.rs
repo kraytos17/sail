@@ -239,10 +239,25 @@ impl PlanResolver<'_> {
         // Note that this is different from how Spark handles table locations
         // for the default catalog.
         let catalog_manager = self.ctx.extension::<CatalogManager>()?;
-        let location = catalog_manager
-            .get_database_by_qualifier(qualifier)
-            .await?
-            .location;
+        let location_fut = catalog_manager.get_database_by_qualifier(qualifier);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), location_fut).await;
+        let location = match result {
+            Ok(Ok(status)) => status.location,
+            Ok(Err(e)) => {
+                log::warn!(
+                    "Failed to get database location for {:?}: {e}. Using default warehouse directory.",
+                    qualifier
+                );
+                None
+            }
+            Err(_) => {
+                log::warn!(
+                    "Timeout getting database location for {:?}. Using default warehouse directory.",
+                    qualifier
+                );
+                None
+            }
+        };
         let (base, suffix) = match &location {
             Some(loc) => (
                 loc.trim_end_matches(object_store::path::DELIMITER),

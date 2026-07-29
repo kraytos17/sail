@@ -212,7 +212,7 @@ impl DriverActor {
                 .is_some_and(|s| sequence <= *s)
             {
                 // The task status update is outdated, so we skip the remaining logic.
-                warn!("{} sequence {sequence} is stale", TaskKeyDisplay(&key));
+                debug!("{} sequence {sequence} is stale", TaskKeyDisplay(&key));
                 return ActorAction::Continue;
             }
             self.task_sequences.insert(key.clone(), sequence);
@@ -585,7 +585,16 @@ impl DriverActor {
     }
 
     fn scale_up_workers(&mut self, ctx: &mut ActorContext<Self>) {
-        for _ in 0..self.task_assigner.request_workers() {
+        let count = self.task_assigner.request_workers();
+        if count > 0 {
+            log::info!(
+                "scale_up_workers: requesting {} workers (enqueued_slots={}, vacant_slots={})",
+                count,
+                self.task_assigner.enqueued_slots(),
+                self.task_assigner.vacant_slots()
+            );
+        }
+        for _ in 0..count {
             self.worker_pool.start_worker(ctx);
         }
     }

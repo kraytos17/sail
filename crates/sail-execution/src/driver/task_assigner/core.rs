@@ -55,6 +55,31 @@ impl TaskAssigner {
         required_workers
     }
 
+    pub fn enqueued_slots(&self) -> usize {
+        self.task_queue
+            .iter()
+            .map(|region| {
+                region
+                    .tasks
+                    .iter()
+                    .filter(|(placement, _)| matches!(placement, TaskPlacement::Worker))
+                    .count()
+            })
+            .sum::<usize>()
+    }
+
+    pub fn vacant_slots(&self) -> usize {
+        self.workers
+            .values()
+            .map(|worker| match worker {
+                WorkerResource::Active { task_slots, .. } => {
+                    task_slots.iter().filter(|x| x.is_vacant()).count()
+                }
+                WorkerResource::Inactive => 0,
+            })
+            .sum::<usize>()
+    }
+
     pub fn track_worker_failed_to_start(&mut self) {
         self.requested_worker_count = self.requested_worker_count.saturating_sub(1);
     }

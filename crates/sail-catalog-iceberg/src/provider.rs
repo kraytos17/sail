@@ -252,7 +252,13 @@ impl IcebergRestCatalogProvider {
         Self {
             name,
             options,
-            http_client: reqwest::Client::new(),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|e| {
+                    log::warn!("Failed to build HTTP client with timeout: {e}, using default");
+                    reqwest::Client::new()
+                }),
             resolved_catalog_config: OnceCell::new(),
         }
     }
