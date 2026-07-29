@@ -11,6 +11,7 @@
 // limitations under the License.
 
 pub mod commit_exec;
+pub mod conflict_checker;
 
 use sail_common_datafusion::catalog::LakehouseExecutionContext;
 use serde::{Deserialize, Serialize};
