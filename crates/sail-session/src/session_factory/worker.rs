@@ -3,6 +3,7 @@ use std::sync::Arc;
 use datafusion::common::Result;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use log;
 use sail_catalog::provider::CatalogCacheManager;
 use sail_common::config::AppConfig;
 use sail_common::runtime::RuntimeHandle;
@@ -61,6 +62,14 @@ impl SessionFactory<()> for WorkerSessionFactory {
             .with_default_features()
             .build();
         let session = SessionContext::new_with_state(state);
+        let state_ref = session.state_ref();
+        let state_read = state_ref.read();
+        let functions: Vec<String> = state_read.scalar_functions().keys().cloned().collect();
+        log::info!(
+            "worker_session_created with_default_features=true scalar_functions_count={}",
+            functions.len()
+        );
+        drop(state_read);
         Ok(session)
     }
 }

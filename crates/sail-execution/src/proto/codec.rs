@@ -2991,6 +2991,7 @@ impl RemoteExecutionCodec {
     }
 
     fn try_decode_udf(&self, name: &str, buf: &[u8]) -> Result<Arc<ScalarUDF>> {
+        log::info!("udf_decode_start name={name} buf_len={}", buf.len());
         // TODO: Implement custom registry to avoid codec for built-in functions.
         // The `match name` below has no session-registry fallback, so every
         // scalar UDF needs an explicit arm or distributed decode fails with
@@ -3017,10 +3018,15 @@ impl RemoteExecutionCodec {
         let ExtendedScalarUdf { udf_kind } = udf;
         let udf_kind = match udf_kind {
             Some(x) => x,
-            None => return plan_err!("ExtendedScalarUdf: no UDF found for {name}"),
+            None => {
+                log::info!("udf_decode_failed name={name} reason=no_udf_kind_in_proto");
+                return plan_err!("ExtendedScalarUdf: no UDF found for {name}");
+            }
         };
         match udf_kind {
-            UdfKind::Standard(gen_::StandardUdf {}) => {}
+            UdfKind::Standard(gen_::StandardUdf {}) => {
+                log::info!("udf_decode_kind name={name} kind=standard");
+            }
             UdfKind::PySpark(gen_::PySparkUdf {
                 kind,
                 name,
@@ -3030,6 +3036,7 @@ impl RemoteExecutionCodec {
                 output_type,
                 config,
             }) => {
+                log::info!("udf_decode_kind name={name} kind=pyspark");
                 let kind = self.try_decode_pyspark_udf_kind(kind)?;
                 let input_types = input_types
                     .iter()
@@ -3063,6 +3070,7 @@ impl RemoteExecutionCodec {
                 is_pandas,
                 config,
             }) => {
+                log::info!("udf_decode_kind name={name} kind=pyspark_cogroup_map");
                 let left_types = left_types
                     .iter()
                     .map(|x| self.try_decode_data_type(x))
@@ -3091,36 +3099,44 @@ impl RemoteExecutionCodec {
                 return Ok(Arc::new(ScalarUDF::from(udf)));
             }
             UdfKind::DropStructField(gen_::DropStructFieldUdf { field_names }) => {
+                log::info!("udf_decode_kind name={name} kind=drop_struct_field");
                 let udf = DropStructField::new(field_names);
                 return Ok(Arc::new(ScalarUDF::from(udf)));
             }
             UdfKind::Explode(gen_::ExplodeUdf { name }) => {
+                log::info!("udf_decode_kind name={name} kind=explode");
                 let kind = explode_name_to_kind(&name)?;
                 let udf = Explode::new(kind);
                 return Ok(Arc::new(ScalarUDF::from(udf)));
             }
             UdfKind::XpathTyped(gen_::XpathTypedUdf { name }) => {
+                log::info!("udf_decode_kind name={name} kind=xpath_typed");
                 let kind = xpath_typed_name_to_kind(&name)?;
                 let udf = XpathTyped::new(kind);
                 return Ok(Arc::new(ScalarUDF::from(udf)));
             }
             UdfKind::SparkToXml(gen_::SparkToXmlUdf { session_timezone }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_to_xml");
                 let udf = SparkToXml::new(Arc::from(session_timezone));
                 return Ok(Arc::new(ScalarUDF::from(udf)));
             }
             UdfKind::SparkUnixTimestamp(gen_::SparkUnixTimestampUdf { timezone }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_unix_timestamp");
                 let udf = SparkUnixTimestamp::new(Arc::from(timezone));
                 return Ok(Arc::new(ScalarUDF::from(udf)));
             }
             UdfKind::StructFunction(gen_::StructFunctionUdf { field_names }) => {
+                log::info!("udf_decode_kind name={name} kind=struct_function");
                 let udf = StructFunction::new(field_names);
                 return Ok(Arc::new(ScalarUDF::from(udf)));
             }
             UdfKind::ArraysZip(gen_::ArraysZipUdf { field_names }) => {
+                log::info!("udf_decode_kind name={name} kind=arrays_zip");
                 let udf = ArraysZip::new(field_names);
                 return Ok(Arc::new(ScalarUDF::from(udf)));
             }
             UdfKind::UpdateStructField(gen_::UpdateStructFieldUdf { field_names }) => {
+                log::info!("udf_decode_kind name={name} kind=update_struct_field");
                 let udf = UpdateStructField::new(field_names);
                 return Ok(Arc::new(ScalarUDF::from(udf)));
             }
@@ -3128,6 +3144,7 @@ impl RemoteExecutionCodec {
                 timezone,
                 time_unit,
             }) => {
+                log::info!("udf_decode_kind name={name} kind=timestamp_now");
                 let time_unit = gen_datafusion_common::TimeUnit::from_str_name(time_unit.as_str())
                     .ok_or_else(|| plan_datafusion_err!("invalid time unit: {time_unit}"))?;
                 let time_unit: TimeUnit = time_unit.into();
@@ -3139,31 +3156,39 @@ impl RemoteExecutionCodec {
                 is_try,
                 ansi_mode,
             }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_timestamp is_try={is_try}");
                 let udf = SparkTimestamp::try_new(timezone.map(Arc::from), ansi_mode, is_try)?;
                 return Ok(Arc::new(ScalarUDF::from(udf)));
             }
             UdfKind::SparkDate(gen_::SparkDateUdf { is_try }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_date is_try={is_try}");
                 return Ok(Arc::new(ScalarUDF::from(SparkDate::new(is_try))));
             }
             UdfKind::SparkTime(gen_::SparkTimeUdf { is_try }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_time is_try={is_try}");
                 return Ok(Arc::new(ScalarUDF::from(SparkTime::new(is_try))));
             }
             UdfKind::SparkFromCsv(gen_::SparkFromCsvUdf { session_timezone }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_from_csv");
                 let udf = SparkFromCSV::new(Arc::from(session_timezone));
                 return Ok(Arc::new(ScalarUDF::from(udf)));
             }
             UdfKind::SparkToCsv(gen_::SparkToCsvUdf { session_timezone }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_to_csv");
                 let udf = SparkToCsv::new(Arc::from(session_timezone));
                 return Ok(Arc::new(ScalarUDF::from(udf)));
             }
             UdfKind::SparkFromJson(gen_::SparkFromJsonUdf { session_timezone }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_from_json");
                 let udf = SparkFromJson::new(Arc::from(session_timezone));
                 return Ok(Arc::new(ScalarUDF::from(udf)));
             }
             UdfKind::SparkVariantGet(gen_::SparkVariantGetUdf { safe }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_variant_get");
                 return Ok(Arc::new(ScalarUDF::from(SparkVariantGet::new(safe))));
             }
             UdfKind::SparkNextDay(gen_::SparkNextDayUdf { ansi_mode }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_next_day");
                 return Ok(Arc::new(ScalarUDF::from(SparkNextDay::new(ansi_mode))));
             }
             UdfKind::SparkWindowBuckets(gen_::SparkWindowBucketsUdf {
@@ -3171,6 +3196,7 @@ impl RemoteExecutionCodec {
                 slide_duration,
                 start_time,
             }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_window_buckets");
                 return Ok(Arc::new(ScalarUDF::from(SparkWindowBuckets::new(
                     window_duration,
                     slide_duration,
@@ -3178,35 +3204,47 @@ impl RemoteExecutionCodec {
                 ))));
             }
             UdfKind::SparkToNumber(gen_::SparkToNumberUdf { safe }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_to_number");
                 return Ok(Arc::new(ScalarUDF::from(SparkToNumber::new(safe))));
             }
             UdfKind::SparkToChar(gen_::SparkToCharUdf { ansi_mode }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_to_char");
                 return Ok(Arc::new(ScalarUDF::from(SparkToChar::new(ansi_mode))));
             }
             UdfKind::SparkAbs(gen_::SparkAbsUdf { ansi_mode }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_abs");
                 return Ok(Arc::new(ScalarUDF::from(SparkAbs::new(ansi_mode))));
             }
             UdfKind::SparkBin(gen_::SparkBinUdf { ansi_mode }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_bin");
                 return Ok(Arc::new(ScalarUDF::from(SparkBin::new(ansi_mode))));
             }
             UdfKind::SparkPmod(gen_::SparkPmodUdf { ansi_mode }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_pmod");
                 return Ok(Arc::new(ScalarUDF::from(SparkPmod::new(ansi_mode))));
             }
             UdfKind::SparkNegative(gen_::SparkNegativeUdf { ansi_mode }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_negative");
                 return Ok(Arc::new(ScalarUDF::from(SparkNegative::new(ansi_mode))));
             }
             UdfKind::SparkMakeTimestampNtz(gen_::SparkMakeTimestampNtzUdf { is_try }) => {
+                log::info!(
+                    "udf_decode_kind name={name} kind=spark_make_timestamp_ntz is_try={is_try}"
+                );
                 return Ok(Arc::new(ScalarUDF::from(SparkMakeTimestampNtz::new(
                     is_try,
                 ))));
             }
             UdfKind::ConvertTz(gen_::ConvertTzUdf { classic }) => {
+                log::info!("udf_decode_kind name={name} kind=convert_tz");
                 return Ok(Arc::new(ScalarUDF::from(ConvertTz::new(classic))));
             }
             UdfKind::SparkParseJson(gen_::SparkParseJsonUdf { safe }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_parse_json");
                 return Ok(Arc::new(ScalarUDF::from(SparkParseJson::new(safe))));
             }
             UdfKind::SparkStructRename(gen_::SparkStructRenameUdf { target_type }) => {
+                log::info!("udf_decode_kind name={name} kind=spark_struct_rename");
                 let target_type = self.try_decode_data_type(&target_type)?;
                 return Ok(Arc::new(ScalarUDF::from(SparkStructRename::new(
                     target_type,
@@ -3387,7 +3425,10 @@ impl RemoteExecutionCodec {
             "try_url_decode" => Ok(Arc::new(ScalarUDF::from(TryUrlDecode::new()))),
             "url_decode" => Ok(Arc::new(ScalarUDF::from(UrlDecode::new()))),
             "url_encode" => Ok(Arc::new(ScalarUDF::from(UrlEncode::new()))),
-            _ => plan_err!("could not find scalar function: {name}"),
+            _ => {
+                log::info!("udf_decode_failed name={name} reason=name_not_in_match_block");
+                plan_err!("could not find scalar function: {name}")
+            }
         }
     }
 
@@ -3657,13 +3698,24 @@ impl RemoteExecutionCodec {
             let target_type = self.try_encode_data_type(func.target_type())?;
             UdfKind::SparkStructRename(gen_::SparkStructRenameUdf { target_type })
         } else {
+            log::info!(
+                "udf_encode name={} status=builtin_empty_buffer",
+                node.name()
+            );
             return Ok(());
         };
-        let node = ExtendedScalarUdf {
+        let encode_node = ExtendedScalarUdf {
             udf_kind: Some(udf_kind),
         };
-        node.encode(buf)
-            .map_err(|e| plan_datafusion_err!("failed to encode udf: {e}"))
+        encode_node
+            .encode(buf)
+            .map_err(|e| plan_datafusion_err!("failed to encode udf: {e}"))?;
+        log::info!(
+            "udf_encode name={} status=serialized buf_len={}",
+            node.name(),
+            buf.len()
+        );
+        Ok(())
     }
 
     fn try_decode_udaf(&self, name: &str, buf: &[u8]) -> Result<Arc<AggregateUDF>> {
