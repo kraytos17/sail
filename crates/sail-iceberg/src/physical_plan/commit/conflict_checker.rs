@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
-use datafusion_common::{DataFusionError, Result};
-use log::{debug, warn};
+use log::warn;
 
 use super::IcebergCommitInfo;
 use crate::spec::{
@@ -77,14 +77,16 @@ pub enum ConflictReason {
 /// On success, contains the updated metadata reflecting the winning commit.
 #[derive(Debug)]
 pub(crate) struct ConflictCheckResult {
-    pub updated_metadata: TableMetadata,
+    pub updated_metadata: Arc<TableMetadata>,
 }
 
 /// Outcome of semantic conflict checking (integration layer).
 #[derive(Debug)]
 pub enum ConflictCheckOutcome {
     /// No semantic conflict — transaction can retry with updated state.
-    NoConflict { updated_metadata: TableMetadata },
+    NoConflict {
+        updated_metadata: Arc<TableMetadata>,
+    },
     /// Semantic conflict detected — transaction must fail.
     SemanticConflict { reason: ConflictReason },
     /// Could not load winning commit — fall back to blind retry.
@@ -96,7 +98,7 @@ pub enum ConflictCheckOutcome {
 /// Information about the current (rejected) transaction.
 pub struct TransactionInfo {
     /// Table metadata at transaction start (what we loaded).
-    pub read_metadata: TableMetadata,
+    pub read_metadata: Arc<TableMetadata>,
 
     /// Operation being performed.
     pub operation: Operation,
@@ -125,7 +127,7 @@ pub struct TransactionInfo {
 
 impl TransactionInfo {
     /// Build a `TransactionInfo` from the commit execution context.
-    pub fn new(read_metadata: &TableMetadata, commit_info: &IcebergCommitInfo) -> Self {
+    pub fn new(read_metadata: Arc<TableMetadata>, commit_info: &IcebergCommitInfo) -> Self {
         let partition_spec = read_metadata
             .default_partition_spec()
             .cloned()
@@ -138,10 +140,10 @@ impl TransactionInfo {
             .collect();
 
         Self {
-            read_metadata: read_metadata.clone(),
+            read_metadata,
             operation: commit_info.operation.clone(),
             added_files: commit_info.data_files.clone(),
-            removed_files: Vec::new(),
+            removed_files: commit_info.removed_files.clone(),
             partition_values,
             read_whole_table: false,
             schema_changes: None,
@@ -154,7 +156,7 @@ impl TransactionInfo {
 /// Summary of the commit that succeeded ahead of ours.
 pub struct WinningCommitSummary {
     /// Full table metadata AFTER the winning commit.
-    pub metadata: TableMetadata,
+    pub metadata: Arc<TableMetadata>,
 
     /// Operation performed by the winning commit.
     pub operation: Operation,
@@ -189,25 +191,31 @@ pub struct ConflictChecker {
 
 impl ConflictChecker {
     /// Run all conflict checks and return the result.
-    pub(crate) fn check_conflicts(&self) -> Result<ConflictCheckResult> {
-        debug!(
-            "Starting Iceberg conflict check: our_op={:?}, winning_op={:?}",
-            self.transaction.operation, self.winning_commit.operation
-        );
+    pub(crate) fn check_conflicts(
+        &self,
+    ) -> std::result::Result<ConflictCheckResult, ConflictReason> {
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "Starting Iceberg conflict check: our_op={:?}, winning_op={:?}",
+                self.transaction.operation,
+                self.winning_commit.operation
+            );
+        }
 
-        self.check_table_uuid()?;
+        // Catalog-authoritative commits already enforce UUID via
+        // TableRequirement::UuidMatch, and the conflict checker only
+        // runs for catalog-authoritative tables.
         self.check_schema_compatibility()?;
         self.check_partition_conflicts()?;
         self.check_file_conflicts()?;
 
-        debug!("No semantic conflicts detected");
-
-        let updated_metadata = self.winning_commit.metadata.clone();
+        let updated_metadata = Arc::clone(&self.winning_commit.metadata);
 
         Ok(ConflictCheckResult { updated_metadata })
     }
 
-    fn check_table_uuid(&self) -> Result<()> {
+    #[allow(dead_code)]
+    fn check_table_uuid(&self) -> std::result::Result<(), ConflictReason> {
         let expected = self.transaction.read_metadata.table_uuid;
         let actual = self.winning_commit.metadata.table_uuid;
 
@@ -216,16 +224,13 @@ impl ConflictChecker {
                 "Table UUID changed: expected {:?}, actual {:?}",
                 expected, actual
             );
-            return Err(DataFusionError::Plan(format!(
-                "Iceberg commit conflict: table UUID changed (expected {:?}, found {:?})",
-                expected, actual
-            )));
+            return Err(ConflictReason::TableUuidChanged { expected, actual });
         }
 
         Ok(())
     }
 
-    fn check_schema_compatibility(&self) -> Result<()> {
+    fn check_schema_compatibility(&self) -> std::result::Result<(), ConflictReason> {
         let our_change = match &self.transaction.schema_changes {
             Some(c) => c,
             None => return Ok(()),
@@ -240,26 +245,28 @@ impl ConflictChecker {
                 if actual_schema_id != expected_schema_id
                     && actual_schema_id != our_change.new_schema_id
                 {
-                    return Err(DataFusionError::Plan(format!(
-                        "Iceberg commit conflict: schema ID changed (expected {}, found {})",
-                        expected_schema_id, actual_schema_id,
-                    )));
+                    return Err(ConflictReason::SchemaIdChanged {
+                        expected: expected_schema_id,
+                        actual: actual_schema_id,
+                    });
                 }
                 return Ok(());
             }
         };
 
         if !our_change.type_changes.is_empty() || !winning_change.type_changes.is_empty() {
-            return Err(DataFusionError::Plan(format!(
-                "Iceberg commit conflict: concurrent type changes (ours={:?}, winning={:?})",
-                our_change.type_changes, winning_change.type_changes,
-            )));
+            return Err(ConflictReason::IncompatibleSchemaChange {
+                detail: format!(
+                    "Concurrent type changes: ours={:?}, winning={:?}",
+                    our_change.type_changes, winning_change.type_changes,
+                ),
+            });
         }
 
         if !our_change.removed_columns.is_empty() || !winning_change.removed_columns.is_empty() {
-            return Err(DataFusionError::Plan(
-                "Iceberg commit conflict: concurrent column removals".to_string(),
-            ));
+            return Err(ConflictReason::IncompatibleSchemaChange {
+                detail: "Concurrent column removals".to_string(),
+            });
         }
 
         let our_added: HashSet<_> = our_change.added_columns.iter().collect();
@@ -267,16 +274,15 @@ impl ConflictChecker {
         let overlap: Vec<_> = our_added.intersection(&winning_added).collect();
 
         if !overlap.is_empty() {
-            return Err(DataFusionError::Plan(format!(
-                "Iceberg commit conflict: both transactions added columns {:?}",
-                overlap,
-            )));
+            return Err(ConflictReason::IncompatibleSchemaChange {
+                detail: format!("Both transactions added columns: {:?}", overlap),
+            });
         }
 
         Ok(())
     }
 
-    fn check_partition_conflicts(&self) -> Result<()> {
+    fn check_partition_conflicts(&self) -> std::result::Result<(), ConflictReason> {
         if self.transaction.partition_values.is_empty()
             || self.winning_commit.partition_values.is_empty()
         {
@@ -293,6 +299,8 @@ impl ConflictChecker {
             return Ok(());
         }
 
+        let overlap_str = format!("{:?}", overlap.iter().take(3).collect::<Vec<_>>());
+
         // Case 1: Both are pure appends to the same partition — safe.
         if self.transaction.operation == Operation::Append
             && self.winning_commit.operation == Operation::Append
@@ -304,22 +312,22 @@ impl ConflictChecker {
         if self.transaction.operation == Operation::Append
             && self.winning_commit.operation == Operation::Overwrite
         {
-            let partition_str = format!("{:?}", overlap.iter().next().unwrap());
-            return Err(DataFusionError::Plan(format!(
-                "Iceberg commit conflict: concurrent overwrite and append on partition {}",
-                partition_str,
-            )));
+            return Err(ConflictReason::ConcurrentOverwrite {
+                partition: overlap_str,
+                winning_operation: Operation::Overwrite,
+                our_operation: Operation::Append,
+            });
         }
 
         // Case 3: Overwrite + anything on same partition → conflict.
         if self.transaction.operation == Operation::Overwrite
             || self.winning_commit.operation == Operation::Overwrite
         {
-            let partition_str = format!("{:?}", overlap.iter().next().unwrap());
-            return Err(DataFusionError::Plan(format!(
-                "Iceberg commit conflict: concurrent overwrite on partition {} (our_op={:?}, winning_op={:?})",
-                partition_str, self.transaction.operation, self.winning_commit.operation,
-            )));
+            return Err(ConflictReason::ConcurrentOverwrite {
+                partition: overlap_str,
+                winning_operation: self.winning_commit.operation.clone(),
+                our_operation: self.transaction.operation.clone(),
+            });
         }
 
         // Case 4: Two deletes on same partition — fall through to file-level checks.
@@ -329,82 +337,126 @@ impl ConflictChecker {
             return Ok(());
         }
 
-        let partition_str = format!("{:?}", overlap.iter().next().unwrap());
-        Err(DataFusionError::Plan(format!(
-            "Iceberg commit conflict: concurrent operations on partition {} (our_op={:?}, winning_op={:?})",
-            partition_str, self.transaction.operation, self.winning_commit.operation,
-        )))
+        Err(ConflictReason::ConcurrentOverwrite {
+            partition: overlap_str,
+            winning_operation: self.winning_commit.operation.clone(),
+            our_operation: self.transaction.operation.clone(),
+        })
     }
 
-    fn check_file_conflicts(&self) -> Result<()> {
-        let our_file_set: HashSet<&str> = self
+    fn check_file_conflicts(&self) -> std::result::Result<(), ConflictReason> {
+        let mut our_files: Vec<&str> = self
             .transaction
             .added_files
             .iter()
             .chain(self.transaction.removed_files.iter())
             .map(|f| f.file_path.as_str())
             .collect();
+        our_files.sort_unstable();
+        our_files.dedup();
 
-        let winning_removed_set: HashSet<&str> = self
+        let mut winning_removed: Vec<&str> = self
             .winning_commit
             .removed_files
             .iter()
             .map(|f| f.file_path.as_str())
             .collect();
+        winning_removed.sort_unstable();
+        winning_removed.dedup();
 
-        let files_deleted_by_winner: Vec<_> =
-            our_file_set.intersection(&winning_removed_set).collect();
-
-        if !files_deleted_by_winner.is_empty() {
-            return Err(DataFusionError::Plan(format!(
-                "Iceberg commit conflict: winning commit deleted files our transaction depends on: {:?}",
-                files_deleted_by_winner,
-            )));
+        // Binary-search intersection: our_files ∩ winning_removed
+        let mut i = 0;
+        let mut j = 0;
+        while i < our_files.len() && j < winning_removed.len() {
+            match our_files[i].cmp(winning_removed[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    return Err(ConflictReason::ConcurrentDeleteRead {
+                        files: vec![our_files[i].to_string()],
+                    });
+                }
+            }
         }
 
-        let our_removed_set: HashSet<&str> = self
+        // Double-delete check: our_removed ∩ winning_removed
+        let mut our_removed: Vec<&str> = self
             .transaction
             .removed_files
             .iter()
             .map(|f| f.file_path.as_str())
             .collect();
+        our_removed.sort_unstable();
+        our_removed.dedup();
 
-        let double_deletes: Vec<_> = our_removed_set.intersection(&winning_removed_set).collect();
-
-        if !double_deletes.is_empty() {
-            return Err(DataFusionError::Plan(format!(
-                "Iceberg commit conflict: both transactions deleted the same files: {:?}",
-                double_deletes,
-            )));
+        let mut i = 0;
+        let mut j = 0;
+        while i < our_removed.len() && j < winning_removed.len() {
+            match our_removed[i].cmp(winning_removed[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    return Err(ConflictReason::ConcurrentDeleteDelete {
+                        files: vec![our_removed[i].to_string()],
+                    });
+                }
+            }
         }
 
         Ok(())
     }
 }
 
-/// Cache for winning commit summaries to avoid redundant
+/// Lightweight cache entry — only the fields needed for conflict checks.
+#[allow(dead_code)]
+pub(crate) struct CachedWinningCommit {
+    pub(crate) operation: Operation,
+    pub(crate) added_files: Vec<DataFile>,
+    pub(crate) removed_files: Vec<DataFile>,
+    pub(crate) partition_values: HashSet<PartitionKey>,
+    pub(crate) table_uuid: Option<uuid::Uuid>,
+    pub(crate) current_schema_id: i32,
+}
+
+/// Cache for winning commit manifests to avoid redundant
 /// catalog and object-store loads across retry attempts.
 ///
 /// Keyed by `snapshot_id` — each commit produces a unique snapshot.
 /// When multiple transactions conflict against the same winning
 /// commit, only the first one loads manifests from storage.
+///
+/// Uses FIFO eviction with a max of 64 entries to prevent
+/// unbounded growth in long-running sessions.
 pub struct WinningCommitCache {
-    entries: HashMap<i64, WinningCommitSummary>,
+    entries: HashMap<i64, CachedWinningCommit>,
+    order: VecDeque<i64>,
 }
+
+const MAX_CACHE_SIZE: usize = 64;
 
 impl WinningCommitCache {
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: HashMap::with_capacity(MAX_CACHE_SIZE),
+            order: VecDeque::with_capacity(MAX_CACHE_SIZE),
         }
     }
 
-    pub fn get(&self, snapshot_id: i64) -> Option<&WinningCommitSummary> {
+    pub(crate) fn get(&self, snapshot_id: i64) -> Option<&CachedWinningCommit> {
         self.entries.get(&snapshot_id)
     }
 
-    pub fn insert(&mut self, snapshot_id: i64, summary: WinningCommitSummary) {
-        self.entries.entry(snapshot_id).or_insert(summary);
+    pub(crate) fn insert(&mut self, snapshot_id: i64, cached: CachedWinningCommit) {
+        if self.entries.contains_key(&snapshot_id) {
+            return;
+        }
+        while self.entries.len() >= MAX_CACHE_SIZE {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.order.push_back(snapshot_id);
+        self.entries.insert(snapshot_id, cached);
     }
 }
 
@@ -449,7 +501,7 @@ mod tests {
         }
     }
 
-    fn minimal_table_metadata(table_uuid: Option<uuid::Uuid>) -> TableMetadata {
+    fn minimal_table_metadata(table_uuid: Option<uuid::Uuid>) -> Arc<TableMetadata> {
         let uuid_str = table_uuid
             .map(|u| format!("\"{}\"", u))
             .unwrap_or_else(|| "null".to_string());
@@ -472,8 +524,10 @@ mod tests {
                 "current-schema-id": 0
             }}"#
         );
-        TableMetadata::from_json(json.as_bytes())
-            .expect("minimal table metadata JSON should be valid")
+        Arc::new(
+            TableMetadata::from_json(json.as_bytes())
+                .expect("minimal table metadata JSON should be valid"),
+        )
     }
 
     fn make_txn(
@@ -813,5 +867,58 @@ mod tests {
 
         let result = checker.check_schema_compatibility();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cache_hit() {
+        let mut cache = WinningCommitCache::new();
+        let key: i64 = 42;
+        cache.insert(key, make_cached(Operation::Append, key));
+        assert!(cache.get(key).is_some());
+    }
+
+    #[test]
+    fn test_cache_miss() {
+        let cache = WinningCommitCache::new();
+        assert!(cache.get(99).is_none());
+    }
+
+    #[test]
+    fn test_cache_eviction() {
+        let mut cache = WinningCommitCache::new();
+        // Insert 65 entries (exceeds MAX_CACHE_SIZE of 64)
+        for i in 0..65 {
+            cache.insert(i, make_cached(Operation::Append, i));
+        }
+        // Oldest entry (snapshot 0) should be evicted
+        assert!(
+            cache.get(0).is_none(),
+            "snapshot 0 should be evicted (oldest)"
+        );
+        // Last inserted (snapshot 64) should still be present
+        assert!(
+            cache.get(64).is_some(),
+            "snapshot 64 should be present (newest)"
+        );
+    }
+
+    #[test]
+    fn test_cache_duplicate_insert_does_not_evict() {
+        let mut cache = WinningCommitCache::new();
+        cache.insert(10, make_cached(Operation::Append, 10));
+        cache.insert(10, make_cached(Operation::Overwrite, 10)); // same key
+        // Duplicate insert should not evict the entry
+        assert!(cache.get(10).is_some());
+    }
+
+    fn make_cached(operation: Operation, id: i64) -> CachedWinningCommit {
+        CachedWinningCommit {
+            operation,
+            added_files: vec![],
+            removed_files: vec![],
+            partition_values: HashSet::new(),
+            table_uuid: Some(uuid::Uuid::new_v4()),
+            current_schema_id: id as i32,
+        }
     }
 }

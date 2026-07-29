@@ -8191,6 +8191,7 @@ dependencies = [
  "sail-data-source",
  "sail-delta-lake",
  "sail-execution",
+ "sail-function",
  "sail-iceberg",
  "sail-logical-optimizer",
  "sail-logical-plan",

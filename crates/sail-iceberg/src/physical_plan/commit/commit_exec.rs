@@ -48,7 +48,7 @@ use crate::operations::{Transaction, TransactionAction};
 use crate::physical_plan::action_schema::decode_actions_and_meta_from_batch;
 use crate::physical_plan::commit::IcebergCommitInfo;
 use crate::physical_plan::commit::conflict_checker::{
-    ConflictCheckOutcome, ConflictChecker, ConflictReason, TransactionInfo, WinningCommitCache,
+    ConflictCheckOutcome, ConflictChecker, TransactionInfo, WinningCommitCache,
     WinningCommitSummary,
 };
 use crate::spec::catalog::TableUpdate;
@@ -389,87 +389,109 @@ impl IcebergCommitExec {
         let manifest_list = ManifestList::parse_with_version(&manifest_list_bytes, format_version)
             .map_err(|e| DataFusionError::Execution(e))?;
 
-        let mut added = Vec::new();
-        let mut removed = Vec::new();
+        const MAX_CONCURRENT: usize = 8;
+        let prefixed = Arc::clone(&store_ctx.prefixed);
 
-        for manifest_file in manifest_list.entries() {
-            let manifest_bytes = store_ctx
-                .prefixed
-                .get(&object_store::path::Path::from(
-                    manifest_file.manifest_path.as_str(),
-                ))
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?
-                .bytes()
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let manifest_paths: Vec<String> = manifest_list
+            .entries()
+            .iter()
+            .map(|entry| entry.manifest_path.clone())
+            .collect();
 
-            let manifest = crate::spec::manifest::Manifest::parse_avro(&manifest_bytes)
-                .map_err(|e| DataFusionError::Execution(e))?;
+        let results: Vec<Result<(Vec<DataFile>, Vec<DataFile>)>> =
+            futures::stream::iter(manifest_paths)
+                .map({
+                    let prefixed = Arc::clone(&prefixed);
+                    move |entry_path: String| {
+                        let prefixed = Arc::clone(&prefixed);
+                        async move {
+                            let bytes = prefixed
+                                .get(&object_store::path::Path::from(entry_path.as_str()))
+                                .await
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?
+                                .bytes()
+                                .await
+                                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            for entry in manifest.entries() {
-                match entry.status {
-                    ManifestStatus::Added => {
-                        added.push(entry.data_file.clone());
+                            let manifest = crate::spec::manifest::Manifest::parse_avro(&bytes)
+                                .map_err(|e| DataFusionError::Execution(e))?;
+
+                            let mut added = Vec::new();
+                            let mut removed = Vec::new();
+                            for file_entry in manifest.entries() {
+                                match file_entry.status {
+                                    ManifestStatus::Added => {
+                                        added.push(file_entry.data_file.clone());
+                                    }
+                                    ManifestStatus::Deleted => {
+                                        removed.push(file_entry.data_file.clone());
+                                    }
+                                    ManifestStatus::Existing => {}
+                                }
+                            }
+                            Ok((added, removed))
+                        }
                     }
-                    ManifestStatus::Deleted => {
-                        removed.push(entry.data_file.clone());
-                    }
-                    ManifestStatus::Existing => {}
-                }
-            }
+                })
+                .buffer_unordered(MAX_CONCURRENT)
+                .collect()
+                .await;
+
+        let mut all_added = Vec::new();
+        let mut all_removed = Vec::new();
+        for result in results {
+            let (added, removed) = result?;
+            all_added.extend(added);
+            all_removed.extend(removed);
         }
 
-        Ok((added, removed))
+        Ok((all_added, all_removed))
     }
 
     async fn try_semantic_conflict_check(
-        context: &Arc<TaskContext>,
         store_ctx: &StoreContext,
-        catalog_table: &[String],
+        catalog_table_info: &CatalogTableInfo,
         commit_info: &IcebergCommitInfo,
         table_meta: &TableMetadata,
+        latest_meta: &str,
         cache: &mut WinningCommitCache,
     ) -> ConflictCheckOutcome {
-        let catalog_table_info = match Self::load_catalog_table_info(context, catalog_table).await {
-            Ok(info) => info,
-            Err(e) => {
-                log::debug!("Could not load catalog table info for conflict check: {e}");
-                return ConflictCheckOutcome::Fallback;
-            }
-        };
-
-        let metadata_location = match catalog_table_info.metadata_location {
-            Some(loc) => loc,
+        // Determine the current winning metadata path
+        let current_path = match &catalog_table_info.metadata_location {
+            Some(loc) => match metadata_location_to_object_path_string(loc) {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    log::debug!("Invalid metadata location for conflict check: {e}");
+                    return ConflictCheckOutcome::Fallback;
+                }
+            },
             None => {
                 log::debug!("No metadata location for conflict check");
                 return ConflictCheckOutcome::Fallback;
             }
         };
 
-        let latest_meta = match metadata_location_to_object_path_string(&metadata_location) {
-            Ok(path) => path,
-            Err(e) => {
-                log::debug!("Invalid metadata location for conflict check: {e}");
-                return ConflictCheckOutcome::Fallback;
-            }
-        };
-
-        let bytes = match load_metadata_file_bytes(&store_ctx.prefixed, &latest_meta).await {
-            Ok(b) => b,
-            Err(e) => {
-                log::debug!("Could not load winning metadata for conflict check: {e}");
-                return ConflictCheckOutcome::Fallback;
-            }
-        };
-
-        let winning_metadata = match TableMetadata::from_json(&bytes)
-            .map_err(|e| DataFusionError::External(Box::new(e)))
-        {
-            Ok(m) => m,
-            Err(e) => {
-                log::debug!("Could not parse winning metadata for conflict check: {e}");
-                return ConflictCheckOutcome::Fallback;
+        // If the current path matches what we already loaded in the retry loop,
+        // reuse the parsed table_meta as the winning metadata.
+        let winning_metadata: Arc<TableMetadata> = if current_path.as_deref() == Some(latest_meta) {
+            Arc::new(table_meta.clone())
+        } else {
+            let path = current_path.as_deref().unwrap_or(latest_meta);
+            let bytes = match load_metadata_file_bytes(&store_ctx.prefixed, path).await {
+                Ok(b) => b,
+                Err(e) => {
+                    log::debug!("Could not load winning metadata for conflict check: {e}");
+                    return ConflictCheckOutcome::Fallback;
+                }
+            };
+            match TableMetadata::from_json(&bytes)
+                .map_err(|e| DataFusionError::External(Box::new(e)))
+            {
+                Ok(m) => Arc::new(m),
+                Err(e) => {
+                    log::debug!("Could not parse winning metadata for conflict check: {e}");
+                    return ConflictCheckOutcome::Fallback;
+                }
             }
         };
 
@@ -486,7 +508,6 @@ impl IcebergCommitExec {
             }
         };
 
-        // Check cache before loading manifests
         let cache_key = snapshot_info.1;
         let (added_files, removed_files, partition_values) = if let Some(cached) =
             cache.get(cache_key)
@@ -527,25 +548,22 @@ impl IcebergCommitExec {
                 })
                 .collect();
 
-            // Cache for future retries
             cache.insert(
                 cache_key,
-                WinningCommitSummary {
+                crate::physical_plan::commit::conflict_checker::CachedWinningCommit {
                     operation: snapshot_info.0.clone(),
                     added_files: added.clone(),
                     removed_files: removed.clone(),
                     partition_values: partitions.clone(),
-                    schema_changes: None,
-                    snapshot_id: cache_key,
-                    parent_snapshot_id: snapshot_info.2,
-                    metadata: winning_metadata.clone(),
+                    table_uuid: winning_metadata.table_uuid,
+                    current_schema_id: winning_metadata.current_schema_id,
                 },
             );
 
             (added, removed, partitions)
         };
 
-        let transaction_info = TransactionInfo::new(table_meta, commit_info);
+        let transaction_info = TransactionInfo::new(Arc::new(table_meta.clone()), commit_info);
 
         let winning_summary = WinningCommitSummary {
             operation: snapshot_info.0,
@@ -567,13 +585,9 @@ impl IcebergCommitExec {
             Ok(result) => ConflictCheckOutcome::NoConflict {
                 updated_metadata: result.updated_metadata,
             },
-            Err(e) => {
-                log::warn!("Semantic conflict detected during commit: {e}");
-                ConflictCheckOutcome::SemanticConflict {
-                    reason: ConflictReason::Unknown {
-                        message: e.to_string(),
-                    },
-                }
+            Err(reason) => {
+                log::warn!("Semantic conflict detected during commit: {:?}", reason);
+                ConflictCheckOutcome::SemanticConflict { reason }
             }
         }
     }
@@ -639,14 +653,16 @@ impl ExecutionPlan for IcebergCommitExec {
             // Read writer result as Arrow-native action batches (may be empty for IgnoreIfExists).
             let mut data = input_stream;
             let mut added_data_files = Vec::new();
+            let mut removed_data_files = Vec::new();
             let mut commit_meta = None;
             while let Some(batch_result) = data.next().await {
                 let batch = batch_result?;
                 if batch.num_rows() == 0 {
                     continue;
                 }
-                let (adds, _deletes, meta) = decode_actions_and_meta_from_batch(&batch)?;
+                let (adds, deletes, meta) = decode_actions_and_meta_from_batch(&batch)?;
                 added_data_files.extend(adds);
+                removed_data_files.extend(deletes);
                 if meta.is_some() {
                     commit_meta = meta;
                 }
@@ -669,6 +685,7 @@ impl ExecutionPlan for IcebergCommitExec {
                 table_uri: commit_meta.table_uri,
                 row_count: commit_meta.row_count,
                 data_files: added_data_files,
+                removed_files: removed_data_files,
                 manifest_path: String::new(),
                 manifest_list_path: String::new(),
                 updates: vec![],
@@ -1192,13 +1209,13 @@ impl ExecutionPlan for IcebergCommitExec {
                                 return Err(commit_conflict_error());
                             }
 
-                            if let Some(catalog_table) = catalog_commit_table {
+                            if let Some(_catalog_table) = catalog_commit_table {
                                 match Self::try_semantic_conflict_check(
-                                    &context,
                                     &store_ctx,
-                                    catalog_table,
+                                    &catalog_table_info,
                                     &commit_info,
                                     &table_meta,
+                                    &latest_meta,
                                     &mut conflict_cache,
                                 )
                                 .await
