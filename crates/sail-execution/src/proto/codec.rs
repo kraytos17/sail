@@ -5211,6 +5211,103 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_round_trip_spark_date_udf_cast() -> Result<()> {
+        let decoded = round_trip_udf(ScalarUDF::from(SparkDate::new(false)))?;
+        assert!(decoded.inner().downcast_ref::<SparkDate>().is_some());
+        assert_eq!(decoded.name(), "spark_date");
+        Ok(())
+    }
+
+    #[test]
+    fn test_round_trip_spark_date_udf_try_cast() -> Result<()> {
+        let decoded = round_trip_udf(ScalarUDF::from(SparkDate::new(true)))?;
+        assert!(decoded.inner().downcast_ref::<SparkDate>().is_some());
+        assert_eq!(decoded.name(), "spark_date");
+        Ok(())
+    }
+
+    #[test]
+    fn test_round_trip_spark_date_udf_is_try_preserved() -> Result<()> {
+        let decoded_cast = round_trip_udf(ScalarUDF::from(SparkDate::new(false)))?;
+        let cast_func = decoded_cast
+            .inner()
+            .downcast_ref::<SparkDate>()
+            .ok_or_else(|| plan_datafusion_err!("not SparkDate"))?;
+        assert!(!cast_func.is_try());
+
+        let decoded_try = round_trip_udf(ScalarUDF::from(SparkDate::new(true)))?;
+        let try_func = decoded_try
+            .inner()
+            .downcast_ref::<SparkDate>()
+            .ok_or_else(|| plan_datafusion_err!("not SparkDate"))?;
+        assert!(try_func.is_try());
+        Ok(())
+    }
+
+    #[test]
+    fn test_round_trip_spark_date_udf_invocation() -> Result<()> {
+        use datafusion::arrow::array::StringArray;
+        use datafusion::common::config::ConfigOptions;
+        use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs};
+
+        let decoded = round_trip_udf(ScalarUDF::from(SparkDate::new(false)))?;
+        let input = Arc::new(StringArray::from(vec![Some("2025-09-30")])) as ArrayRef;
+        let args = ScalarFunctionArgs {
+            number_rows: 1,
+            args: vec![ColumnarValue::Array(input.clone())],
+            arg_fields: vec![Arc::new(Field::new("input", DataType::Utf8, true))],
+            return_field: Arc::new(Field::new("result", DataType::Date32, true)),
+            config_options: Arc::new(ConfigOptions::default()),
+        };
+        let original = ScalarUDF::from(SparkDate::new(false));
+        let orig_result = original.inner().invoke_with_args(args.clone())?;
+        let dec_result = decoded.inner().invoke_with_args(args)?;
+        match (orig_result, dec_result) {
+            (ColumnarValue::Array(a), ColumnarValue::Array(b)) => {
+                assert_eq!(a.to_data(), b.to_data())
+            }
+            _ => return plan_err!("expected array"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_round_trip_spark_date_udf_empty_null() -> Result<()> {
+        use datafusion::arrow::array::{Date32Array, StringArray};
+        use datafusion::common::config::ConfigOptions;
+        use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs};
+
+        let decoded = round_trip_udf(ScalarUDF::from(SparkDate::new(true)))?;
+        let input = Arc::new(StringArray::from(vec![
+            Some("2025-09-30"),
+            None,
+            Some(""),
+            Some("invalid-date"),
+        ])) as ArrayRef;
+        let args = ScalarFunctionArgs {
+            number_rows: 4,
+            args: vec![ColumnarValue::Array(input)],
+            arg_fields: vec![Arc::new(Field::new("input", DataType::Utf8, true))],
+            return_field: Arc::new(Field::new("result", DataType::Date32, true)),
+            config_options: Arc::new(ConfigOptions::default()),
+        };
+        let result = decoded.inner().invoke_with_args(args)?;
+        let arr = match result {
+            ColumnarValue::Array(arr) => arr,
+            _ => return plan_err!("expected array"),
+        };
+        let dates = arr
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .ok_or_else(|| plan_datafusion_err!("expected Date32Array"))?;
+        assert!(dates.value(0) > 0);
+        assert!(dates.is_null(1));
+        assert!(dates.is_null(2));
+        assert!(dates.is_null(3));
+        Ok(())
+    }
+
     fn round_trip_expr(
         expr: &Arc<dyn PhysicalExpr>,
         schema: &Schema,
