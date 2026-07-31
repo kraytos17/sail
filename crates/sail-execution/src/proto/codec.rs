@@ -2991,6 +2991,7 @@ impl RemoteExecutionCodec {
     }
 
     fn try_decode_udf(&self, name: &str, buf: &[u8]) -> Result<Arc<ScalarUDF>> {
+        eprintln!("[DIAG] udf_decode_start name={} buf_len={}", name, buf.len());
         log::info!("udf_decode_start name={name} buf_len={}", buf.len());
         // TODO: Implement custom registry to avoid codec for built-in functions.
         // The `match name` below has no session-registry fallback, so every
@@ -3025,6 +3026,7 @@ impl RemoteExecutionCodec {
         };
         match udf_kind {
             UdfKind::Standard(gen_::StandardUdf {}) => {
+                eprintln!("[DIAG] udf_decode_kind name={} kind=standard", name);
                 log::info!("udf_decode_kind name={name} kind=standard");
             }
             UdfKind::PySpark(gen_::PySparkUdf {
@@ -3161,6 +3163,7 @@ impl RemoteExecutionCodec {
                 return Ok(Arc::new(ScalarUDF::from(udf)));
             }
             UdfKind::SparkDate(gen_::SparkDateUdf { is_try }) => {
+                eprintln!("[DIAG] udf_decode_kind name={} kind=spark_date is_try={}", name, is_try);
                 log::info!("udf_decode_kind name={name} kind=spark_date is_try={is_try}");
                 return Ok(Arc::new(ScalarUDF::from(SparkDate::new(is_try))));
             }
@@ -3710,6 +3713,11 @@ impl RemoteExecutionCodec {
         encode_node
             .encode(buf)
             .map_err(|e| plan_datafusion_err!("failed to encode udf: {e}"))?;
+        eprintln!(
+            "[DIAG] udf_encode name={} status=serialized buf_len={}",
+            node.name(),
+            buf.len()
+        );
         log::info!(
             "udf_encode name={} status=serialized buf_len={}",
             node.name(),

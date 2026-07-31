@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1.9
+# Simplified Dockerfile for debugging - no sccache, no cargo-chef, no mount caches
+# Use: docker build -f Dockerfile.test -t sail-test-nocache:local .
+
+ARG RUST_VERSION=1.96.0
+ARG RUST_PROFILE=release
+ARG PYSPARK_VERSION=4.2.0
+ARG CARGO_BUILD_JOBS
+
+FROM rust:${RUST_VERSION}-slim-trixie AS base
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gcc libc6-dev git pkg-config \
+        protobuf-compiler libprotobuf-dev mold && \
+    rm -rf /var/lib/apt/lists/*
+
+FROM python:3.14-slim-trixie AS python
+
+FROM base AS builder
+ARG RUST_PROFILE
+ARG CARGO_BUILD_JOBS
+
+# Disable incremental compilation and clear any cache state
+ENV CARGO_INCREMENTAL=0 \
+    CARGO_NET_RETRY=3 \
+    CARGO_HTTP_TIMEOUT=30 \
+    CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+
+WORKDIR /app
+
+# Copy Python from python stage
+COPY --from=python /usr/local/ /usr/local/
+
+# Install missing rustfmt component
+RUN rustup component add rustfmt
+
+# Copy all source code
+COPY . .
+
+# Build the binary - NO sccache, NO cargo-chef, NO cache mounts
+# This guarantees a full recompile from scratch
+RUN rm -rf /app/target && \
+    JOBS=${CARGO_BUILD_JOBS:-$(nproc)} && \
+    cargo build -p sail-cli --profile ${RUST_PROFILE} --bins --jobs "$JOBS" && \
+    install -m755 target/${RUST_PROFILE}/sail /usr/local/bin/sail
+
+FROM python:3.14-slim-trixie AS runtime
+
+ARG PYSPARK_VERSION
+
+RUN groupadd --system sail && \
+    useradd --system --gid sail --no-create-home --shell /usr/sbin/nologin sail && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+RUN python3 -m pip install --no-cache-dir "pyspark[connect]==${PYSPARK_VERSION}" pandas
+
+COPY --link --from=builder /usr/local/bin/sail /usr/local/bin/sail
+
+USER sail
+ENTRYPOINT ["/usr/local/bin/sail"]
