@@ -56,7 +56,9 @@ use crate::table::metadata_loader::{
 };
 use crate::table_format::metadata_location_from_properties;
 use crate::utils::get_object_store_from_context;
-use crate::utils::metadata::metadata_files_for_version;
+use crate::utils::metadata::{
+    get_metadata_file_timestamp, is_stale_metadata_file, metadata_files_for_version,
+};
 const MAX_COMMIT_RETRIES: usize = 5;
 
 #[derive(Debug)]
@@ -342,6 +344,102 @@ impl IcebergCommitExec {
     }
 }
 
+/// Compute which parent manifest entries are untouched by the given file paths.
+///
+/// For MERGE with matched clauses, we want to keep parent manifests whose data files
+/// are NOT in the touched set. Manifests whose data files ARE touched are replaced
+/// by new files from the writer.
+async fn compute_untouched_manifest_entries(
+    store_ctx: &StoreContext,
+    parent_snapshot: &crate::spec::Snapshot,
+    touched_file_paths: &[String],
+) -> std::result::Result<Vec<crate::spec::ManifestFile>, String> {
+    let format_version = crate::spec::FormatVersion::V2;
+    let touched: std::collections::HashSet<&str> =
+        touched_file_paths.iter().map(|s| s.as_str()).collect();
+
+    // Load parent manifest list
+    let manifest_list_path_str = parent_snapshot.manifest_list();
+    let (store_ref, manifest_list_path) = store_ctx
+        .resolve(manifest_list_path_str)
+        .map_err(|e| format!("failed to resolve manifest list path: {e}"))?;
+    let manifest_list_data = store_ref
+        .get(&manifest_list_path)
+        .await
+        .map_err(|e| format!("failed to get parent manifest list: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("failed to read parent manifest list bytes: {e}"))?;
+    let parent_manifest_list =
+        crate::spec::ManifestList::parse_with_version(&manifest_list_data, format_version)?;
+    let parent_entries: Vec<crate::spec::ManifestFile> = parent_manifest_list.entries().to_vec();
+    let total_parent_entries = parent_entries.len();
+
+    let mut untouched = Vec::new();
+
+    for entry in parent_entries {
+        if !matches!(entry.content, crate::spec::ManifestContentType::Data) {
+            // Keep non-data manifests (e.g., delete manifests)
+            untouched.push(entry);
+            continue;
+        }
+
+        // Load the manifest file to check individual data file paths
+        let (manifest_store, manifest_path_obj) = store_ctx
+            .resolve(&entry.manifest_path)
+            .map_err(|e| format!("failed to resolve manifest path: {e}"))?;
+        let manifest_data = match manifest_store.get(&manifest_path_obj).await {
+            Ok(data) => data
+                .bytes()
+                .await
+                .map_err(|e| format!("manifest read: {e}"))?,
+            Err(e) => {
+                log::warn!(
+                    "Failed to load parent manifest {}: {e}; keeping it",
+                    entry.manifest_path
+                );
+                untouched.push(entry);
+                continue;
+            }
+        };
+
+        let manifest = match crate::spec::Manifest::parse_avro(&manifest_data) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!(
+                    "Failed to parse parent manifest {}: {e}; keeping it",
+                    entry.manifest_path
+                );
+                untouched.push(entry);
+                continue;
+            }
+        };
+
+        // Check if any data file in this manifest has a path in the touched set
+        let has_touched = manifest
+            .entries()
+            .iter()
+            .any(|me| touched.contains(me.data_file.file_path()));
+
+        if !has_touched {
+            // This manifest has no touched files → keep it in the new snapshot
+            untouched.push(entry);
+        }
+        // If has_touched, skip this manifest entry (it will be replaced by new files)
+    }
+
+    let excluded = total_parent_entries - untouched.len();
+    log::debug!(
+        "MERGE commit: {}/{} parent manifests untouched ({} excluded, {} touched file paths)",
+        untouched.len(),
+        total_parent_entries,
+        excluded,
+        touched_file_paths.len()
+    );
+
+    Ok(untouched)
+}
+
 #[async_trait]
 impl ExecutionPlan for IcebergCommitExec {
     fn name(&self) -> &'static str {
@@ -441,6 +539,7 @@ impl ExecutionPlan for IcebergCommitExec {
                 operation: commit_meta.operation,
                 schema: commit_meta.schema,
                 partition_spec: commit_meta.partition_spec,
+                touched_file_paths: commit_meta.touched_file_paths,
             };
 
             let catalog_table = commit_info
@@ -781,19 +880,26 @@ impl ExecutionPlan for IcebergCommitExec {
                 let existing_for_next =
                     metadata_files_for_version(&store_ctx, next_version).await?;
                 if !existing_for_next.is_empty() {
-                    log::warn!(
-                        "Detected existing metadata files for version {}: {:?}. Retrying attempt {}",
-                        next_version,
-                        existing_for_next,
-                        attempt
-                    );
-                    if attempt >= MAX_COMMIT_RETRIES {
-                        return Err(commit_conflict_error());
+                    let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+                    if existing_for_next
+                        .iter()
+                        .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts))
+                    {
+                        log::warn!(
+                            "Detected existing metadata files for version {}: {:?}. Retrying attempt {}",
+                            next_version,
+                            existing_for_next,
+                            attempt
+                        );
+                        if attempt >= MAX_COMMIT_RETRIES {
+                            return Err(commit_conflict_error());
+                        }
+                        continue;
                     }
-                    continue;
                 }
 
                 // Build transaction and action based on operation
+                let snapshot_for_commit = snapshot.clone();
                 let tx = Transaction::new(table_url.to_string(), snapshot);
                 let manifest_meta = tx.default_manifest_metadata(
                     &schema_iceberg,
@@ -816,13 +922,35 @@ impl ExecutionPlan for IcebergCommitExec {
                             .map_err(DataFusionError::Execution)?
                     }
                     crate::spec::Operation::Overwrite => {
+                        // Compute parent manifests to keep.
+                        // If touched_file_paths is non-empty, we keep manifests
+                        // whose data files are NOT in the touched set; touched
+                        // files are replaced by the new data files.
+                        let parent_entries = if !commit_info.touched_file_paths.is_empty() {
+                            compute_untouched_manifest_entries(
+                                &store_ctx,
+                                &snapshot_for_commit,
+                                &commit_info.touched_file_paths,
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                log::warn!(
+                                    "Failed to compute untouched parent manifests: {e}; \
+                                     falling back to full replacement"
+                                );
+                                vec![]
+                            })
+                        } else {
+                            vec![]
+                        };
                         let producer = crate::operations::SnapshotProducer::new(
                             &tx,
                             commit_info.data_files.clone(),
                             Some(store_ctx.clone()),
                             Some(manifest_meta),
                         )
-                        .with_row_lineage_start_row_id(row_lineage_start_row_id);
+                        .with_row_lineage_start_row_id(row_lineage_start_row_id)
+                        .with_parent_manifest_entries(Some(parent_entries));
                         struct LocalOverwriteOperation;
                         impl SnapshotProduceOperation for LocalOverwriteOperation {
                             fn operation(&self) -> &'static str {
@@ -834,10 +962,46 @@ impl ExecutionPlan for IcebergCommitExec {
                             .await
                             .map_err(DataFusionError::Execution)?
                     }
-                    _ => {
-                        return Err(DataFusionError::NotImplemented(
-                            "Unsupported Iceberg operation in commit".to_string(),
-                        ));
+                    crate::spec::Operation::Delete => {
+                        let data_files = commit_info.data_files.clone();
+                        let producer = crate::operations::SnapshotProducer::new(
+                            &tx,
+                            data_files,
+                            Some(store_ctx.clone()),
+                            Some(manifest_meta),
+                        )
+                        .with_row_lineage_start_row_id(row_lineage_start_row_id)
+                        .with_parent_manifest_entries(Some(vec![]));
+                        struct LocalDeleteOperation;
+                        impl SnapshotProduceOperation for LocalDeleteOperation {
+                            fn operation(&self) -> &'static str {
+                                "delete"
+                            }
+                        }
+                        producer
+                            .commit(LocalDeleteOperation)
+                            .await
+                            .map_err(DataFusionError::Execution)?
+                    }
+                    crate::spec::Operation::Replace => {
+                        let producer = crate::operations::SnapshotProducer::new(
+                            &tx,
+                            commit_info.data_files.clone(),
+                            Some(store_ctx.clone()),
+                            Some(manifest_meta),
+                        )
+                        .with_row_lineage_start_row_id(row_lineage_start_row_id)
+                        .with_parent_manifest_entries(Some(vec![]));
+                        struct LocalReplaceOperation;
+                        impl SnapshotProduceOperation for LocalReplaceOperation {
+                            fn operation(&self) -> &'static str {
+                                "replace"
+                            }
+                        }
+                        producer
+                            .commit(LocalReplaceOperation)
+                            .await
+                            .map_err(DataFusionError::Execution)?
                     }
                 };
 
@@ -997,7 +1161,10 @@ impl ExecutionPlan for IcebergCommitExec {
                     Err(e) => return Err(DataFusionError::External(Box::new(e))),
                 }
                 let version_files = metadata_files_for_version(&store_ctx, next_version).await?;
-                let conflict_after_write = version_files.iter().any(|path| path != &new_meta_rel);
+                let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+                let conflict_after_write = version_files.iter().any(|(path, ts)| {
+                    *path != new_meta_rel && !is_stale_metadata_file(*ts, current_ts)
+                });
                 if conflict_after_write {
                     log::warn!(
                         "Concurrent metadata writes detected for version {}: {:?}. Retrying attempt {}",

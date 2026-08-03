@@ -33,4 +33,7 @@ pub struct IcebergCommitInfo {
     pub schema: Option<Schema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition_spec: Option<PartitionSpec>,
+    /// File paths rewritten by a row-level operation. Non-empty for MERGE
+    /// with matched clauses; used to compute which parent manifests to keep.
+    pub touched_file_paths: Vec<String>,
 }

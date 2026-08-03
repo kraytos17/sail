@@ -40,6 +40,10 @@ pub struct CommitMeta {
     pub lakehouse_table: Option<LakehouseExecutionContext>,
     pub schema: Option<IcebergSchema>,
     pub partition_spec: Option<PartitionSpec>,
+    /// File paths that were rewritten by a row-level operation (MERGE matched clauses).
+    /// When set, the commit exec uses these to compute which parent manifests to keep
+    /// vs replace. Files in this set are replaced; files NOT in this set stay in the table.
+    pub touched_file_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +60,9 @@ pub struct CommitMetaAction {
     pub schema_json: Option<String>,
     /// Optional PartitionSpec JSON (rare) to avoid huge Arrow schema.
     pub partition_spec_json: Option<String>,
+    /// File paths rewritten by a row-level operation. JSON-encoded Vec<String>.
+    /// When non-empty, the commit exec uses these to compute which parent manifests to keep.
+    pub touched_file_paths_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -409,6 +416,14 @@ pub fn encode_commit_meta(meta: CommitMeta) -> Result<RecordBatch> {
         .map(serde_json::to_string)
         .transpose()
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let touched_file_paths_json = if meta.touched_file_paths.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&meta.touched_file_paths)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?,
+        )
+    };
 
     let rows = vec![ActionRow {
         action: ExecAction::CommitMeta(CommitMetaAction {
@@ -420,6 +435,7 @@ pub fn encode_commit_meta(meta: CommitMeta) -> Result<RecordBatch> {
             lakehouse_table_json,
             schema_json,
             partition_spec_json,
+            touched_file_paths_json,
         }),
     }];
     encode_actions(rows)
@@ -469,6 +485,13 @@ pub fn decode_actions_and_meta_from_batch(
                     .map(serde_json::from_str::<PartitionSpec>)
                     .transpose()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let touched_file_paths: Vec<String> = m
+                    .touched_file_paths_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
+                    .unwrap_or_default();
                 meta = Some(CommitMeta {
                     table_uri: m.table_uri,
                     row_count: m.row_count,
@@ -478,6 +501,7 @@ pub fn decode_actions_and_meta_from_batch(
                     lakehouse_table,
                     schema,
                     partition_spec,
+                    touched_file_paths,
                 });
             }
         }
@@ -530,6 +554,7 @@ mod tests {
             lakehouse_table: None,
             schema: None,
             partition_spec: None,
+            touched_file_paths: vec![],
         };
 
         let schema = iceberg_action_schema()?;

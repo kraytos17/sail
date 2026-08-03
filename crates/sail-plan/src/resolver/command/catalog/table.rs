@@ -469,6 +469,38 @@ impl PlanResolver<'_> {
         state: &mut PlanResolverState,
     ) -> PlanResult<LogicalPlan> {
         let options = match operation {
+            spec::AlterTableOperation::RenameTable { new_name } => AlterTableOptions::RenameTable {
+                new_name: new_name.into(),
+            },
+            spec::AlterTableOperation::AddColumns { items } => {
+                let columns: Vec<sail_catalog::provider::AddColumn> = items
+                    .into_iter()
+                    .map(|c| -> PlanResult<sail_catalog::provider::AddColumn> {
+                        let name: Vec<String> = c.name.into();
+                        Ok(sail_catalog::provider::AddColumn {
+                            name,
+                            data_type: self.resolve_data_type(&c.data_type, state)?,
+                            nullable: c.nullable,
+                            default: c.default,
+                            comment: c.comment,
+                        })
+                    })
+                    .collect::<PlanResult<Vec<_>>>()?;
+                AlterTableOptions::AddColumns { columns }
+            }
+            spec::AlterTableOperation::DropColumns { names, if_exists } => {
+                let drop_names: Vec<String> = names
+                    .into_iter()
+                    .map(|n| {
+                        let parts: Vec<String> = n.into();
+                        parts.join(".")
+                    })
+                    .collect();
+                AlterTableOptions::DropColumns {
+                    names: drop_names,
+                    if_exists,
+                }
+            }
             spec::AlterTableOperation::SetTableProperties { properties } => {
                 AlterTableOptions::SetTableProperties { properties }
             }
@@ -485,6 +517,24 @@ impl PlanResolver<'_> {
                 AlterTableOptions::AlterColumnDefault {
                     name: name.into(),
                     default,
+                }
+            }
+            spec::AlterTableOperation::AlterColumnComment { name, comment } => {
+                AlterTableOptions::AlterColumnComment {
+                    name: name.into(),
+                    comment,
+                }
+            }
+            spec::AlterTableOperation::AlterColumnNullability { name, nullable } => {
+                AlterTableOptions::AlterColumnNullability {
+                    name: name.into(),
+                    nullable,
+                }
+            }
+            spec::AlterTableOperation::AlterColumnPosition { name, position } => {
+                AlterTableOptions::AlterColumnPosition {
+                    name: name.into(),
+                    position,
                 }
             }
             spec::AlterTableOperation::AddCheckConstraint { .. } => {

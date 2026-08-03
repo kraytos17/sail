@@ -53,6 +53,7 @@ pub fn create_catalog_manager(
                     namespace_separator,
                     oauth_access_token,
                     bearer_access_token,
+                    access_delegation,
                     cache,
                 } => {
                     let mut properties = HashMap::new();
@@ -86,6 +87,9 @@ pub fn create_catalog_manager(
                                 IcebergRestCatalogOptions {
                                     credentials,
                                     properties,
+                                    access_delegation: access_delegation
+                                        .clone()
+                                        .unwrap_or_default(),
                                 },
                             );
                             Ok(provider)

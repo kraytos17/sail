@@ -388,6 +388,117 @@ impl CatalogProvider for MemoryCatalogProvider {
                         ))
                     })
                 }
+                AlterTableOptions::AlterColumnComment { name, comment } => {
+                    let col_name = name.join(".");
+                    let col = columns
+                        .iter_mut()
+                        .find(|c| c.name == col_name)
+                        .ok_or_else(|| {
+                            CatalogError::NotFound(
+                                CatalogObject::Table,
+                                format!("column '{col_name}' not found on table '{table}'"),
+                            )
+                        })?;
+                    col.comment = comment;
+                    Ok(())
+                }
+                AlterTableOptions::AlterColumnNullability { name, nullable } => {
+                    let col_name = name.join(".");
+                    let col = columns
+                        .iter_mut()
+                        .find(|c| c.name == col_name)
+                        .ok_or_else(|| {
+                            CatalogError::NotFound(
+                                CatalogObject::Table,
+                                format!("column '{col_name}' not found on table '{table}'"),
+                            )
+                        })?;
+                    col.nullable = nullable;
+                    Ok(())
+                }
+                AlterTableOptions::AlterColumnPosition { name, position } => {
+                    let col_name = name.join(".");
+                    let idx = columns
+                        .iter()
+                        .position(|c| c.name == col_name)
+                        .ok_or_else(|| {
+                            CatalogError::NotFound(
+                                CatalogObject::Table,
+                                format!("column '{col_name}' not found on table '{table}'"),
+                            )
+                        })?;
+                    let col = columns.remove(idx);
+                    match position {
+                        sail_common::spec::ColumnPosition::First => {
+                            columns.insert(0, col);
+                        }
+                        sail_common::spec::ColumnPosition::After(after) => {
+                            let after_name: Vec<String> = after.into();
+                            let after_name = after_name.join(".");
+                            let after_idx = columns
+                                .iter()
+                                .position(|c| c.name == after_name)
+                                .ok_or_else(|| {
+                                    CatalogError::NotFound(
+                                        CatalogObject::Table,
+                                        format!("target column '{after_name}' not found on table '{table}'"),
+                                    )
+                                })?;
+                            columns.insert(after_idx + 1, col);
+                        }
+                    }
+                    Ok(())
+                }
+                AlterTableOptions::RenameTable { new_name } => {
+                    let new_table_name = new_name.last().cloned().ok_or_else(|| {
+                        CatalogError::InvalidArgument(
+                            "RENAME TO requires a valid table name".to_string(),
+                        )
+                    })?;
+                    let old_entry = db.tables.remove(table).ok_or_else(|| {
+                        CatalogError::NotFound(CatalogObject::Table, table.to_string())
+                    })?;
+                    db.tables.insert(new_table_name.clone(), old_entry);
+                    Ok(())
+                }
+                AlterTableOptions::AddColumns {
+                    columns: new_columns,
+                } => {
+                    for col in new_columns {
+                        columns.push(TableColumnStatus {
+                            name: col.name.join("."),
+                            data_type: col.data_type,
+                            nullable: col.nullable,
+                            comment: col.comment,
+                            default: col.default,
+                            generated_always_as: None,
+                            identity: None,
+                            is_partition: false,
+                            is_bucket: false,
+                            is_cluster: false,
+                        });
+                    }
+                    Ok(())
+                }
+                AlterTableOptions::DropColumns { names, if_exists } => {
+                    for name in &names {
+                        let pos = columns.iter().position(|c| c.name == name.as_str());
+                        match pos {
+                            Some(idx) => {
+                                columns.remove(idx);
+                            }
+                            None => {
+                                if !if_exists {
+                                    return Err(CatalogError::NotFound(
+                                        CatalogObject::Table,
+                                        format!("column '{name}' not found on table '{table}'"),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                }
                 AlterTableOptions::AddCheckConstraint { .. } => Err(CatalogError::NotSupported(
                     "CHECK constraints are handled by lakehouse table formats".to_string(),
                 )),

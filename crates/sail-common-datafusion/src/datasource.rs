@@ -307,6 +307,24 @@ pub struct MergeInfo {
     pub input_schema: DFSchemaRef,
 }
 
+/// Information required to create a logical UPDATE plan for a table format.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct UpdateInfo {
+    pub table_name: Vec<String>,
+    pub path: String,
+    pub condition: Option<ExprWithSource>,
+    pub assignments: Vec<UpdateAssignment>,
+    pub lakehouse_table: Option<LakehouseExecutionContext>,
+    pub options: Vec<OptionLayer>,
+}
+
+/// An UPDATE SET assignment (column_path = expression).
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct UpdateAssignment {
+    pub column_path: Vec<String>,
+    pub expression: Expr,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct MergeIntoOptions {
     pub target_alias: Option<String>,
@@ -449,6 +467,15 @@ pub enum RowLevelCommand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableFormatAlterTableOperation {
+    /// Rename the table. For Iceberg, this is a no-op at the storage level
+    /// (metadata path stays the same). The catalog handles the name change.
+    RenameTable,
+    /// Add columns to the table.
+    AddColumns {
+        columns: Vec<TableFormatCreateTableColumn>,
+    },
+    /// Drop columns from the table.
+    DropColumns { names: Vec<String>, if_exists: bool },
     /// Alters table properties (SET/UNSET TBLPROPERTIES).
     ///
     /// `changes` is a list of `(key, value)` pairs where `value` is `Some(v)` to set a property,
@@ -469,6 +496,21 @@ pub enum TableFormatAlterTableOperation {
     AlterColumnDefault {
         column_path: Vec<String>,
         default: Option<String>,
+    },
+    /// Alters the comment of a table column.
+    AlterColumnComment {
+        column_path: Vec<String>,
+        comment: Option<String>,
+    },
+    /// Sets or drops NOT NULL on a table column.
+    AlterColumnNullability {
+        column_path: Vec<String>,
+        nullable: bool,
+    },
+    /// Reorders a table column to a new position.
+    AlterColumnPosition {
+        column_path: Vec<String>,
+        position: sail_common::spec::ColumnPosition,
     },
     /// Adds a CHECK constraint after the caller has validated existing rows.
     AddCheckConstraint { name: String, expression: String },
@@ -531,6 +573,12 @@ pub trait TableFormat: Send + Sync {
         not_impl_err!("MERGE is not yet implemented for {} format", self.name())
     }
 
+    /// Creates a logical plan for UPDATE.
+    async fn create_updater(&self, ctx: &dyn Session, info: UpdateInfo) -> Result<LogicalPlan> {
+        let _ = (ctx, info);
+        not_impl_err!("UPDATE is not yet implemented for {} format", self.name())
+    }
+
     /// Alters table-format storage metadata for an existing table.
     async fn alter_table(
         &self,
@@ -562,6 +610,34 @@ pub trait TableFormat: Send + Sync {
             TableFormatAlterTableOperation::AddCheckConstraint { .. } => {
                 not_impl_err!(
                     "CHECK constraint alteration not supported for {} format",
+                    self.name()
+                )
+            }
+            TableFormatAlterTableOperation::RenameTable => Ok(()),
+            TableFormatAlterTableOperation::AddColumns { .. } => {
+                not_impl_err!("ADD COLUMNS not yet implemented for {} format", self.name())
+            }
+            TableFormatAlterTableOperation::DropColumns { .. } => {
+                not_impl_err!(
+                    "DROP COLUMNS not yet implemented for {} format",
+                    self.name()
+                )
+            }
+            TableFormatAlterTableOperation::AlterColumnComment { .. } => {
+                not_impl_err!(
+                    "ALTER COLUMN COMMENT not yet implemented for {} format",
+                    self.name()
+                )
+            }
+            TableFormatAlterTableOperation::AlterColumnNullability { .. } => {
+                not_impl_err!(
+                    "ALTER COLUMN NULLABILITY not yet implemented for {} format",
+                    self.name()
+                )
+            }
+            TableFormatAlterTableOperation::AlterColumnPosition { .. } => {
+                not_impl_err!(
+                    "ALTER COLUMN POSITION not yet implemented for {} format",
                     self.name()
                 )
             }

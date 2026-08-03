@@ -29,6 +29,7 @@ use sail_catalog::provider::{
     PartitionTransform,
 };
 use sail_catalog::utils::{get_property, quote_name_if_needed, quote_namespace_if_needed};
+use sail_common::config::IcebergRestAccessDelegation;
 use sail_common::http::SAIL_USER_AGENT;
 use sail_common_datafusion::catalog::managed::METADATA_LOCATION_KEY;
 use sail_common_datafusion::catalog::{
@@ -123,6 +124,7 @@ impl CatalogConfig<'_> {
 pub struct IcebergRestCatalogOptions {
     pub credentials: Arc<dyn CatalogCredentials>,
     pub properties: HashMap<String, String>,
+    pub access_delegation: IcebergRestAccessDelegation,
 }
 
 /// Provider for Apache Iceberg REST Catalog.
@@ -257,6 +259,15 @@ impl IcebergRestCatalogProvider {
                         ),
                     )
                 }
+                apis::Error::ResponseError(apis::ResponseContent {
+                    status, content, ..
+                }) => CatalogError::External(format!(
+                    "Failed to load table {}.{}: server responded with {}: {}",
+                    quote_namespace_if_needed(database),
+                    quote_name_if_needed(table),
+                    status,
+                    content,
+                )),
                 _ => CatalogError::External(format!(
                     "Failed to load table {}.{}: {e}",
                     quote_namespace_if_needed(database),
@@ -992,7 +1003,7 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             bucket_by,
             mode,
             properties,
-            is_external: _,
+            is_external,
             is_write_precondition,
         } = options;
 
@@ -1064,7 +1075,11 @@ impl CatalogProvider for IcebergRestCatalogProvider {
 
         let request = crate::models::CreateTableRequest {
             name: table.to_string(),
-            location,
+            // For managed tables, let the catalog autogenerate the location under its
+            // storage so the planner-computed default (e.g. `spark-warehouse/<table>-<uuid>`)
+            // is never sent to a remote authority that cannot resolve it. Only forward
+            // a user-specified location (which marks the table as external).
+            location: if is_external { location } else { None },
             schema: Box::new(schema),
             partition_spec,
             write_order,
@@ -1301,12 +1316,14 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             purpose: _,
         } = request;
         let catalog_config = self.resolved_catalog_config().await?;
+        let access_delegation = match self.options.access_delegation {
+            IcebergRestAccessDelegation::VendedCredentials => {
+                Some(REST_ACCESS_DELEGATION_VENDED_CREDENTIALS)
+            }
+            IcebergRestAccessDelegation::None => None,
+        };
         let result = self
-            .load_table_result(
-                database,
-                table,
-                Some(REST_ACCESS_DELEGATION_VENDED_CREDENTIALS),
-            )
+            .load_table_result(database, table, access_delegation)
             .await?;
         // TODO: Convert preserved REST table-session credentials into operation-scoped
         // FileIO/object-store access instead of only fingerprinting the session.
@@ -2045,6 +2062,7 @@ mod tests {
         IcebergRestCatalogOptions {
             credentials: Arc::new(EmptyCatalogCredentials),
             properties,
+            access_delegation: IcebergRestAccessDelegation::default(),
         }
     }
 

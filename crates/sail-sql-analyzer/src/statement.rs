@@ -11,15 +11,15 @@ use sail_sql_parser::ast::statement::{
     AlterColumnOperation, AlterTableOperation, AlterViewOperation, AnalyzeTableModifier,
     AsQueryClause, Assignment, AssignmentList, ColumnAlteration, ColumnAlterationList,
     ColumnAlterationOption, ColumnDefinition, ColumnDefinitionList, ColumnDefinitionOption,
-    ColumnPosition, ColumnTypeDefinition, CommentValue, CreateDatabaseClause, CreateTableClause,
-    CreateViewClause, CreateViewDefinition, DeleteTableAlias, DescribeFunctionName, DescribeItem,
-    ExplainFormat, FileFormat, InsertDirectoryDestination, MergeMatchClause, MergeMatchedAction,
-    MergeNotMatchedBySourceAction, MergeNotMatchedByTargetAction, MergeSource, PartitionByItem,
-    PartitionByList, PartitionClause, PartitionValue, PartitionValueList, PropertyKey,
-    PropertyKeyList, PropertyKeyValue, PropertyList, PropertyValue, RowFormat,
-    RowFormatDelimitedClause, SetClause, ShowFunctionScope, ShowFunctionsClause,
-    ShowFunctionsPattern, SortColumn, SortColumnClause, SortColumnList, Statement,
-    TableColumnIdentityOption, TableColumnIdentityOptions, UpdateTableAlias, ViewColumn,
+    ColumnDropList, ColumnPosition, ColumnTypeDefinition, CommentValue, CreateDatabaseClause,
+    CreateTableClause, CreateViewClause, CreateViewDefinition, DeleteTableAlias,
+    DescribeFunctionName, DescribeItem, ExplainFormat, FileFormat, InsertDirectoryDestination,
+    MergeMatchClause, MergeMatchedAction, MergeNotMatchedBySourceAction,
+    MergeNotMatchedByTargetAction, MergeSource, PartitionByItem, PartitionByList, PartitionClause,
+    PartitionValue, PartitionValueList, PropertyKey, PropertyKeyList, PropertyKeyValue,
+    PropertyList, PropertyValue, RowFormat, RowFormatDelimitedClause, SetClause, ShowFunctionScope,
+    ShowFunctionsClause, ShowFunctionsPattern, SortColumn, SortColumnClause, SortColumnList,
+    Statement, TableColumnIdentityOption, TableColumnIdentityOptions, UpdateTableAlias, ViewColumn,
     ViewColumnList, ViewUsingClause,
 };
 use sail_sql_parser::tree::TreeText;
@@ -2165,9 +2165,9 @@ impl TryFrom<Vec<ColumnAlterationOption>> for ColumnAlterationOptions {
     }
 }
 
-// TODO: implement the conversion properly for column-level ALTER TABLE operations
-fn from_ast_column_alteration_list(items: ColumnAlterationList) -> SqlResult<()> {
-    // TODO: implement the conversion properly
+fn from_ast_column_alteration_list(
+    items: ColumnAlterationList,
+) -> SqlResult<Vec<spec::ColumnDefinition>> {
     let columns = match items {
         ColumnAlterationList::Delimited {
             left: _,
@@ -2176,19 +2176,27 @@ fn from_ast_column_alteration_list(items: ColumnAlterationList) -> SqlResult<()>
         } => columns,
         ColumnAlterationList::NotDelimited { columns } => columns,
     };
-    let _ = columns
+    columns
         .into_items()
         .map(|x| {
             let ColumnAlteration {
-                name: _,
-                data_type: _,
+                name,
+                data_type,
                 options,
             } = x;
-            let _: ColumnAlterationOptions = options.try_into()?;
-            Ok(())
+            let options: ColumnAlterationOptions = options.try_into()?;
+            Ok(spec::ColumnDefinition {
+                name: from_ast_object_name(name)?,
+                data_type: from_ast_data_type(data_type)?,
+                nullable: !options.not_null,
+                default: options
+                    .default
+                    .as_ref()
+                    .map(|expr| expr.text().trim().to_string()),
+                comment: options.comment.map(from_ast_string).transpose()?,
+            })
         })
-        .collect::<SqlResult<Vec<_>>>()?;
-    Ok(())
+        .collect()
 }
 
 fn from_ast_merge_optional_condition<T>(
@@ -2280,22 +2288,87 @@ fn from_ast_alter_table_operation(
                 },
             })
         }
-        AlterTableOperation::RenameTable { .. }
-        | AlterTableOperation::RenamePartition { .. }
-        | AlterTableOperation::DropColumns { .. }
+        AlterTableOperation::RenameTable { name, .. } => {
+            Ok(spec::AlterTableOperation::RenameTable {
+                new_name: from_ast_object_name(name)?,
+            })
+        }
+        AlterTableOperation::RenamePartition { .. }
         | AlterTableOperation::RenameColumn { .. }
         | AlterTableOperation::AddPartitions { .. }
         | AlterTableOperation::DropPartition { .. }
         | AlterTableOperation::SetFileFormat { .. }
         | AlterTableOperation::SetLocation { .. }
         | AlterTableOperation::RecoverPartitions { .. } => Ok(spec::AlterTableOperation::Unknown),
-        AlterTableOperation::AlterColumn { .. } => Ok(spec::AlterTableOperation::Unknown),
-        AlterTableOperation::AddColumns { items, .. }
-        | AlterTableOperation::ReplaceColumns { items, .. } => {
+        AlterTableOperation::AlterColumn {
+            name,
+            operation: AlterColumnOperation::Comment(_, s),
+            ..
+        } => {
+            let comment = from_ast_string(s)?;
+            Ok(spec::AlterTableOperation::AlterColumnComment {
+                name: from_ast_object_name(name)?,
+                comment: Some(comment),
+            })
+        }
+        AlterTableOperation::AlterColumn {
+            name,
+            operation: AlterColumnOperation::SetNotNull(_, _, _),
+            ..
+        } => Ok(spec::AlterTableOperation::AlterColumnNullability {
+            name: from_ast_object_name(name)?,
+            nullable: false,
+        }),
+        AlterTableOperation::AlterColumn {
+            name,
+            operation: AlterColumnOperation::DropNotNull(_, _, _),
+            ..
+        } => Ok(spec::AlterTableOperation::AlterColumnNullability {
+            name: from_ast_object_name(name)?,
+            nullable: true,
+        }),
+        AlterTableOperation::AlterColumn {
+            name,
+            operation: AlterColumnOperation::Position(pos),
+            ..
+        } => {
+            let position = match pos {
+                ColumnPosition::First(_) => spec::ColumnPosition::First,
+                ColumnPosition::After(_, name) => {
+                    spec::ColumnPosition::After(from_ast_object_name(name)?)
+                }
+            };
+            Ok(spec::AlterTableOperation::AlterColumnPosition {
+                name: from_ast_object_name(name)?,
+                position,
+            })
+        }
+        AlterTableOperation::AddColumns { items, .. } => {
+            Ok(spec::AlterTableOperation::AddColumns {
+                items: from_ast_column_alteration_list(items)?,
+            })
+        }
+        AlterTableOperation::ReplaceColumns { items, .. } => {
             // Validate column descriptors (e.g. detect duplicate COMMENT/DEFAULT/NOT NULL/POSITION
-            // clauses) even though we do not yet translate these operations.
+            // clauses) even though we do not yet translate this operation.
             from_ast_column_alteration_list(items)?;
             Ok(spec::AlterTableOperation::Unknown)
+        }
+        AlterTableOperation::DropColumns {
+            names, if_exists, ..
+        } => {
+            let names: Vec<ObjectName> = match names {
+                ColumnDropList::Delimited { columns, .. } => columns.into_items().collect(),
+                ColumnDropList::NotDelimited { columns } => columns.into_items().collect(),
+            };
+            let names: Vec<spec::ObjectName> = names
+                .into_iter()
+                .map(from_ast_object_name)
+                .collect::<SqlResult<Vec<_>>>()?;
+            Ok(spec::AlterTableOperation::DropColumns {
+                names,
+                if_exists: if_exists.is_some(),
+            })
         }
     }
 }
@@ -2304,4 +2377,528 @@ fn from_ast_alter_view_operation(
     _operation: AlterViewOperation,
 ) -> SqlResult<spec::AlterViewOperation> {
     Ok(spec::AlterViewOperation::Unknown)
+}
+
+#[cfg(test)]
+mod tests {
+    use sail_sql_parser::ast::statement::Statement;
+
+    use super::*;
+    use crate::parser::parse_one_statement;
+
+    fn parse_alter_op(sql: &str) -> SqlResult<spec::AlterTableOperation> {
+        let stmt = parse_one_statement(sql)?;
+        match stmt {
+            Statement::AlterTable { operation, .. } => from_ast_alter_table_operation(operation),
+            _ => Err(SqlError::invalid("expected ALTER TABLE statement")),
+        }
+    }
+
+    #[test]
+    fn test_alter_table_rename_to() -> SqlResult<()> {
+        let op = parse_alter_op("ALTER TABLE old_name RENAME TO new_name")?;
+        match op {
+            spec::AlterTableOperation::RenameTable { new_name } => {
+                let parts: Vec<String> = new_name.into();
+                assert_eq!(parts, vec!["new_name"]);
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_alter_table_rename_to_multipart() -> SqlResult<()> {
+        let op = parse_alter_op("ALTER TABLE t RENAME TO db.new_name")?;
+        match op {
+            spec::AlterTableOperation::RenameTable { new_name } => {
+                let parts: Vec<String> = new_name.into();
+                assert_eq!(parts, vec!["db", "new_name"]);
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_alter_table_drop_columns() -> SqlResult<()> {
+        let op = parse_alter_op("ALTER TABLE t DROP COLUMN c")?;
+        match op {
+            spec::AlterTableOperation::DropColumns { names, if_exists } => {
+                let parts: Vec<String> = names[0].clone().into();
+                assert_eq!(parts, vec!["c"]);
+                assert!(!if_exists);
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_alter_table_drop_columns_multiple() -> SqlResult<()> {
+        let op = parse_alter_op("ALTER TABLE t DROP COLUMNS (a, b.c)")?;
+        match op {
+            spec::AlterTableOperation::DropColumns { names, if_exists } => {
+                assert_eq!(names.len(), 2);
+                let parts0: Vec<String> = names[0].clone().into();
+                assert_eq!(parts0, vec!["a"]);
+                let parts1: Vec<String> = names[1].clone().into();
+                assert_eq!(parts1, vec!["b", "c"]);
+                assert!(!if_exists);
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_alter_table_drop_columns_if_exists() -> SqlResult<()> {
+        let op = parse_alter_op("ALTER TABLE t DROP COLUMNS IF EXISTS (nonexistent_col)")?;
+        match op {
+            spec::AlterTableOperation::DropColumns { names, if_exists } => {
+                assert_eq!(names.len(), 1);
+                assert!(if_exists);
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_alter_column_comment_set() -> SqlResult<()> {
+        let op = parse_alter_op("ALTER TABLE t ALTER COLUMN c COMMENT 'hello world'")?;
+        match op {
+            spec::AlterTableOperation::AlterColumnComment { name, comment } => {
+                let parts: Vec<String> = name.into();
+                assert_eq!(parts, vec!["c"]);
+                assert_eq!(comment, Some("hello world".to_string()));
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_alter_column_set_not_null() -> SqlResult<()> {
+        let op = parse_alter_op("ALTER TABLE t ALTER COLUMN c SET NOT NULL")?;
+        match op {
+            spec::AlterTableOperation::AlterColumnNullability { name, nullable } => {
+                let parts: Vec<String> = name.into();
+                assert_eq!(parts, vec!["c"]);
+                assert!(!nullable);
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_alter_column_drop_not_null() -> SqlResult<()> {
+        let op = parse_alter_op("ALTER TABLE t ALTER COLUMN c DROP NOT NULL")?;
+        match op {
+            spec::AlterTableOperation::AlterColumnNullability { name, nullable } => {
+                let parts: Vec<String> = name.into();
+                assert_eq!(parts, vec!["c"]);
+                assert!(nullable);
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_alter_column_position_first() -> SqlResult<()> {
+        let op = parse_alter_op("ALTER TABLE t ALTER COLUMN c FIRST")?;
+        match op {
+            spec::AlterTableOperation::AlterColumnPosition { name, position } => {
+                let parts: Vec<String> = name.into();
+                assert_eq!(parts, vec!["c"]);
+                assert_eq!(position, spec::ColumnPosition::First);
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_alter_column_position_after() -> SqlResult<()> {
+        let op = parse_alter_op("ALTER TABLE t ALTER COLUMN c AFTER d")?;
+        match op {
+            spec::AlterTableOperation::AlterColumnPosition { name, position } => {
+                let parts: Vec<String> = name.into();
+                assert_eq!(parts, vec!["c"]);
+                match position {
+                    spec::ColumnPosition::After(after_name) => {
+                        let after_parts: Vec<String> = after_name.into();
+                        assert_eq!(after_parts, vec!["d"]);
+                    }
+                    spec::ColumnPosition::First => panic!("expected After, got First"),
+                }
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_alter_column_multipart_name() -> SqlResult<()> {
+        let op = parse_alter_op("ALTER TABLE t ALTER COLUMN a.b.c SET NOT NULL")?;
+        match op {
+            spec::AlterTableOperation::AlterColumnNullability { name, nullable } => {
+                let parts: Vec<String> = name.into();
+                assert_eq!(parts, vec!["a", "b", "c"]);
+                assert!(!nullable);
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_alter_column_comment_empty() -> SqlResult<()> {
+        let op = parse_alter_op("ALTER TABLE t ALTER COLUMN c COMMENT ''")?;
+        match op {
+            spec::AlterTableOperation::AlterColumnComment { name, comment } => {
+                let parts: Vec<String> = name.into();
+                assert_eq!(parts, vec!["c"]);
+                assert_eq!(comment, Some(String::new()));
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_alter_column_multipart_position_after() -> SqlResult<()> {
+        let op = parse_alter_op("ALTER TABLE t ALTER COLUMN x.y AFTER a.b")?;
+        match op {
+            spec::AlterTableOperation::AlterColumnPosition { name, position } => {
+                let parts: Vec<String> = name.into();
+                assert_eq!(parts, vec!["x", "y"]);
+                match position {
+                    spec::ColumnPosition::After(after_name) => {
+                        let after_parts: Vec<String> = after_name.into();
+                        assert_eq!(after_parts, vec!["a", "b"]);
+                    }
+                    spec::ColumnPosition::First => panic!("expected After, got First"),
+                }
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+        Ok(())
+    }
+
+    fn parse_add_columns(sql: &str) -> SqlResult<Vec<spec::ColumnDefinition>> {
+        let stmt = parse_one_statement(sql)?;
+        match stmt {
+            Statement::AlterTable {
+                operation: AlterTableOperation::AddColumns { items, .. },
+                ..
+            } => from_ast_column_alteration_list(items),
+            _ => Err(SqlError::invalid("expected ALTER TABLE ADD COLUMNS")),
+        }
+    }
+
+    #[test]
+    fn test_add_column_basic() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x int")?;
+        assert_eq!(defs.len(), 1);
+        let col = &defs[0];
+        let name: Vec<String> = col.name.clone().into();
+        assert_eq!(name, vec!["x"]);
+        assert_eq!(col.data_type, spec::DataType::Int32);
+        assert!(col.nullable);
+        assert_eq!(col.default, None);
+        assert_eq!(col.comment, None);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_not_null() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x int NOT NULL")?;
+        assert_eq!(defs.len(), 1);
+        assert!(!defs[0].nullable);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_default() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x int DEFAULT 42")?;
+        assert_eq!(defs.len(), 1);
+        assert!(defs[0]
+            .default
+            .as_ref()
+            .expect("column default should be Some")
+            .contains("42"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_comment() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x int COMMENT 'hello'")?;
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].comment, Some("hello".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_position_first() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x int FIRST")?;
+        assert_eq!(defs.len(), 1);
+        assert!(defs[0].nullable);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_all_options() -> SqlResult<()> {
+        let defs = parse_add_columns(
+            "ALTER TABLE t ADD COLUMN x int NOT NULL DEFAULT 42 COMMENT 'desc' FIRST",
+        )?;
+        assert_eq!(defs.len(), 1);
+        let col = &defs[0];
+        assert!(!col.nullable);
+        assert!(col
+            .default
+            .as_ref()
+            .expect("column default should be Some")
+            .contains("42"));
+        assert_eq!(col.comment, Some("desc".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_multiple() -> SqlResult<()> {
+        let defs = parse_add_columns(
+            "ALTER TABLE t ADD COLUMNS (x int NOT NULL, y string COMMENT 'name')",
+        )?;
+        assert_eq!(defs.len(), 2);
+
+        let name0: Vec<String> = defs[0].name.clone().into();
+        assert_eq!(name0, vec!["x"]);
+        assert_eq!(defs[0].data_type, spec::DataType::Int32);
+        assert!(!defs[0].nullable);
+
+        let name1: Vec<String> = defs[1].name.clone().into();
+        assert_eq!(name1, vec!["y"]);
+        assert!(matches!(
+            defs[1].data_type,
+            spec::DataType::Utf8 | spec::DataType::ConfiguredUtf8 { .. }
+        ));
+        assert_eq!(defs[1].comment, Some("name".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_multipart_name() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN a.b.c bigint NOT NULL")?;
+        assert_eq!(defs.len(), 1);
+        let name: Vec<String> = defs[0].name.clone().into();
+        assert_eq!(name, vec!["a", "b", "c"]);
+        assert_eq!(defs[0].data_type, spec::DataType::Int64);
+        assert!(!defs[0].nullable);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_default_string() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x string DEFAULT 'hello world'")?;
+        assert_eq!(defs.len(), 1);
+        assert!(defs[0]
+            .default
+            .as_ref()
+            .expect("column default should be Some")
+            .contains("hello world"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_add_column_default_boolean() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x boolean DEFAULT true")?;
+        assert_eq!(defs.len(), 1);
+        let d = defs[0]
+            .default
+            .as_ref()
+            .expect("column default should be Some");
+        assert_eq!(d, "TRUE");
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_double_quoted_comment() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x int COMMENT \"hello world\"")?;
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].comment, Some("hello world".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_empty_comment() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x int COMMENT ''")?;
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].comment, Some(String::new()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_decimal() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN price DECIMAL(10,2)")?;
+        assert_eq!(defs.len(), 1);
+        assert!(matches!(
+            defs[0].data_type,
+            spec::DataType::Decimal128 {
+                precision: 10,
+                scale: 2,
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_date() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN dt DATE")?;
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].data_type, spec::DataType::Date32);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_timestamp() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN ts TIMESTAMP")?;
+        assert_eq!(defs.len(), 1);
+        assert!(matches!(
+            defs[0].data_type,
+            spec::DataType::Timestamp {
+                time_unit: spec::TimeUnit::Microsecond,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_boolean() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN flag BOOLEAN")?;
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].data_type, spec::DataType::Boolean);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_double() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN val DOUBLE")?;
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].data_type, spec::DataType::Float64);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_float() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN val FLOAT")?;
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].data_type, spec::DataType::Float32);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_smallint() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN s SMALLINT")?;
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].data_type, spec::DataType::Int16);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_tinyint() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN t TINYINT")?;
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].data_type, spec::DataType::Int8);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_binary() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN b BINARY")?;
+        assert_eq!(defs.len(), 1);
+        assert!(matches!(
+            defs[0].data_type,
+            spec::DataType::Binary | spec::DataType::ConfiguredBinary
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_array() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN arr ARRAY<INT>")?;
+        assert_eq!(defs.len(), 1);
+        assert!(matches!(defs[0].data_type, spec::DataType::List { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_array_not_null() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN arr ARRAY<INT> NOT NULL")?;
+        assert_eq!(defs.len(), 1);
+        assert!(!defs[0].nullable);
+        assert!(matches!(defs[0].data_type, spec::DataType::List { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_map() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN m MAP<STRING, INT>")?;
+        assert_eq!(defs.len(), 1);
+        assert!(matches!(defs[0].data_type, spec::DataType::Map { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_struct() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN s STRUCT<name: STRING, age: INT>")?;
+        assert_eq!(defs.len(), 1);
+        assert!(matches!(defs[0].data_type, spec::DataType::Struct { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_position_after() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x INT AFTER y")?;
+        assert_eq!(defs.len(), 1);
+        assert!(defs[0].nullable);
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_columns_mixed_types_and_options() -> SqlResult<()> {
+        let defs = parse_add_columns(
+            "ALTER TABLE t ADD COLUMNS (x INT NOT NULL, y DECIMAL(10,2) DEFAULT 0.0, z DATE NOT NULL DEFAULT '2024-01-01' COMMENT 'event date')",
+        )?;
+        assert_eq!(defs.len(), 3);
+
+        assert_eq!(defs[0].data_type, spec::DataType::Int32);
+        assert!(!defs[0].nullable);
+        assert_eq!(defs[0].default, None);
+
+        assert!(matches!(
+            defs[1].data_type,
+            spec::DataType::Decimal128 {
+                precision: 10,
+                scale: 2,
+            }
+        ));
+        assert!(defs[1].default.is_some(), "expected a default value");
+
+        assert_eq!(defs[2].data_type, spec::DataType::Date32);
+        assert!(!defs[2].nullable);
+        assert!(defs[2].default.is_some(), "expected a default value");
+        assert_eq!(defs[2].comment, Some("event date".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_column_default_float() -> SqlResult<()> {
+        let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x FLOAT DEFAULT 3.14")?;
+        assert_eq!(defs.len(), 1);
+        assert!(defs[0].default.is_some(), "expected a default value");
+        Ok(())
+    }
 }

@@ -596,11 +596,13 @@ impl ExecutionPlan for IcebergWriterExec {
             let commit_meta = CommitMeta {
                 table_uri: table_url.to_string(),
                 row_count: total_rows,
-                operation: if matches!(sink_mode, PhysicalSinkMode::Overwrite) {
-                    crate::spec::Operation::Overwrite
-                } else {
-                    crate::spec::Operation::Append
-                },
+                operation: options.commit_operation.unwrap_or_else(|| {
+                    if matches!(sink_mode, PhysicalSinkMode::Overwrite) {
+                        crate::spec::Operation::Overwrite
+                    } else {
+                        crate::spec::Operation::Append
+                    }
+                }),
                 requirements: commit_requirements,
                 table_properties: options.table_properties,
                 lakehouse_table: options.lakehouse_table,
@@ -612,6 +614,7 @@ impl ExecutionPlan for IcebergWriterExec {
                 } else {
                     None
                 },
+                touched_file_paths: options.touched_file_paths.clone(),
             };
 
             let schema = iceberg_action_schema()?;

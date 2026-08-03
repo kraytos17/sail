@@ -24,7 +24,8 @@ use sail_catalog::provider::{
     RuntimeAwareCatalogProvider,
 };
 use sail_catalog_iceberg::{
-    IcebergRestCatalogOptions, IcebergRestCatalogProvider, REST_CATALOG_PROP_URI,
+    IcebergRestAccessDelegation, IcebergRestCatalogOptions, IcebergRestCatalogProvider,
+    REST_CATALOG_PROP_URI,
 };
 use sail_common::runtime::RuntimeHandle;
 use sail_common_datafusion::catalog::{
@@ -117,6 +118,7 @@ async fn setup_catalog(
                 IcebergRestCatalogOptions {
                     credentials: Arc::new(EmptyCatalogCredentials),
                     properties: props,
+                    access_delegation: IcebergRestAccessDelegation::default(),
                 },
             );
             Ok(provider)

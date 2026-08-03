@@ -51,6 +51,12 @@ pub struct IcebergWriterExecOptions {
     pub shred_variants_explicit: bool,
     pub variant_inference_buffer_size: usize,
     pub variant_inference_buffer_size_explicit: bool,
+    /// When set, overrides the operation derived from `PhysicalSinkMode`.
+    /// Used by row-level operations (DELETE → Delete, MERGE → Overwrite, COMPACT → Replace).
+    pub commit_operation: Option<crate::spec::Operation>,
+    /// File paths rewritten by row-level operations. Used to determine which parent
+    /// manifests to keep vs replace when committing.
+    pub touched_file_paths: Vec<String>,
 }
 
 impl Default for IcebergWriterExecOptions {
@@ -66,6 +72,8 @@ impl Default for IcebergWriterExecOptions {
             shred_variants_explicit: false,
             variant_inference_buffer_size: 100,
             variant_inference_buffer_size_explicit: false,
+            commit_operation: None,
+            touched_file_paths: vec![],
         }
     }
 }
@@ -83,6 +91,8 @@ impl From<IcebergWriteOptions> for IcebergWriterExecOptions {
             shred_variants_explicit: false,
             variant_inference_buffer_size: options.variant_inference_buffer_size,
             variant_inference_buffer_size_explicit: false,
+            commit_operation: None,
+            touched_file_paths: vec![],
         }
     }
 }

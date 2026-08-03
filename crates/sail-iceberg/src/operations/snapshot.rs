@@ -18,7 +18,7 @@ use crate::io::StoreContext;
 use crate::spec::manifest::ManifestWriterBuilder;
 use crate::spec::manifest_list::ManifestListWriter;
 use crate::spec::{
-    DataFile, FormatVersion, ManifestContentType, Operation, PartitionSpec, Schema,
+    DataFile, FormatVersion, ManifestContentType, ManifestFile, Operation, PartitionSpec, Schema,
     SnapshotBuilder, SnapshotReference, SnapshotRetention, TableRequirement, TableUpdate,
     MAIN_BRANCH,
 };
@@ -37,6 +37,11 @@ pub struct SnapshotProducer<'a> {
     /// If true, create a snapshot with no parent (for bootstrap scenarios)
     pub is_bootstrap: bool,
     pub row_lineage_start_row_id: Option<i64>,
+    /// Explicit override for parent manifest entries.
+    /// - `Some(vec![])`: no parent manifests (full replacement — used by Overwrite, Delete, Replace)
+    /// - `Some(entries)`: use these specific parent manifests (partial replacement)
+    /// - `None`: existing behavior — load parent for Append, skip for Overwrite
+    pub parent_manifest_entries: Option<Vec<ManifestFile>>,
 }
 
 impl<'a> SnapshotProducer<'a> {
@@ -54,6 +59,7 @@ impl<'a> SnapshotProducer<'a> {
             write_path_mode: crate::utils::WritePathMode::Absolute,
             is_bootstrap: false,
             row_lineage_start_row_id: None,
+            parent_manifest_entries: None,
         }
     }
 
@@ -74,6 +80,14 @@ impl<'a> SnapshotProducer<'a> {
         self
     }
 
+    /// Override parent manifest entries.
+    /// `Some(vec![])` means a full replacement (no inherited parent manifests),
+    /// `Some(entries)` means partial replacement (only these parent manifests are kept).
+    pub fn with_parent_manifest_entries(mut self, entries: Option<Vec<ManifestFile>>) -> Self {
+        self.parent_manifest_entries = entries;
+        self
+    }
+
     pub fn validate_added_data_files(&self, _files: &[DataFile]) -> Result<(), String> {
         // TODO: Implement this function to validate the added data files
         Ok(())
@@ -81,12 +95,18 @@ impl<'a> SnapshotProducer<'a> {
 
     pub async fn commit(self, op: impl SnapshotProduceOperation) -> Result<ActionCommit, String> {
         let timestamp_ms = crate::utils::timestamp::monotonic_timestamp_ms();
-        let is_overwrite = op.operation() == Operation::Overwrite.as_str();
-        let summary = if is_overwrite {
-            crate::spec::snapshots::Summary::new(Operation::Overwrite)
-        } else {
-            crate::spec::snapshots::Summary::new(Operation::Append)
+        let op_str = op.operation();
+
+        // Determine the Iceberg Operation enum from the producer operation string.
+        // This allows DELETE to produce Operation::Delete, COMPACT to produce Operation::Replace, etc.
+        let op_type = match op_str {
+            "append" => Operation::Append,
+            "overwrite" => Operation::Overwrite,
+            "delete" => Operation::Delete,
+            "replace" => Operation::Replace,
+            _ => Operation::Append, // fallback
         };
+        let summary = crate::spec::snapshots::Summary::new(op_type);
 
         // Build manifest metadata: prefer caller-provided metadata derived from table schema/spec
         // Fall back to deriving from the current transaction snapshot if not provided
@@ -125,9 +145,19 @@ impl<'a> SnapshotProducer<'a> {
 
         let parent_snapshot = self.tx.snapshot();
         let parent_manifest_list_path_str = parent_snapshot.manifest_list();
-        let mut parent_manifest_entries = Vec::new();
+        let mut parent_manifest_entries: Vec<ManifestFile> = Vec::new();
 
-        if !self.is_bootstrap && !is_overwrite && !parent_manifest_list_path_str.is_empty() {
+        // Resolve parent manifest entries:
+        // - If explicit override is Some, use it directly
+        // - If explicit override is None, use existing behavior:
+        //   - Append (and not bootstrap): load parent manifests
+        //   - Overwrite / Delete / Replace (and not bootstrap): skip parent manifests
+        if let Some(entries) = self.parent_manifest_entries {
+            parent_manifest_entries = entries;
+        } else if !self.is_bootstrap
+            && op_str == Operation::Append.as_str()
+            && !parent_manifest_list_path_str.is_empty()
+        {
             let (store_ref, manifest_list_path) = store_ctx
                 .resolve(parent_manifest_list_path_str)
                 .map_err(|e| format!("{}", e))?;

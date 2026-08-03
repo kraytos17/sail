@@ -517,6 +517,14 @@ pub enum OneLakeApi {
     Iceberg,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IcebergRestAccessDelegation {
+    #[default]
+    VendedCredentials,
+    None,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -549,6 +557,8 @@ pub enum CatalogType {
             serialize_with = "serialize_optional_secret"
         )]
         bearer_access_token: Option<SecretString>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        access_delegation: Option<IcebergRestAccessDelegation>,
         #[serde(flatten)]
         cache: CatalogCacheConfig,
     },

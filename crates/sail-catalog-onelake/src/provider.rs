@@ -102,6 +102,7 @@ impl OneLakeCatalogProvider {
                     IcebergRestCatalogOptions {
                         credentials,
                         properties,
+                        access_delegation: Default::default(),
                     },
                 ))
             }
