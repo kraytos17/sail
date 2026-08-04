@@ -44,6 +44,14 @@ pub struct CommitMeta {
     /// When set, the commit exec uses these to compute which parent manifests to keep
     /// vs replace. Files in this set are replaced; files NOT in this set stay in the table.
     pub touched_file_paths: Vec<String>,
+    /// JSON-encoded `Vec<(String, String)>` partition equality pairs from
+    /// `INSERT ... REPLACE WHERE`. When set, the commit exec keeps only parent
+    /// manifests whose partition bounds do not match the predicate.
+    pub overwrite_predicate: Option<String>,
+    /// JSON-encoded set of partition value tuples written by a dynamic partition
+    /// overwrite. When set, the commit exec keeps only parent manifests whose
+    /// partition bounds do not overlap the written values.
+    pub overwrite_partition_values: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +71,11 @@ pub struct CommitMetaAction {
     /// File paths rewritten by a row-level operation. JSON-encoded Vec<String>.
     /// When non-empty, the commit exec uses these to compute which parent manifests to keep.
     pub touched_file_paths_json: Option<String>,
+    /// Predicate overwrite partition pairs. JSON-encoded Vec<(String, String)>.
+    pub overwrite_predicate_json: Option<String>,
+    /// Dynamic partition overwrite written partition value tuples.
+    /// JSON-encoded Vec<Vec<String>>.
+    pub overwrite_partition_values_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,6 +449,8 @@ pub fn encode_commit_meta(meta: CommitMeta) -> Result<RecordBatch> {
             schema_json,
             partition_spec_json,
             touched_file_paths_json,
+            overwrite_predicate_json: meta.overwrite_predicate,
+            overwrite_partition_values_json: meta.overwrite_partition_values,
         }),
     }];
     encode_actions(rows)
@@ -502,6 +517,8 @@ pub fn decode_actions_and_meta_from_batch(
                     schema,
                     partition_spec,
                     touched_file_paths,
+                    overwrite_predicate: m.overwrite_predicate_json,
+                    overwrite_partition_values: m.overwrite_partition_values_json,
                 });
             }
         }
@@ -555,6 +572,8 @@ mod tests {
             schema: None,
             partition_spec: None,
             touched_file_paths: vec![],
+            overwrite_predicate: None,
+            overwrite_partition_values: None,
         };
 
         let schema = iceberg_action_schema()?;
@@ -570,6 +589,68 @@ mod tests {
         assert_eq!(adds[0].file_path, df.file_path);
         assert_eq!(adds[0].record_count, df.record_count);
         assert!(meta.is_some());
+        Ok(())
+    }
+
+    fn commit_meta_for_overwrite() -> CommitMeta {
+        CommitMeta {
+            table_uri: "s3://bucket/table".to_string(),
+            row_count: 3,
+            operation: Operation::Overwrite,
+            requirements: vec![],
+            table_properties: vec![],
+            lakehouse_table: None,
+            schema: None,
+            partition_spec: None,
+            touched_file_paths: vec![],
+            overwrite_predicate: None,
+            overwrite_partition_values: None,
+        }
+    }
+
+    #[test]
+    fn encode_commit_meta_with_overwrite_predicate_roundtrip() -> Result<()> {
+        let mut meta = commit_meta_for_overwrite();
+        meta.overwrite_predicate = Some(r#"[["event_date","2024-01-15"]]"#.to_string());
+
+        let batch = encode_commit_meta(meta)?;
+        let (_adds, _deletes, decoded) = decode_actions_and_meta_from_batch(&batch)?;
+        let decoded = decoded.expect("commit meta should decode");
+        assert_eq!(decoded.operation, Operation::Overwrite);
+        assert_eq!(
+            decoded.overwrite_predicate.as_deref(),
+            Some(r#"[["event_date","2024-01-15"]]"#)
+        );
+        assert!(decoded.overwrite_partition_values.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn encode_commit_meta_with_overwrite_partition_values_roundtrip() -> Result<()> {
+        let mut meta = commit_meta_for_overwrite();
+        meta.overwrite_partition_values = Some(r#"[["2024-01-15"],["2024-01-16"]]"#.to_string());
+
+        let batch = encode_commit_meta(meta)?;
+        let (_adds, _deletes, decoded) = decode_actions_and_meta_from_batch(&batch)?;
+        let decoded = decoded.expect("commit meta should decode");
+        assert_eq!(decoded.operation, Operation::Overwrite);
+        assert_eq!(
+            decoded.overwrite_partition_values.as_deref(),
+            Some(r#"[["2024-01-15"],["2024-01-16"]]"#)
+        );
+        assert!(decoded.overwrite_predicate.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn encode_commit_meta_without_overwrite_fields_roundtrip() -> Result<()> {
+        let meta = commit_meta_for_overwrite();
+
+        let batch = encode_commit_meta(meta)?;
+        let (_adds, _deletes, decoded) = decode_actions_and_meta_from_batch(&batch)?;
+        let decoded = decoded.expect("commit meta should decode");
+        assert!(decoded.overwrite_predicate.is_none());
+        assert!(decoded.overwrite_partition_values.is_none());
         Ok(())
     }
 }

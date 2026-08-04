@@ -3,12 +3,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, StringArray, UInt64Array};
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::memory::DataSourceExec;
+use datafusion::common::scalar::ScalarValue;
 use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::table_schema::TableSchema;
 use datafusion::execution::context::TaskContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::physical_expr::{Distribution, EquivalenceProperties};
@@ -41,6 +43,9 @@ struct ScanByDataFilesState {
     table_url: Url,
     /// The Arrow schema of the actual user data.
     output_schema: SchemaRef,
+    /// When set, each output row is tagged with its source file path in a column
+    /// of this name (materialized via the Parquet scan partition columns).
+    file_path_column: Option<String>,
     /// Pending file entries (path, size_in_bytes) accumulated from the metadata stream.
     pending_files: Vec<(String, u64)>,
     /// Currently active scan stream (draining Parquet data).
@@ -57,12 +62,14 @@ impl ScanByDataFilesState {
         context: Arc<TaskContext>,
         table_url: Url,
         output_schema: SchemaRef,
+        file_path_column: Option<String>,
     ) -> Self {
         Self {
             input,
             context,
             table_url,
             output_schema,
+            file_path_column,
             pending_files: Vec::new(),
             current_scan: None,
             input_done: false,
@@ -127,6 +134,15 @@ impl ScanByDataFilesState {
         let mut partitioned_files = Vec::with_capacity(files.len());
         for (raw_path, file_size) in &files {
             let file_path = store_ctx.resolve_to_absolute_path(raw_path)?;
+            // The file path column must carry the EXACT string stored in the manifest
+            // (`data_file.file_path()`), not a re-resolved object path. Row-level
+            // operations compare this value against manifest paths when deciding which
+            // files to rewrite, so the two must be identical.
+            let partition_values = if self.file_path_column.is_some() {
+                vec![ScalarValue::Utf8(Some(raw_path.clone()))]
+            } else {
+                vec![]
+            };
             partitioned_files.push(PartitionedFile {
                 object_meta: ObjectMeta {
                     location: file_path,
@@ -135,7 +151,7 @@ impl ScanByDataFilesState {
                     e_tag: None,
                     version: None,
                 },
-                partition_values: vec![],
+                partition_values,
                 range: None,
                 statistics: None,
                 ordering: None,
@@ -161,10 +177,35 @@ impl ScanByDataFilesState {
                 .clone(),
             ..Default::default()
         };
-        let parquet_source = ParquetSource::new(Arc::clone(&self.output_schema))
-            .with_table_parquet_options(parquet_options);
+
+        // When a file path column is requested, materialize it through the Parquet
+        // scan's partition columns: the file schema is the user data schema and the
+        // file path is appended as a synthetic partition column.
+        let parquet_source = if let Some(file_path_column) = &self.file_path_column {
+            let file_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(
+                self.output_schema
+                    .fields()
+                    .iter()
+                    .filter(|f| f.name() != file_path_column)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ));
+            let table_schema = TableSchema::new(
+                file_schema,
+                vec![Arc::new(datafusion::arrow::datatypes::Field::new(
+                    file_path_column.clone(),
+                    DataType::Utf8,
+                    true,
+                ))],
+            );
+            Arc::new(ParquetSource::new(table_schema).with_table_parquet_options(parquet_options))
+        } else {
+            let parquet_source = ParquetSource::new(Arc::clone(&self.output_schema))
+                .with_table_parquet_options(parquet_options);
+            Arc::new(parquet_source)
+        };
         let parquet_source: Arc<dyn datafusion::datasource::physical_plan::FileSource> =
-            Arc::new(parquet_source);
+            parquet_source;
 
         let file_scan_config = FileScanConfigBuilder::new(object_store_url, parquet_source)
             .with_file_groups(file_groups)
@@ -207,12 +248,36 @@ pub struct IcebergScanByDataFilesExec {
     table_url: String,
     /// The Arrow schema of the actual user data.
     output_schema: SchemaRef,
+    /// When set, each output row is tagged with its source file path in a column
+    /// of this name (materialized via the Parquet scan partition columns).
+    file_path_column: Option<String>,
     /// Cached plan properties.
     cache: Arc<PlanProperties>,
 }
 
 impl IcebergScanByDataFilesExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, table_url: String, output_schema: SchemaRef) -> Self {
+        Self::new_with_file_path_column(input, table_url, output_schema, None)
+    }
+
+    pub fn new_with_file_path_column(
+        input: Arc<dyn ExecutionPlan>,
+        table_url: String,
+        output_schema: SchemaRef,
+        file_path_column: Option<String>,
+    ) -> Self {
+        let output_schema = if let Some(column) = &file_path_column {
+            let mut builder =
+                datafusion::arrow::datatypes::SchemaBuilder::from(output_schema.as_ref().clone());
+            builder.push(datafusion::arrow::datatypes::Field::new(
+                column.clone(),
+                DataType::Utf8,
+                true,
+            ));
+            Arc::new(builder.finish())
+        } else {
+            output_schema
+        };
         let partition_count = input.output_partitioning().partition_count().max(1);
         let cache = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
@@ -224,8 +289,13 @@ impl IcebergScanByDataFilesExec {
             input,
             table_url: table_url.to_string(),
             output_schema,
+            file_path_column,
             cache,
         }
+    }
+
+    pub fn file_path_column(&self) -> &Option<String> {
+        &self.file_path_column
     }
 
     pub fn table_url(&self) -> &str {
@@ -309,8 +379,13 @@ impl ExecutionPlan for IcebergScanByDataFilesExec {
             Url::parse(&self.table_url).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let output_schema = self.output_schema.clone();
 
-        let state =
-            ScanByDataFilesState::new(input_stream, context, table_url, Arc::clone(&output_schema));
+        let state = ScanByDataFilesState::new(
+            input_stream,
+            context,
+            table_url,
+            Arc::clone(&output_schema),
+            self.file_path_column.clone(),
+        );
 
         let s = stream::try_unfold(state, |mut st| async move {
             loop {
@@ -365,5 +440,204 @@ impl ExecutionPlan for IcebergScanByDataFilesExec {
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(output_schema, s)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{Int32Array, StringArray, UInt64Array};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::common::Result;
+    use datafusion::execution::context::TaskContext;
+    use datafusion::physical_expr::EquivalenceProperties;
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+    use datafusion::physical_plan::memory::MemoryStream;
+    use datafusion::physical_plan::{
+        common, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        SendableRecordBatchStream,
+    };
+    use parquet::file::properties::WriterProperties;
+
+    use super::*;
+    use crate::operations::write::arrow_parquet::ArrowParquetWriter;
+    use crate::physical_plan::manifest_scan_exec::manifest_scan_schema;
+
+    const PATH_COL: &str = "__sail_file_path";
+
+    /// A minimal plan that yields a single fixed batch; used as the metadata
+    /// source for `IcebergScanByDataFilesExec` in tests.
+    #[derive(Debug, Clone)]
+    struct FixedBatchExec {
+        schema: SchemaRef,
+        batch: RecordBatch,
+        cache: Arc<PlanProperties>,
+    }
+
+    impl FixedBatchExec {
+        fn new(schema: SchemaRef, batch: RecordBatch) -> Self {
+            let cache = Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(Arc::clone(&schema)),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            ));
+            Self {
+                schema,
+                batch,
+                cache,
+            }
+        }
+    }
+
+    impl DisplayAs for FixedBatchExec {
+        fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            match t {
+                DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                    write!(f, "FixedBatchExec")
+                }
+                DisplayFormatType::TreeRender => Ok(()),
+            }
+        }
+    }
+
+    impl ExecutionPlan for FixedBatchExec {
+        fn name(&self) -> &'static str {
+            "FixedBatchExec"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.cache
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            Ok(Box::pin(MemoryStream::try_new(
+                vec![self.batch.clone()],
+                Arc::clone(&self.schema),
+                None,
+            )?))
+        }
+    }
+
+    async fn write_parquet_file(path: &str, batch: &RecordBatch) -> u64 {
+        let mut writer =
+            ArrowParquetWriter::try_new(batch.schema().as_ref(), WriterProperties::default())
+                .expect("create parquet writer");
+        writer.write_batch(batch).await.expect("write batch");
+        let (bytes, meta) = writer.close().await.expect("close writer");
+        std::fs::write(path, bytes.to_vec()).expect("write file");
+        meta.file_size
+    }
+
+    fn data_batch(rows: &[(i32, &str)]) -> RecordBatch {
+        let ids = Int32Array::from(rows.iter().map(|(i, _)| *i).collect::<Vec<_>>());
+        let values = StringArray::from(rows.iter().map(|(_, v)| Some(*v)).collect::<Vec<_>>());
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("value", DataType::Utf8, false),
+            ])),
+            vec![Arc::new(ids), Arc::new(values)],
+        )
+        .expect("data batch")
+    }
+
+    #[tokio::test]
+    async fn file_path_column_is_materialized_per_file() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "sail-scan-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("data")).expect("create temp dir");
+
+        let file0 = format!("file://{}/data/file0.parquet", dir.display());
+        let file1 = format!("file://{}/data/file1.parquet", dir.display());
+
+        let size0 = write_parquet_file(
+            dir.join("data/file0.parquet").to_str().unwrap(),
+            &data_batch(&[(1, "a"), (2, "b")]),
+        )
+        .await;
+        let size1 = write_parquet_file(
+            dir.join("data/file1.parquet").to_str().unwrap(),
+            &data_batch(&[(3, "c"), (4, "d")]),
+        )
+        .await;
+
+        let meta = manifest_scan_schema();
+        let meta_batch = RecordBatch::try_new(
+            meta.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![file0.clone(), file1.clone()])),
+                Arc::new(StringArray::from(vec!["PARQUET", "PARQUET"])),
+                Arc::new(UInt64Array::from(vec![2u64, 2u64])),
+                Arc::new(UInt64Array::from(vec![size0, size1])),
+                Arc::new(Int32Array::from(vec![0i32, 0i32])),
+                Arc::new(StringArray::from(vec!["DATA", "DATA"])),
+            ],
+        )
+        .expect("manifest metadata batch");
+
+        let input: Arc<dyn ExecutionPlan> = Arc::new(FixedBatchExec::new(meta.clone(), meta_batch));
+
+        let table_url = format!("file://{}/", dir.display());
+        let data_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let scan = IcebergScanByDataFilesExec::new_with_file_path_column(
+            input,
+            table_url,
+            data_schema,
+            Some(PATH_COL.to_string()),
+        );
+
+        let ctx = datafusion::execution::context::SessionContext::new();
+        let stream = scan.execute(0, ctx.task_ctx())?;
+        let batches = common::collect(stream).await?;
+
+        let mut paths: HashSet<String> = HashSet::new();
+        for batch in &batches {
+            let col = batch
+                .column_by_name(PATH_COL)
+                .expect("path column present")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("path column is utf8");
+            for i in 0..col.len() {
+                paths.insert(col.value(i).to_string());
+            }
+        }
+
+        let expected: HashSet<String> = vec![file0, file1].into_iter().collect();
+        assert_eq!(
+            paths, expected,
+            "each data file must yield its own __sail_file_path value"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

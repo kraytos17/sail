@@ -312,6 +312,8 @@ pub struct MergeInfo {
 pub struct UpdateInfo {
     pub table_name: Vec<String>,
     pub path: String,
+    /// The resolved logical target scan for the table being updated.
+    pub target: Arc<LogicalPlan>,
     pub condition: Option<ExprWithSource>,
     pub assignments: Vec<UpdateAssignment>,
     pub lakehouse_table: Option<LakehouseExecutionContext>,

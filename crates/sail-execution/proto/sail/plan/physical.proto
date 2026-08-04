@@ -924,6 +924,7 @@ message IcebergScanByDataFilesExecNode {
   bytes input = 1;
   string table_url = 2;
   bytes output_schema = 3;
+  optional string file_path_column = 4;
 }
 
 message IcebergDeleteApplyExecNode {

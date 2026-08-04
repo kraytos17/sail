@@ -57,6 +57,10 @@ pub struct IcebergWriterExecOptions {
     /// File paths rewritten by row-level operations. Used to determine which parent
     /// manifests to keep vs replace when committing.
     pub touched_file_paths: Vec<String>,
+    /// JSON-encoded `Vec<(String, String)>` partition column equality pairs from
+    /// `INSERT ... REPLACE WHERE`. Used to keep only non-matching parent manifests
+    /// when committing a predicate overwrite.
+    pub overwrite_predicate: Option<String>,
 }
 
 impl Default for IcebergWriterExecOptions {
@@ -74,6 +78,7 @@ impl Default for IcebergWriterExecOptions {
             variant_inference_buffer_size_explicit: false,
             commit_operation: None,
             touched_file_paths: vec![],
+            overwrite_predicate: None,
         }
     }
 }
@@ -93,6 +98,7 @@ impl From<IcebergWriteOptions> for IcebergWriterExecOptions {
             variant_inference_buffer_size_explicit: false,
             commit_operation: None,
             touched_file_paths: vec![],
+            overwrite_predicate: None,
         }
     }
 }

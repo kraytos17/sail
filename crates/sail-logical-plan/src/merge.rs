@@ -40,7 +40,9 @@ pub use sail_common_datafusion::datasource::{
     MergeNotMatchedByTargetAction, MergeNotMatchedByTargetClause, MergeTargetInfo,
     MERGE_SOURCE_METRIC_COLUMN, OPERATION_COLUMN,
 };
-use sail_common_datafusion::datasource::{OptionLayer, RowLevelOperationType};
+use sail_common_datafusion::datasource::{
+    OptionLayer, RowLevelOperationType, UpdateAssignment, UpdateInfo,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Educe)]
 #[educe(PartialOrd)]
@@ -155,6 +157,9 @@ pub struct RowLevelWriteNode {
     /// Condition for DELETE/UPDATE (passed through to physical planner).
     #[educe(PartialOrd(ignore))]
     condition: Option<ExprWithSource>,
+    /// Assignments for UPDATE (column, expression pairs).
+    #[educe(PartialOrd(ignore))]
+    assignments: Option<Vec<UpdateAssignment>>,
     #[educe(PartialOrd(ignore))]
     merge_options: Option<MergeIntoOptions>,
     target_format: String,
@@ -196,6 +201,7 @@ impl RowLevelWriteNode {
             touched_files_plan: Some(touched_files_plan),
             deletion_vector_plan,
             condition: None,
+            assignments: None,
             merge_options: Some(options),
             schema,
         }
@@ -221,6 +227,44 @@ impl RowLevelWriteNode {
             touched_files_plan: None,
             deletion_vector_plan: None,
             condition,
+            assignments: None,
+            merge_options: None,
+            target_format: format,
+            target_location: location,
+            target_table_name: table_name,
+            target_partition_by: Vec::new(),
+            target_options: options,
+            target_lakehouse_table: lakehouse_table,
+            with_schema_evolution: false,
+            schema: Arc::new(DFSchema::empty()),
+        }
+    }
+
+    /// Create an UPDATE write node carrying the expanded logical write plan and
+    /// touched-files plan, plus the condition and assignments for display.
+    pub fn new_update(
+        raw_target: Arc<LogicalPlan>,
+        raw_input_schema: DFSchemaRef,
+        write_plan: Arc<LogicalPlan>,
+        touched_files_plan: Arc<LogicalPlan>,
+        condition: Option<ExprWithSource>,
+        assignments: Vec<UpdateAssignment>,
+        format: String,
+        location: String,
+        table_name: Vec<String>,
+        options: Vec<OptionLayer>,
+        lakehouse_table: Option<LakehouseExecutionContext>,
+    ) -> Self {
+        Self {
+            command: RowLevelCommand::Update,
+            raw_target,
+            raw_source: None,
+            raw_input_schema,
+            write_plan: Some(write_plan),
+            touched_files_plan: Some(touched_files_plan),
+            deletion_vector_plan: None,
+            condition,
+            assignments: Some(assignments),
             merge_options: None,
             target_format: format,
             target_location: location,
@@ -267,6 +311,10 @@ impl RowLevelWriteNode {
 
     pub fn condition(&self) -> Option<&ExprWithSource> {
         self.condition.as_ref()
+    }
+
+    pub fn assignments(&self) -> Option<&[UpdateAssignment]> {
+        self.assignments.as_deref()
     }
 
     pub fn target_format(&self) -> &str {
@@ -353,7 +401,14 @@ impl UserDefinedLogicalNodeCore for RowLevelWriteNode {
                     )?;
                 }
             }
-            RowLevelCommand::Update => {}
+            RowLevelCommand::Update => {
+                if let Some(cond) = self.condition.as_ref().and_then(|c| c.source.as_deref()) {
+                    write!(f, ", condition={}", cond.trim())?;
+                }
+                if let Some(assignments) = &self.assignments {
+                    write!(f, ", assignments={}", assignments.len())?;
+                }
+            }
         }
         Ok(())
     }
@@ -399,6 +454,7 @@ impl UserDefinedLogicalNodeCore for RowLevelWriteNode {
             touched_files_plan,
             deletion_vector_plan,
             condition: self.condition.clone(),
+            assignments: self.assignments.clone(),
             merge_options: self.merge_options.clone(),
             target_format: self.target_format.clone(),
             target_location: self.target_location.clone(),
@@ -782,6 +838,109 @@ pub fn expand_merge(
         path_column,
         row_index_column,
     )
+}
+
+/// Expansion result for a logical UPDATE write node.
+#[derive(Clone, Debug)]
+pub struct UpdateExpansion {
+    /// Logical plan producing the rows to write: every target column projected
+    /// through `CASE WHEN condition THEN assignment ELSE current END`, plus the
+    /// per-row file path column used for targeted rewrite.
+    pub write_plan: LogicalPlan,
+    /// Logical plan producing the distinct file paths of files containing rows
+    /// that match the update condition.
+    pub touched_files_plan: LogicalPlan,
+    /// The (empty) command output schema.
+    pub output_schema: DFSchemaRef,
+}
+
+/// Expand an UPDATE into a logical write plan and a touched-files plan.
+///
+/// The target plan must already expose the per-row file path column (via a
+/// `MergeCapableSource`), so the touched-files plan and the write plan's file
+/// path projection resolve against the scan schema.
+pub fn expand_update(info: UpdateInfo, path_column: &str) -> Result<UpdateExpansion> {
+    let target_plan = info.target.as_ref().clone();
+    let target_schema = target_plan.schema();
+    let condition = info.condition.as_ref().map(|c| c.expr.clone());
+    let assignments = info.assignments;
+
+    // Build a lookup from target column name to assignment expression.
+    let assignment_by_name: HashMap<String, Expr> = assignments
+        .into_iter()
+        .filter_map(|a| {
+            if a.column_path.len() == 1 {
+                Some((a.column_path[0].clone(), a.expression))
+            } else {
+                trace!(
+                    "UPDATE expansion: ignoring nested assignment {:?}",
+                    a.column_path
+                );
+                None
+            }
+        })
+        .collect();
+
+    // Projection: for each target column, either keep it or apply the assignment
+    // (CASE WHEN condition THEN assignment ELSE current END when a condition is
+    // present). Preserve the file path column for the targeted-rewrite join.
+    let mut projections: Vec<Expr> = Vec::with_capacity(target_schema.fields().len() + 1);
+    for field in target_schema.fields() {
+        if field.name() == path_column {
+            continue;
+        }
+        let current = Expr::Column(Column::from_name(field.name()));
+        let expr = if let Some(assignment) = assignment_by_name.get(field.name()) {
+            match &condition {
+                Some(cond) => Expr::Case(Case {
+                    expr: None,
+                    when_then_expr: vec![(Box::new(cond.clone()), Box::new(assignment.clone()))],
+                    else_expr: Some(Box::new(current)),
+                }),
+                None => assignment.clone(),
+            }
+        } else {
+            current
+        };
+        projections.push(expr.alias(field.name()));
+    }
+    // Keep the file path column through the write plan so the physical planner
+    // can join it against the touched files for targeted rewrite.
+    projections.push(Expr::Column(Column::from_name(path_column)).alias(path_column.to_string()));
+
+    let write_plan = LogicalPlanBuilder::from(target_plan.clone())
+        .project(projections)?
+        .build()?;
+
+    // Touched-files plan: scan -> filter(condition) -> project file path.
+    let filtered = if let Some(cond) = &condition {
+        LogicalPlanBuilder::from(target_plan)
+            .filter(cond.clone())?
+            .build()?
+    } else {
+        target_plan
+    };
+    let touched_files_plan = LogicalPlanBuilder::from(filtered)
+        .project(vec![
+            Expr::Column(Column::from_name(path_column)).alias(path_column.to_string())
+        ])?
+        .build()?;
+
+    trace!(
+        "UPDATE expansion write_plan schema fields: {:?}",
+        write_plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect::<Vec<_>>()
+    );
+
+    Ok(UpdateExpansion {
+        write_plan,
+        touched_files_plan,
+        output_schema: Arc::new(DFSchema::empty()),
+    })
 }
 
 /// Default MERGE expansion: full outer join + presence columns + touched files.

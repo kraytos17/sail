@@ -13,11 +13,16 @@ use super::helpers::{
 use crate::datasource::type_converter::iceberg_schema_to_arrow;
 use crate::spec::Operation;
 
-pub async fn plan_merge(
+/// Plan an UPDATE from its expanded logical plans using targeted rewrite:
+/// - The logical write plan already projects `CASE WHEN condition THEN assignment
+///   ELSE current END` for each assigned column and carries `__sail_file_path`.
+/// - Collect the touched files (files with rows matching the condition).
+/// - Rewrite only touched files via `build_targeted_writer_input`; untouched files
+///   stay in the parent manifests (via touched_file_paths at commit).
+pub async fn plan_update(
     ctx: &PlannerContext<'_>,
     write_plan: Arc<dyn ExecutionPlan>,
     touched_files_plan: Arc<dyn ExecutionPlan>,
-    is_insert_only: bool,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let table = ctx.table();
     let arrow_schema = Arc::new(iceberg_schema_to_arrow(
@@ -29,16 +34,17 @@ pub async fn plan_merge(
 
     let touched_file_paths = collect_touched_file_paths(ctx.session(), &touched_files_plan).await?;
 
-    if is_insert_only || touched_file_paths.is_empty() {
-        // Full write: all rows are new (insert path), no file rewrite needed.
-        let writer_input = strip_internal_columns(write_plan, &arrow_schema)?;
+    debug!("UPDATE touched file paths: {:?}", touched_file_paths);
 
+    if touched_file_paths.is_empty() {
+        // No rows matched: nothing changes. Rewrite all rows unchanged (full replacement).
+        let writer_input = strip_internal_columns(write_plan, &arrow_schema)?;
         return assemble_iceberg_commit_plan(
             ctx,
             writer_input,
             None,
             arrow_schema,
-            Operation::Append,
+            Operation::Overwrite,
             vec![],
         )
         .await;
@@ -52,7 +58,7 @@ pub async fn plan_merge(
     let writer_input = strip_internal_columns(writer_input, &arrow_schema)?;
 
     debug!(
-        "MERGE touched {} files: {:?}",
+        "UPDATE touched {} files: {:?}",
         touched_file_paths.len(),
         touched_file_paths
     );

@@ -12,10 +12,13 @@
 
 mod commit;
 mod context;
+pub(crate) mod helpers;
 mod op_delete;
 mod op_merge;
+mod op_update;
 
 pub use commit::assemble_iceberg_commit_plan;
 pub use context::PlannerContext;
 pub use op_delete::plan_delete;
 pub use op_merge::plan_merge;
+pub use op_update::plan_update;

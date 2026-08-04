@@ -36,4 +36,14 @@ pub struct IcebergCommitInfo {
     /// File paths rewritten by a row-level operation. Non-empty for MERGE
     /// with matched clauses; used to compute which parent manifests to keep.
     pub touched_file_paths: Vec<String>,
+    /// JSON-encoded `Vec<(String, String)>` partition equality pairs from
+    /// `INSERT ... REPLACE WHERE`. When set, the commit keeps only parent
+    /// manifests whose partition bounds do not match the predicate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overwrite_predicate: Option<String>,
+    /// JSON-encoded set of partition value tuples written by a dynamic
+    /// partition overwrite. When set, the commit keeps only parent manifests
+    /// whose partition bounds do not overlap the written values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overwrite_partition_values: Option<String>,
 }

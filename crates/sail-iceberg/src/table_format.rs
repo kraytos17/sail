@@ -35,7 +35,7 @@ use sail_common_datafusion::datasource::{
     create_sort_order, find_path_in_options, BucketBy, DeleteInfo, MergeInfo, OptionLayer,
     PhysicalSinkMode, SinkInfo, SinkMode, SourceInfo, TableFormat, TableFormatAlterTableOperation,
     TableFormatCreateTableColumn, TableFormatCreateTableInfo, TableFormatCreateTableResult,
-    TableFormatRegistry, MERGE_FILE_COLUMN,
+    TableFormatRegistry, UpdateInfo, MERGE_FILE_COLUMN,
 };
 use sail_common_datafusion::utils::items::ItemTaker;
 use sail_common_datafusion::variant::with_variant_extension_if_marked_storage;
@@ -342,6 +342,10 @@ impl TableFormat for IcebergTableFormat {
         }))
     }
 
+    async fn create_updater(&self, _ctx: &dyn Session, info: UpdateInfo) -> Result<LogicalPlan> {
+        crate::logical::update::expand_update_node(info)
+    }
+
     async fn create_merger(&self, _ctx: &dyn Session, info: MergeInfo) -> Result<LogicalPlan> {
         let raw_target = Arc::clone(&info.target);
         let raw_source = Arc::clone(&info.source);
@@ -467,9 +471,14 @@ pub(crate) async fn plan_iceberg_write(
         SinkMode::IgnoreIfExists => PhysicalSinkMode::IgnoreIfExists,
         SinkMode::Append => PhysicalSinkMode::Append,
         SinkMode::Overwrite => PhysicalSinkMode::Overwrite,
-        SinkMode::OverwriteIf { .. } | SinkMode::OverwritePartitions => {
-            return not_impl_err!("predicate or partition overwrite for Iceberg");
+        SinkMode::OverwriteIf { condition } => {
+            let source = condition.source.clone();
+            PhysicalSinkMode::OverwriteIf {
+                condition: Some(condition),
+                source,
+            }
         }
+        SinkMode::OverwritePartitions => PhysicalSinkMode::OverwritePartitions,
     };
     validate_iceberg_lakehouse_storage_access(lakehouse_table.as_ref())?;
     let metadata_location = metadata_location_from_options(&options);
@@ -512,9 +521,6 @@ pub(crate) async fn plan_iceberg_write(
         PhysicalSinkMode::IgnoreIfExists if table_exists => {
             return Ok(Arc::new(EmptyExec::new(physical_input.schema())));
         }
-        PhysicalSinkMode::OverwriteIf { .. } | PhysicalSinkMode::OverwritePartitions => {
-            return not_impl_err!("predicate or partition overwrite for Iceberg");
-        }
         _ => {}
     }
 
@@ -551,6 +557,30 @@ pub(crate) async fn plan_iceberg_write(
         }
     }
 
+    if let PhysicalSinkMode::OverwriteIf {
+        condition: Some(condition),
+        ..
+    } = &mode
+    {
+        if let Some(partition_columns) = &existing_partition_columns {
+            let predicate = extract_partition_predicate_from_expr(&condition.expr).ok_or_else(
+                || {
+                    DataFusionError::Plan(
+                        "INSERT ... REPLACE WHERE predicate must be equality predicates on partition columns".to_string(),
+                    )
+                },
+            )?;
+            for (col, _) in predicate {
+                if !partition_columns.iter().any(|field| field.column == col) {
+                    return plan_err!(
+                        "Cannot use REPLACE WHERE with non-partition predicate: column '{}' is not a partition column",
+                        col
+                    );
+                }
+            }
+        }
+    }
+
     let resolved_partition_columns = if !partition_by.is_empty() {
         partition_by
     } else {
@@ -561,6 +591,15 @@ pub(crate) async fn plan_iceberg_write(
     options.apply_variant_shredding_option_presence(variant_shredding_option_presence);
     options.table_properties = table_properties;
     options.lakehouse_table = lakehouse_table;
+    if let PhysicalSinkMode::OverwriteIf {
+        condition: Some(condition),
+        ..
+    } = &mode
+    {
+        let partition_predicate = extract_partition_predicate_from_expr(&condition.expr);
+        options.overwrite_predicate = partition_predicate
+            .map(|map| serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string()));
+    }
     let table_config = IcebergTableConfig {
         table_url,
         partition_columns: resolved_partition_columns,
@@ -1515,6 +1554,47 @@ fn alter_table_properties_conflict_error() -> DataFusionError {
     ))
 }
 
+/// Extract partition column equality conditions from an expression.
+/// Only supports equality predicates on partition columns (e.g., `col = 'value'`).
+/// Returns a JSON-serializable vector of (column, value) pairs.
+pub(crate) fn extract_partition_predicate_from_expr(expr: &Expr) -> Option<Vec<(String, String)>> {
+    match expr {
+        Expr::BinaryExpr(binary_expr) => {
+            use datafusion_expr::Operator;
+            match binary_expr.op {
+                Operator::Eq => {
+                    let left = binary_expr.left.as_ref();
+                    let right = binary_expr.right.as_ref();
+                    match (left, right) {
+                        (Expr::Column(col), Expr::Literal(scalar, _)) => {
+                            Some(vec![(col.name.clone(), scalar.to_string())])
+                        }
+                        (Expr::Literal(scalar, _), Expr::Column(col)) => {
+                            Some(vec![(col.name.clone(), scalar.to_string())])
+                        }
+                        _ => None,
+                    }
+                }
+                Operator::And => {
+                    let left = extract_partition_predicate_from_expr(binary_expr.left.as_ref());
+                    let right = extract_partition_predicate_from_expr(binary_expr.right.as_ref());
+                    match (left, right) {
+                        (Some(mut l), Some(r)) => {
+                            l.extend(r);
+                            Some(l)
+                        }
+                        (Some(l), None) => Some(l),
+                        (None, Some(r)) => Some(r),
+                        (None, None) => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sail_common_datafusion::catalog::{
@@ -1758,5 +1838,64 @@ mod tests {
 
         let result = validate_iceberg_lakehouse_storage_access(Some(&context));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn extract_partition_predicate_simple_eq() {
+        use datafusion_expr::{col, lit};
+        // col("event_date") = lit("2024-01-15")
+        let expr = col("event_date").eq(lit("2024-01-15"));
+        let result = extract_partition_predicate_from_expr(&expr);
+        assert!(result.is_some());
+        let pairs = result.unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "event_date");
+    }
+
+    #[test]
+    fn extract_partition_predicate_and_combined() {
+        use datafusion_expr::{col, lit};
+        // col("year") = lit("2024") AND col("month") = lit("01")
+        let expr = col("year").eq(lit("2024")).and(col("month").eq(lit("01")));
+        let result = extract_partition_predicate_from_expr(&expr);
+        assert!(result.is_some());
+        let pairs = result.unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.iter().any(|(k, _)| k == "year"));
+        assert!(pairs.iter().any(|(k, _)| k == "month"));
+    }
+
+    #[test]
+    fn extract_partition_predicate_no_match() {
+        use datafusion_expr::{col, lit};
+        // col("value") > lit(100) — not an equality predicate
+        let expr = col("value").gt(lit(100i64));
+        let result = extract_partition_predicate_from_expr(&expr);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_partition_predicate_literal_on_left() {
+        use datafusion_expr::{col, lit};
+        // lit("2024-01-15") = col("event_date") — reversed order
+        let expr = lit("2024-01-15").eq(col("event_date"));
+        let result = extract_partition_predicate_from_expr(&expr);
+        assert!(result.is_some());
+        let pairs = result.unwrap();
+        assert_eq!(pairs[0].0, "event_date");
+    }
+
+    #[test]
+    fn extract_partition_predicate_complex_expr() {
+        use datafusion_expr::{col, lit};
+        // (col("a") = lit("1") AND col("b") = lit("2")) OR col("c") = lit("3")
+        // Only the AND branch should be extracted; OR is not supported
+        let expr = col("a")
+            .eq(lit("1"))
+            .and(col("b").eq(lit("2")))
+            .or(col("c").eq(lit("3")));
+        let result = extract_partition_predicate_from_expr(&expr);
+        // OR is not supported, so should return None for the top-level
+        assert!(result.is_none());
     }
 }

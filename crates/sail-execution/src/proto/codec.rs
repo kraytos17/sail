@@ -1318,14 +1318,18 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 input,
                 table_url,
                 output_schema,
+                file_path_column,
             }) => {
                 let input = try_decode_physical_plan(ctx, self, &input)?;
                 let output_schema = Arc::new(try_decode_schema(&output_schema)?);
-                Ok(Arc::new(IcebergScanByDataFilesExec::new(
-                    input,
-                    table_url,
-                    output_schema,
-                )))
+                Ok(Arc::new(
+                    IcebergScanByDataFilesExec::new_with_file_path_column(
+                        input,
+                        table_url,
+                        output_schema,
+                        file_path_column,
+                    ),
+                ))
             }
             NodeKind::IcebergDeleteApply(gen::IcebergDeleteApplyExecNode {
                 input,
@@ -2118,6 +2122,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 input,
                 table_url: scan_by_files.table_url().to_string(),
                 output_schema,
+                file_path_column: scan_by_files.file_path_column().clone(),
             })
         } else if let Some(delete_apply) = node.downcast_ref::<IcebergDeleteApplyExec>() {
             let input = try_encode_physical_plan(self, delete_apply.input().clone())?;

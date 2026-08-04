@@ -73,7 +73,22 @@ pub async fn plan_iceberg_row_level_write(
             planner::plan_merge(&ctx, physical_write, physical_touched, is_insert_only).await
         }
         RowLevelCommand::Update => {
-            datafusion_common::internal_err!("UPDATE is not yet implemented for Iceberg")
+            let write_plan = node.write_plan().ok_or_else(|| {
+                DataFusionError::Internal("UPDATE node must have a write_plan".into())
+            })?;
+            let physical_write = planner
+                .create_physical_plan(write_plan, session_state)
+                .await?;
+
+            let physical_touched = if let Some(plan) = node.touched_files_plan() {
+                planner.create_physical_plan(plan, session_state).await?
+            } else {
+                return datafusion_common::internal_err!(
+                    "UPDATE node must have a touched_files_plan"
+                );
+            };
+
+            planner::plan_update(&ctx, physical_write, physical_touched).await
         }
     }
 }
