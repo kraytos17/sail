@@ -1278,6 +1278,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 input,
                 table_url,
                 lakehouse_table_json,
+                reported_row_count,
             }) => {
                 let input = try_decode_physical_plan(ctx, self, &input)?;
                 let table_url = Url::parse(&table_url)
@@ -1288,6 +1289,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     input,
                     table_url,
                     lakehouse_table,
+                    reported_row_count,
                 )))
             }
             NodeKind::IcebergManifestScan(gen::IcebergManifestScanExecNode {
@@ -2099,6 +2101,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 table_url: iceberg_commit_exec.table_url().to_string(),
                 lakehouse_table_json: self
                     .try_encode_lakehouse_table(iceberg_commit_exec.lakehouse_table())?,
+                reported_row_count: iceberg_commit_exec.reported_row_count(),
             })
         } else if let Some(manifest_scan) = node.downcast_ref::<IcebergManifestScanExec>() {
             let snapshot_json = serde_json::to_string(manifest_scan.snapshot())

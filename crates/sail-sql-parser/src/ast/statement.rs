@@ -157,6 +157,12 @@ pub enum Statement {
         table: (Either<From, In>, ObjectName),
         database: Option<(Either<From, In>, ObjectName)>,
     },
+    ShowTblProperties {
+        show: Show,
+        tblproperties: Tblproperties,
+        table: ObjectName,
+        property_key: Option<(LeftParenthesis, StringLiteral, RightParenthesis)>,
+    },
     CreateView {
         create: Create,
         or_replace: Option<(Or, Replace)>,

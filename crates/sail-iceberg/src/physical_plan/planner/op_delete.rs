@@ -59,6 +59,7 @@ pub async fn plan_delete(
             arrow_schema,
             Operation::Delete,
             vec![],
+            None,
         )
         .await;
     }
@@ -104,6 +105,7 @@ pub async fn plan_delete(
         arrow_schema,
         Operation::Delete,
         vec![],
+        None,
     )
     .await
 }

@@ -32,6 +32,7 @@ pub async fn assemble_iceberg_commit_plan(
     output_schema: SchemaRef,
     operation: Operation,
     touched_file_paths: Vec<String>,
+    reported_row_count: Option<u64>,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
     let table = ctx.table();
     let table_url = ctx.table_url().clone();
@@ -74,5 +75,6 @@ pub async fn assemble_iceberg_commit_plan(
         Arc::new(CoalescePartitionsExec::new(commit_input)),
         table_url,
         ctx.lakehouse_table().cloned(),
+        reported_row_count,
     )))
 }

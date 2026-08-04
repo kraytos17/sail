@@ -273,7 +273,7 @@ impl TableFormat for IcebergTableFormat {
         operation: TableFormatAlterTableOperation,
         lakehouse_table: Option<LakehouseExecutionContext>,
     ) -> Result<()> {
-        reject_catalog_managed_iceberg_alter(lakehouse_table.as_ref())?;
+        reject_catalog_managed_iceberg_alter(lakehouse_table.as_ref(), &operation)?;
         match operation {
             TableFormatAlterTableOperation::SetTableProperties { changes, if_exists } => {
                 self.alter_table_properties(runtime_env, path, changes, if_exists)
@@ -369,7 +369,14 @@ impl TableFormat for IcebergTableFormat {
 
 fn reject_catalog_managed_iceberg_alter(
     lakehouse_table: Option<&LakehouseExecutionContext>,
+    operation: &TableFormatAlterTableOperation,
 ) -> Result<()> {
+    // Rename is a purely catalog-level operation (the Iceberg spec has no rename
+    // metadata update), so catalog-managed tables rename through the catalog without
+    // any storage mutation.
+    if matches!(operation, TableFormatAlterTableOperation::RenameTable) {
+        return Ok(());
+    }
     let Some(context) = lakehouse_table else {
         return Ok(());
     };

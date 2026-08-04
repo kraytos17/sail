@@ -905,6 +905,7 @@ message IcebergCommitExecNode {
   bytes input = 1;
   string table_url = 2;
   string lakehouse_table_json = 3;
+  optional uint64 reported_row_count = 4;
 }
 
 message IcebergManifestScanExecNode {

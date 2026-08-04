@@ -66,6 +66,7 @@ pub struct IcebergCommitExec {
     input: Arc<dyn ExecutionPlan>,
     table_url: Url,
     lakehouse_table: Option<LakehouseExecutionContext>,
+    reported_row_count: Option<u64>,
     cache: Arc<PlanProperties>,
 }
 
@@ -74,6 +75,7 @@ impl IcebergCommitExec {
         input: Arc<dyn ExecutionPlan>,
         table_url: Url,
         lakehouse_table: Option<LakehouseExecutionContext>,
+        reported_row_count: Option<u64>,
     ) -> Self {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "count",
@@ -90,6 +92,7 @@ impl IcebergCommitExec {
             input,
             table_url,
             lakehouse_table,
+            reported_row_count,
             cache,
         }
     }
@@ -104,6 +107,10 @@ impl IcebergCommitExec {
 
     pub fn lakehouse_table(&self) -> Option<&LakehouseExecutionContext> {
         self.lakehouse_table.as_ref()
+    }
+
+    pub fn reported_row_count(&self) -> Option<u64> {
+        self.reported_row_count
     }
 
     fn apply_schema_update(table_meta: &mut TableMetadata, new_schema: IcebergSchema) {
@@ -647,6 +654,7 @@ impl ExecutionPlan for IcebergCommitExec {
             Arc::clone(&children[0]),
             self.table_url.clone(),
             self.lakehouse_table.clone(),
+            self.reported_row_count,
         )))
     }
 
@@ -670,6 +678,7 @@ impl ExecutionPlan for IcebergCommitExec {
 
         let table_url = self.table_url.clone();
         let lakehouse_table = self.lakehouse_table.clone();
+        let reported_row_count = self.reported_row_count;
         let schema = self.schema();
         let future = async move {
             let object_store = get_object_store_from_context(&context, &table_url)?;
@@ -721,6 +730,10 @@ impl ExecutionPlan for IcebergCommitExec {
                 overwrite_predicate: commit_meta.overwrite_predicate,
                 overwrite_partition_values: commit_meta.overwrite_partition_values,
             };
+
+            // Operations that report a specific "rows affected" count (e.g. UPDATE reports
+            // the number of rows matching the predicate) override the total rows written.
+            let reported_count = reported_row_count.unwrap_or(commit_info.row_count);
 
             let catalog_table = commit_info
                 .lakehouse_table
@@ -830,7 +843,7 @@ impl ExecutionPlan for IcebergCommitExec {
                     }
                 }
 
-                let array = Arc::new(UInt64Array::from(vec![commit_info.row_count]));
+                let array = Arc::new(UInt64Array::from(vec![reported_count]));
                 let batch = RecordBatch::try_new(schema, vec![array])?;
                 return Ok(batch);
             }
@@ -969,8 +982,7 @@ impl ExecutionPlan for IcebergCommitExec {
                                 if committed.payload().is_some() {
                                     log::trace!("Iceberg catalog commit returned a payload");
                                 }
-                                let array =
-                                    Arc::new(UInt64Array::from(vec![commit_info.row_count]));
+                                let array = Arc::new(UInt64Array::from(vec![reported_count]));
                                 let batch = RecordBatch::try_new(schema, vec![array])?;
                                 return Ok(batch);
                             }
@@ -1045,7 +1057,7 @@ impl ExecutionPlan for IcebergCommitExec {
                         .await?;
                     }
 
-                    let array = Arc::new(UInt64Array::from(vec![commit_info.row_count]));
+                    let array = Arc::new(UInt64Array::from(vec![reported_count]));
                     let batch = RecordBatch::try_new(schema, vec![array])?;
                     return Ok(batch);
                 }
@@ -1246,7 +1258,7 @@ impl ExecutionPlan for IcebergCommitExec {
                             if committed.payload().is_some() {
                                 log::trace!("Iceberg catalog commit returned a payload");
                             }
-                            let array = Arc::new(UInt64Array::from(vec![commit_info.row_count]));
+                            let array = Arc::new(UInt64Array::from(vec![reported_count]));
                             let batch = RecordBatch::try_new(schema, vec![array])?;
                             return Ok(batch);
                         }
@@ -1430,7 +1442,7 @@ impl ExecutionPlan for IcebergCommitExec {
                     .await?;
                 }
 
-                let array = Arc::new(UInt64Array::from(vec![commit_info.row_count]));
+                let array = Arc::new(UInt64Array::from(vec![reported_count]));
                 let batch = RecordBatch::try_new(schema, vec![array])?;
                 return Ok(batch);
             }

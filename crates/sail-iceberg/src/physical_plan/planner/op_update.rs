@@ -32,7 +32,8 @@ pub async fn plan_update(
             .ok_or_else(|| DataFusionError::Plan("Table has no current schema".to_string()))?,
     )?);
 
-    let touched_file_paths = collect_touched_file_paths(ctx.session(), &touched_files_plan).await?;
+    let (touched_file_paths, matched_row_count) =
+        collect_touched_file_paths(ctx.session(), &touched_files_plan).await?;
 
     debug!("UPDATE touched file paths: {:?}", touched_file_paths);
 
@@ -46,6 +47,7 @@ pub async fn plan_update(
             arrow_schema,
             Operation::Overwrite,
             vec![],
+            Some(0),
         )
         .await;
     }
@@ -58,8 +60,9 @@ pub async fn plan_update(
     let writer_input = strip_internal_columns(writer_input, &arrow_schema)?;
 
     debug!(
-        "UPDATE touched {} files: {:?}",
+        "UPDATE touched {} files, matched {} rows: {:?}",
         touched_file_paths.len(),
+        matched_row_count,
         touched_file_paths
     );
 
@@ -70,6 +73,7 @@ pub async fn plan_update(
         arrow_schema,
         Operation::Overwrite,
         touched_file_paths,
+        Some(matched_row_count),
     )
     .await
 }

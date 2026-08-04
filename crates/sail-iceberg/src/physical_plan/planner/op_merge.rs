@@ -27,7 +27,8 @@ pub async fn plan_merge(
             .ok_or_else(|| DataFusionError::Plan("Table has no current schema".to_string()))?,
     )?);
 
-    let touched_file_paths = collect_touched_file_paths(ctx.session(), &touched_files_plan).await?;
+    let (touched_file_paths, _matched_row_count) =
+        collect_touched_file_paths(ctx.session(), &touched_files_plan).await?;
 
     if is_insert_only || touched_file_paths.is_empty() {
         // Full write: all rows are new (insert path), no file rewrite needed.
@@ -40,6 +41,7 @@ pub async fn plan_merge(
             arrow_schema,
             Operation::Append,
             vec![],
+            None,
         )
         .await;
     }
@@ -64,6 +66,7 @@ pub async fn plan_merge(
         arrow_schema,
         Operation::Overwrite,
         touched_file_paths,
+        None,
     )
     .await
 }

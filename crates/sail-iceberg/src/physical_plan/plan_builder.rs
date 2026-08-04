@@ -156,6 +156,7 @@ impl<'a> IcebergPlanBuilder<'a> {
                 input,
                 self.table_config.table_url.clone(),
                 self.table_config.options.lakehouse_table.clone(),
+                None,
             ),
         ))
     }

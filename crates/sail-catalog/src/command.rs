@@ -1,7 +1,7 @@
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use sail_common_datafusion::array::serde::ArrowSerializer;
-use sail_common_datafusion::catalog::{FunctionStatus, LakehouseOperation};
+use sail_common_datafusion::catalog::{CommitAuthority, FunctionStatus, LakehouseOperation};
 use sail_common_datafusion::datasource::{
     is_lakehouse_format, TableFormatAlterTableOperation, TableFormatCreateTableColumn,
     TableFormatCreateTableInfo, TableFormatRegistry,
@@ -71,6 +71,10 @@ pub enum CatalogCommand {
     ShowTableExtended {
         database: Vec<String>,
         pattern: String,
+    },
+    ShowTblProperties {
+        table: Vec<String>,
+        property_key: Option<String>,
     },
     ShowFunctions {
         database: Vec<String>,
@@ -181,6 +185,7 @@ impl CatalogCommand {
             CatalogCommand::GetTable { .. } => "GetTable",
             CatalogCommand::ShowTables { .. } => "ShowTables",
             CatalogCommand::ShowTableExtended { .. } => "ShowTableExtended",
+            CatalogCommand::ShowTblProperties { .. } => "ShowTblProperties",
             CatalogCommand::ShowFunctions { .. } => "ShowFunctions",
             CatalogCommand::ListTables { .. } => "ListTables",
             CatalogCommand::ListViews { .. } => "ListViews",
@@ -219,6 +224,9 @@ impl CatalogCommand {
             }
             CatalogCommand::ShowTableExtended { .. } => {
                 ArrowSerializer::default().schema::<ShowTableExtendedRow>()?
+            }
+            CatalogCommand::ShowTblProperties { .. } => {
+                ArrowSerializer::default().schema::<ShowTblPropertiesRow>()?
             }
             CatalogCommand::ShowFunctions { .. } => {
                 ArrowSerializer::default().schema::<ShowFunctionsRow>()?
@@ -399,6 +407,42 @@ impl CatalogCommand {
                     .collect::<CatalogResult<Vec<_>>>()?;
                 ArrowSerializer::default().build_record_batch(&rows)?
             }
+            CatalogCommand::ShowTblProperties {
+                table,
+                property_key,
+            } => {
+                let status = manager.get_table_or_view(&table).await?;
+                let properties = match &status.kind {
+                    sail_common_datafusion::catalog::TableKind::Table { properties, .. } => {
+                        properties
+                    }
+                    _ => {
+                        return Err(CatalogError::NotSupported(
+                            "SHOW TBLPROPERTIES is not supported for views".to_string(),
+                        ));
+                    }
+                };
+                let mut rows: Vec<ShowTblPropertiesRow> = match property_key {
+                    Some(key) => properties
+                        .iter()
+                        .find(|(k, _)| k == &key)
+                        .map(|(k, v)| ShowTblPropertiesRow {
+                            key: k.clone(),
+                            value: v.clone(),
+                        })
+                        .into_iter()
+                        .collect(),
+                    None => properties
+                        .iter()
+                        .map(|(k, v)| ShowTblPropertiesRow {
+                            key: k.clone(),
+                            value: v.clone(),
+                        })
+                        .collect(),
+                };
+                rows.sort_by(|a, b| a.key.cmp(&b.key));
+                ArrowSerializer::default().build_record_batch(&rows)?
+            }
             CatalogCommand::ShowFunctions {
                 database,
                 pattern,
@@ -499,6 +543,15 @@ impl CatalogCommand {
                         )
                         .await?
                         .execution;
+
+                    // Iceberg REST catalogs (e.g. Polaris) own the table metadata:
+                    // mutate through the catalog provider, not the storage layer
+                    // (which cannot commit catalog-managed metadata).
+                    if lakehouse_table.commit == CommitAuthority::IcebergRestCommit {
+                        manager.alter_table(&table, options).await?;
+                        return Ok(display.bools().to_record_batch(vec![true])?);
+                    }
+
                     table_format
                         .alter_table(runtime, &location, storage_operation, Some(lakehouse_table))
                         .await
@@ -1105,6 +1158,12 @@ struct ShowTableExtendedRow {
     table_name: String,
     is_temporary: bool,
     information: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ShowTblPropertiesRow {
+    key: String,
+    value: String,
 }
 
 #[derive(Serialize, Deserialize)]

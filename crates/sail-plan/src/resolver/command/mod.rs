@@ -64,6 +64,13 @@ impl PlanResolver<'_> {
                     pattern,
                 })
             }
+            CommandNode::ShowTblProperties {
+                table,
+                property_key,
+            } => self.resolve_catalog_command(CatalogCommand::ShowTblProperties {
+                table: table.into(),
+                property_key,
+            }),
             CommandNode::ShowFunctions {
                 database,
                 pattern,

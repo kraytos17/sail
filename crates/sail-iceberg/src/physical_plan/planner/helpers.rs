@@ -23,10 +23,15 @@ use sail_common_datafusion::datasource::MERGE_FILE_COLUMN;
 /// `DataSourceExec`, which spawn tokio tasks internally. Driving them with
 /// `futures::executor::block_on` would park a runtime worker and starve those tasks,
 /// deadlocking the driver.
+///
+/// Returns `(touched_file_paths, matched_row_count)`: the distinct file paths, plus the
+/// number of rows produced by `touched_files_plan` before path dedup. The touched plan is
+/// built as `scan -> filter(condition) -> project(file_path)` (one row per matching row),
+/// so `matched_row_count` is exactly the number of rows affected by the operation.
 pub async fn collect_touched_file_paths(
     session: &dyn datafusion::catalog::Session,
     touched_files_plan: &Arc<dyn ExecutionPlan>,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, u64)> {
     use datafusion::arrow::array::StringArray;
     use datafusion::execution::TaskContext;
     use datafusion::physical_plan::common;
@@ -47,8 +52,11 @@ pub async fn collect_touched_file_paths(
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
+    let mut matched_row_count = 0u64;
     let mut paths: HashSet<String> = HashSet::new();
     for batch in &batches {
+        matched_row_count += u64::try_from(batch.num_rows())
+            .map_err(|e| DataFusionError::Execution(format!("Row count overflow: {}", e)))?;
         let col = batch
             .column(0)
             .as_any()
@@ -67,7 +75,7 @@ pub async fn collect_touched_file_paths(
 
     let mut result: Vec<String> = paths.into_iter().collect();
     result.sort();
-    Ok(result)
+    Ok((result, matched_row_count))
 }
 
 /// Build a one-column in-memory DataSourceExec from a list of file path strings.
@@ -128,7 +136,7 @@ pub fn build_targeted_writer_input(
         false,
     )?);
     let untouched_rows = Arc::new(ProjectionExec::try_new(
-        (left_width..untouched_join.schema().fields().len())
+        (0..untouched_join.schema().fields().len())
             .map(|i| {
                 (
                     Arc::new(Column::new(untouched_join.schema().field(i).name(), i))
