@@ -154,6 +154,7 @@ pub enum CatalogCommand {
     DescribeTable {
         table: Vec<String>,
         extended: bool,
+        column: Option<String>,
     },
     DescribeDatabase {
         database: Vec<String>,
@@ -574,14 +575,25 @@ impl CatalogCommand {
                 let rows = manager.get_table_or_view(&table).await?.kind.columns();
                 display.table_columns().to_record_batch(rows)?
             }
-            CatalogCommand::DescribeTable { table, extended } => {
+            CatalogCommand::DescribeTable {
+                table,
+                extended,
+                column,
+            } => {
                 let table_status = manager.get_table_or_view(&table).await?;
                 let formatter = service.plan_formatter();
                 let serializer = ArrowSerializer::default();
 
                 let mut rows: Vec<DescribeTableRow> = Vec::new();
 
-                for col in &table_status.kind.columns() {
+                if let Some(column_name) = column {
+                    let columns = table_status.kind.columns();
+                    let col = columns
+                        .iter()
+                        .find(|col| col.name == column_name)
+                        .ok_or_else(|| {
+                            CatalogError::NotFound(CatalogObject::Column, column_name)
+                        })?;
                     rows.push(DescribeTableRow {
                         col_name: col.name.clone(),
                         data_type: formatter
@@ -589,49 +601,59 @@ impl CatalogCommand {
                             .unwrap_or_else(|_| "invalid".to_string()),
                         comment: col.comment.clone(),
                     });
-                }
-
-                if extended {
-                    let partition_cols = table_status.kind.partition_columns();
-                    if !partition_cols.is_empty() {
+                } else {
+                    for col in &table_status.kind.columns() {
                         rows.push(DescribeTableRow {
-                            col_name: "# Partition Information".to_string(),
+                            col_name: col.name.clone(),
+                            data_type: formatter
+                                .data_type_to_simple_string(&col.data_type)
+                                .unwrap_or_else(|_| "invalid".to_string()),
+                            comment: col.comment.clone(),
+                        });
+                    }
+
+                    if extended {
+                        let partition_cols = table_status.kind.partition_columns();
+                        if !partition_cols.is_empty() {
+                            rows.push(DescribeTableRow {
+                                col_name: "# Partition Information".to_string(),
+                                data_type: String::new(),
+                                comment: None,
+                            });
+                            rows.push(DescribeTableRow {
+                                col_name: "# col_name".to_string(),
+                                data_type: "data_type".to_string(),
+                                comment: Some("comment".to_string()),
+                            });
+                            for col in &partition_cols {
+                                rows.push(DescribeTableRow {
+                                    col_name: col.name.clone(),
+                                    data_type: formatter
+                                        .data_type_to_simple_string(&col.data_type)
+                                        .unwrap_or_else(|_| "invalid".to_string()),
+                                    comment: col.comment.clone(),
+                                });
+                            }
+                        }
+
+                        rows.push(DescribeTableRow {
+                            col_name: String::new(),
                             data_type: String::new(),
                             comment: None,
                         });
                         rows.push(DescribeTableRow {
-                            col_name: "# col_name".to_string(),
-                            data_type: "data_type".to_string(),
-                            comment: Some("comment".to_string()),
-                        });
-                        for col in &partition_cols {
-                            rows.push(DescribeTableRow {
-                                col_name: col.name.clone(),
-                                data_type: formatter
-                                    .data_type_to_simple_string(&col.data_type)
-                                    .unwrap_or_else(|_| "invalid".to_string()),
-                                comment: col.comment.clone(),
-                            });
-                        }
-                    }
-
-                    rows.push(DescribeTableRow {
-                        col_name: String::new(),
-                        data_type: String::new(),
-                        comment: None,
-                    });
-                    rows.push(DescribeTableRow {
-                        col_name: "# Detailed Table Information".to_string(),
-                        data_type: String::new(),
-                        comment: None,
-                    });
-
-                    for (key, value) in table_status.describe_extended_metadata() {
-                        rows.push(DescribeTableRow {
-                            col_name: key,
-                            data_type: value,
+                            col_name: "# Detailed Table Information".to_string(),
+                            data_type: String::new(),
                             comment: None,
                         });
+
+                        for (key, value) in table_status.describe_extended_metadata() {
+                            rows.push(DescribeTableRow {
+                                col_name: key,
+                                data_type: value,
+                                comment: None,
+                            });
+                        }
                     }
                 }
 
@@ -1582,5 +1604,45 @@ mod tests {
         assert!(
             matches!(error, CatalogError::External(message) if message.contains("catalog sync failed"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_describe_table_with_column() {
+        let ctx = test_session_context();
+        let manager = test_manager(None);
+        let command = CatalogCommand::DescribeTable {
+            table: vec!["items".to_string()],
+            extended: false,
+            column: Some("id".to_string()),
+        };
+
+        let result = command.execute(&ctx, &manager).await;
+        let Ok(batch) = result else {
+            panic!("describe table with column failed: {result:?}");
+        };
+        assert_eq!(batch.num_rows(), 1);
+        let col_name = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::LargeStringArray>()
+            .expect("col_name should be a string array");
+        assert_eq!(col_name.value(0), "id");
+    }
+
+    #[tokio::test]
+    async fn test_describe_table_with_missing_column() {
+        let ctx = test_session_context();
+        let manager = test_manager(None);
+        let command = CatalogCommand::DescribeTable {
+            table: vec!["items".to_string()],
+            extended: false,
+            column: Some("nope".to_string()),
+        };
+
+        let result = command.execute(&ctx, &manager).await;
+        assert!(matches!(
+            result,
+            Err(CatalogError::NotFound(CatalogObject::Column, _))
+        ));
     }
 }

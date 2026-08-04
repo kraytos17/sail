@@ -2715,6 +2715,19 @@
                   {
                     "sequence": [
                       {
+                        "nonTerminal": "Keyword(View)"
+                      },
+                      {
+                        "nonTerminal": "Option(Keyword(Extended))"
+                      },
+                      {
+                        "nonTerminal": "ObjectName"
+                      }
+                    ]
+                  },
+                  {
+                    "sequence": [
+                      {
                         "nonTerminal": "Option(Keyword(Query))"
                       },
                       {

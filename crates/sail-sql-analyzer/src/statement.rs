@@ -1249,6 +1249,16 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
                         column,
                     }
                 }
+                DescribeItem::View {
+                    view: _,
+                    extended,
+                    name,
+                } => spec::CommandNode::DescribeTable {
+                    table: from_ast_object_name(name)?,
+                    extended: extended.is_some(),
+                    partition: Default::default(),
+                    column: None,
+                },
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }

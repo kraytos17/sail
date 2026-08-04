@@ -859,9 +859,7 @@ impl IcebergRestCatalogProvider {
             .catalog_api_api()
             .update_table(&namespace, table, request, catalog_config.prefix())
             .await
-            .map_err(|e| {
-                CatalogError::External(format!("Failed to alter table properties: {e}"))
-            })?;
+            .map_err(|e| map_update_table_alter_error(database, table, e))?;
         Ok(())
     }
 
@@ -939,7 +937,9 @@ impl IcebergRestCatalogProvider {
                 schema: Box::new(schema),
                 last_column_id: Some(next_id - 1),
             },
-            crate::models::TableUpdate::SetCurrentSchemaUpdate { schema_id: -1 },
+            crate::models::TableUpdate::SetCurrentSchemaUpdate {
+                schema_id: new_schema_id,
+            },
         ];
         let request = crate::models::CommitTableRequest {
             identifier: Some(Box::new(crate::models::TableIdentifier::new(
@@ -953,7 +953,7 @@ impl IcebergRestCatalogProvider {
             .catalog_api_api()
             .update_table(&namespace, table, request, catalog_config.prefix())
             .await
-            .map_err(|e| CatalogError::External(format!("Failed to alter table schema: {e}")))?;
+            .map_err(|e| map_update_table_alter_error(database, table, e))?;
         Ok(())
     }
 
@@ -994,6 +994,12 @@ impl IcebergRestCatalogProvider {
                     }
                 }
             }
+        }
+
+        // Nothing was removed (e.g. IF EXISTS on a missing column): the schema is
+        // unchanged, so this is a no-op. Do not commit an identical schema.
+        if new_fields == current_schema.fields {
+            return Ok(());
         }
 
         let removed_ids: std::collections::HashSet<i32> = current_schema
@@ -1045,7 +1051,9 @@ impl IcebergRestCatalogProvider {
                 schema: Box::new(schema),
                 last_column_id: Some(last_column_id),
             },
-            crate::models::TableUpdate::SetCurrentSchemaUpdate { schema_id: -1 },
+            crate::models::TableUpdate::SetCurrentSchemaUpdate {
+                schema_id: new_schema_id,
+            },
         ];
         let request = crate::models::CommitTableRequest {
             identifier: Some(Box::new(crate::models::TableIdentifier::new(
@@ -1059,7 +1067,7 @@ impl IcebergRestCatalogProvider {
             .catalog_api_api()
             .update_table(&namespace, table, request, catalog_config.prefix())
             .await
-            .map_err(|e| CatalogError::External(format!("Failed to alter table schema: {e}")))?;
+            .map_err(|e| map_update_table_alter_error(database, table, e))?;
         Ok(())
     }
 }
@@ -1977,6 +1985,65 @@ where
             items.last()
         }
     })
+}
+
+/// Maps an Iceberg REST `update_table` commit error for an ALTER TABLE operation into a
+/// catalog error, preserving the server response body for diagnosability.
+fn map_update_table_alter_error(
+    database: &Namespace,
+    table: &str,
+    e: apis::Error<crate::apis::catalog_api_api::UpdateTableError>,
+) -> CatalogError {
+    match e {
+        apis::Error::ResponseError(apis::ResponseContent {
+            status, content: _, ..
+        }) if status == reqwest::StatusCode::NOT_FOUND => CatalogError::NotFound(
+            CatalogObject::Table,
+            format!(
+                "{}.{}",
+                quote_namespace_if_needed(database),
+                quote_name_if_needed(table)
+            ),
+        ),
+        apis::Error::ResponseError(apis::ResponseContent {
+            status, content, ..
+        }) if status == reqwest::StatusCode::CONFLICT => CatalogError::Conflict(format!(
+            "Iceberg REST catalog commit conflict for {}.{}: {content}",
+            quote_namespace_if_needed(database),
+            quote_name_if_needed(table)
+        )),
+        apis::Error::ResponseError(apis::ResponseContent {
+            status, content, ..
+        }) if status == reqwest::StatusCode::UNAUTHORIZED => CatalogError::Unauthorized(format!(
+            "Iceberg REST catalog commit unauthorized for {}.{}: {content}",
+            quote_namespace_if_needed(database),
+            quote_name_if_needed(table)
+        )),
+        apis::Error::ResponseError(apis::ResponseContent {
+            status, content, ..
+        }) if status == reqwest::StatusCode::FORBIDDEN => CatalogError::Forbidden(format!(
+            "Iceberg REST catalog commit forbidden for {}.{}: {content}",
+            quote_namespace_if_needed(database),
+            quote_name_if_needed(table)
+        )),
+        apis::Error::ResponseError(apis::ResponseContent {
+            status, content, ..
+        }) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            CatalogError::RateLimited(format!(
+                "Iceberg REST catalog commit rate limited for {}.{}: {content}",
+                quote_namespace_if_needed(database),
+                quote_name_if_needed(table)
+            ))
+        }
+        apis::Error::ResponseError(apis::ResponseContent {
+            status, content, ..
+        }) => CatalogError::External(format!(
+            "Failed to alter Iceberg table {}.{}: status {status}: {content}",
+            quote_namespace_if_needed(database),
+            quote_name_if_needed(table)
+        )),
+        e => CatalogError::External(format!("Failed to alter table: {e}")),
+    }
 }
 
 fn requested_iceberg_format_version(
@@ -3896,7 +3963,7 @@ mod tests {
                         ],
                         "identifier-field-ids": []
                     }, "last-column-id": 5},
-                    {"action": "set-current-schema", "schema-id": -1}
+                    {"action": "set-current-schema", "schema-id": 1}
                 ]
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3973,7 +4040,7 @@ mod tests {
                         ],
                         "identifier-field-ids": []
                     }, "last-column-id": 4},
-                    {"action": "set-current-schema", "schema-id": -1}
+                    {"action": "set-current-schema", "schema-id": 1}
                 ]
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4036,6 +4103,39 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(CatalogError::InvalidArgument(_))));
+    }
+
+    #[tokio::test]
+    async fn test_alter_table_drop_columns_if_exists_missing_key() {
+        let ctx = TestContext::new(None).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+        let table_path = ctx.path("/namespaces/db1/tables/t1");
+
+        ctx.mock_load_table_with_schema(
+            &table_path,
+            serde_json::json!([
+                {"id": 1, "name": "id", "required": false, "type": "int"},
+                {"id": 2, "name": "name", "required": false, "type": "string"}
+            ]),
+            2,
+        )
+        .await;
+
+        // No POST mock is mounted: a commit would 404 and fail the assertion below,
+        // proving the no-op IF EXISTS path does not issue an update.
+        let result = ctx
+            .catalog
+            .alter_table(
+                &namespace,
+                "t1",
+                AlterTableOptions::DropColumns {
+                    names: vec!["nonexistent".to_string()],
+                    if_exists: true,
+                },
+            )
+            .await;
+
+        result.expect("DROP COLUMNS IF EXISTS on a missing column should be a no-op");
     }
 
     async fn test_create_database_impl(name: Option<&str>) {

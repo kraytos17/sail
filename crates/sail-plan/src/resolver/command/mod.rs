@@ -338,12 +338,10 @@ impl PlanResolver<'_> {
                 if !partition.is_empty() {
                     return Err(PlanError::todo("DESCRIBE TABLE with partition spec"));
                 }
-                if column.is_some() {
-                    return Err(PlanError::todo("DESCRIBE TABLE with column"));
-                }
                 self.resolve_catalog_command(CatalogCommand::DescribeTable {
                     table: table.into(),
                     extended,
+                    column: column.map(|c| Vec::<String>::from(c).join(".")),
                 })
             }
             CommandNode::CommentOnCatalog { .. } => {
