@@ -15,6 +15,7 @@ pub mod append;
 pub mod bootstrap;
 pub mod helpers;
 pub mod overwrite;
+pub mod parquet_utils;
 pub mod snapshot;
 pub mod write;
 

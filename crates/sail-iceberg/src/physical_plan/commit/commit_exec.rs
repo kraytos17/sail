@@ -43,13 +43,15 @@ use crate::operations::bootstrap::{
 };
 use crate::operations::helpers::format_version_for_schema;
 use crate::operations::{SnapshotProduceOperation, Transaction, TransactionAction};
-use crate::physical_plan::action_schema::decode_actions_and_meta_from_batch;
+use crate::physical_plan::action_schema::{decode_actions_and_meta_from_batch, CommitMeta};
 use crate::physical_plan::commit::IcebergCommitInfo;
 use crate::spec::catalog::TableUpdate;
 use crate::spec::metadata::table_metadata::SnapshotLog;
 use crate::spec::partition::{UnboundPartitionField, UnboundPartitionSpec};
 use crate::spec::snapshots::MAIN_BRANCH;
-use crate::spec::{PartitionSpec, Schema as IcebergSchema, TableMetadata, TableRequirement};
+use crate::spec::{
+    DataFile, PartitionSpec, Schema as IcebergSchema, TableMetadata, TableRequirement,
+};
 use crate::table::metadata_loader::{
     encode_metadata_file, load_metadata_file_bytes, metadata_file_extension_from_properties,
     metadata_file_version_from_path, metadata_location_to_object_path_string,
@@ -625,6 +627,32 @@ async fn filter_parent_manifest_entries_by_values(
     Ok(kept)
 }
 
+/// Accumulate iceberg action batches into the commit inputs.
+///
+/// Returns `(added_data_files, total_written_rows, last_commit_meta)`. The reported row
+/// count is the **sum** of `row_count` across every commit-meta batch (LOAD DATA unions a
+/// fast-register branch + one or more rewrite writers); the last commit meta wins for the
+/// other commit fields (all branches target the same table).
+fn accumulate_action_batches(
+    batches: &[RecordBatch],
+) -> Result<(Vec<DataFile>, u64, Option<CommitMeta>)> {
+    let mut added_data_files = Vec::new();
+    let mut total_written_rows: u64 = 0;
+    let mut commit_meta = None;
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let (adds, _deletes, meta) = decode_actions_and_meta_from_batch(batch)?;
+        added_data_files.extend(adds);
+        if let Some(meta) = meta {
+            total_written_rows += meta.row_count;
+            commit_meta = Some(meta);
+        }
+    }
+    Ok((added_data_files, total_written_rows, commit_meta))
+}
+
 #[async_trait]
 impl ExecutionPlan for IcebergCommitExec {
     fn name(&self) -> &'static str {
@@ -685,20 +713,16 @@ impl ExecutionPlan for IcebergCommitExec {
             let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
 
             // Read writer result as Arrow-native action batches (may be empty for IgnoreIfExists).
-            let mut data = input_stream;
-            let mut added_data_files = Vec::new();
-            let mut commit_meta = None;
-            while let Some(batch_result) = data.next().await {
-                let batch = batch_result?;
-                if batch.num_rows() == 0 {
-                    continue;
+            let batches = {
+                let mut v = Vec::new();
+                let mut data = input_stream;
+                while let Some(batch_result) = data.next().await {
+                    v.push(batch_result?);
                 }
-                let (adds, _deletes, meta) = decode_actions_and_meta_from_batch(&batch)?;
-                added_data_files.extend(adds);
-                if meta.is_some() {
-                    commit_meta = meta;
-                }
-            }
+                v
+            };
+            let (added_data_files, total_written_rows, commit_meta) =
+                accumulate_action_batches(&batches)?;
 
             // No-op path (e.g. IgnoreIfExists on existing table): no rows, no meta.
             if commit_meta.is_none() && added_data_files.is_empty() {
@@ -733,7 +757,9 @@ impl ExecutionPlan for IcebergCommitExec {
 
             // Operations that report a specific "rows affected" count (e.g. UPDATE reports
             // the number of rows matching the predicate) override the total rows written.
-            let reported_count = reported_row_count.unwrap_or(commit_info.row_count);
+            // Otherwise the count is the sum of row counts across every writer batch
+            // (e.g. LOAD DATA unions a fast-register branch + one or more rewrite writers).
+            let reported_count = reported_row_count.unwrap_or(total_written_rows);
 
             let catalog_table = commit_info
                 .lakehouse_table
@@ -1474,4 +1500,122 @@ fn commit_conflict_error() -> DataFusionError {
     DataFusionError::Execution(format!(
         "Iceberg commit failed after {MAX_COMMIT_RETRIES} retries due to concurrent metadata updates"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::physical_plan::action_schema::encode_commit_meta;
+    use crate::spec::Operation;
+
+    fn commit_meta(row_count: u64) -> CommitMeta {
+        CommitMeta {
+            table_uri: "s3://bucket/table".to_string(),
+            row_count,
+            operation: Operation::Append,
+            requirements: vec![],
+            table_properties: vec![],
+            lakehouse_table: None,
+            schema: None,
+            partition_spec: None,
+            touched_file_paths: vec![],
+            overwrite_predicate: None,
+            overwrite_partition_values: None,
+        }
+    }
+
+    fn action_batches(row_counts: &[u64]) -> Result<Vec<RecordBatch>> {
+        row_counts
+            .iter()
+            .map(|&rc| encode_commit_meta(commit_meta(rc)))
+            .collect::<Result<Vec<_>>>()
+    }
+
+    fn reported_count(batches: &[RecordBatch], reported_row_count: Option<u64>) -> Result<u64> {
+        let (_, total_written_rows, _) = accumulate_action_batches(batches)?;
+        Ok(reported_row_count.unwrap_or(total_written_rows))
+    }
+
+    #[test]
+    fn count_sums_multiple_commit_meta() -> Result<()> {
+        // LOAD DATA union: fast-register branch (3 rows) + rewrite writer (2 rows).
+        let batches = action_batches(&[3, 2])?;
+        assert_eq!(reported_count(&batches, None)?, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn count_single_commit_meta() -> Result<()> {
+        // INSERT-like: a single writer with no override.
+        let batches = action_batches(&[3])?;
+        assert_eq!(reported_count(&batches, None)?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn count_reported_row_count_overrides() -> Result<()> {
+        // UPDATE/DELETE/MERGE pass an explicit reported count; it must win.
+        let batches = action_batches(&[3, 2])?;
+        assert_eq!(reported_count(&batches, Some(7))?, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn count_zero_for_no_commit_meta() -> Result<()> {
+        let (added, total, meta) = accumulate_action_batches(&[])?;
+        assert!(added.is_empty());
+        assert_eq!(total, 0);
+        assert!(meta.is_none());
+        assert_eq!(None.unwrap_or(total), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn accumulate_merges_data_files_across_batches() -> Result<()> {
+        use std::collections::HashMap;
+
+        use crate::spec::{DataContentType, DataFileFormat};
+
+        let mk_df = |path: &str| DataFile {
+            content: DataContentType::Data,
+            file_path: path.to_string(),
+            file_format: DataFileFormat::Parquet,
+            partition: vec![],
+            record_count: 1,
+            file_size_in_bytes: 1,
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            block_size_in_bytes: None,
+            key_metadata: None,
+            split_offsets: vec![],
+            equality_ids: vec![],
+            sort_order_id: None,
+            first_row_id: None,
+            partition_spec_id: 0,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
+
+        let batches = vec![
+            crate::physical_plan::action_schema::encode_add_data_files(vec![mk_df(
+                "s3://bucket/a.parquet",
+            )])?,
+            crate::physical_plan::action_schema::encode_add_data_files(vec![mk_df(
+                "s3://bucket/b.parquet",
+            )])?,
+        ];
+        let mut batches = batches;
+        batches.push(encode_commit_meta(commit_meta(2))?);
+
+        let (added, total, meta) = accumulate_action_batches(&batches)?;
+        assert_eq!(added.len(), 2);
+        assert_eq!(total, 2);
+        assert!(meta.is_some());
+        Ok(())
+    }
 }

@@ -395,7 +395,164 @@ spark.sql("SHOW TABLES IN test1").show()
 
 ---
 
-## 12. Known limitations / notes
+## 12. LOAD DATA (optimized file → Iceberg)
+
+`LOAD DATA INPATH '<path>' [OVERWRITE] INTO TABLE <ns>.<tbl>` loads files from object storage
+into an Iceberg table. **Parquet files whose schema name+type-matches the table are
+registered directly** (footer-only read, no rewrite — the source file path appears in the
+manifest). CSV/JSON and schema-mismatched parquet go through the rewrite fallback.
+
+> **Path format (important)**: `<path>` must be a **full absolute object-store URL** —
+> `s3a://<bucket>/<key>`. A bare key like `data/test/test.csv` has no scheme/bucket and is
+> rejected at plan time (`invalid source location`). Include the bucket:
+> `s3a://work/data/test/test.csv` (if the bucket is `work`). A directory/glob needs a
+> trailing slash (`s3a://work/data/test/`) or wildcard (`s3a://work/data/test/*.csv`).
+
+### 12.0 Quick start — load a single CSV into an Iceberg table (your use case)
+
+```python
+# Source: MinIO object data/test/test.csv inside bucket <bucket> (e.g. work).
+# Header row column names must match the table columns.
+
+# 1. Create the table (once)
+spark.sql("CREATE TABLE test.test_tbl (id INT, name STRING) USING iceberg").show()
+
+# 2. Load the CSV (use the FULL s3a:// URL, not the bare key)
+spark.sql("LOAD DATA INPATH 's3a://<bucket>/data/test/test.csv' INTO TABLE test.test_tbl").show()
+# Expected: count = number of CSV data rows
+
+# 3. Verify
+spark.sql("SELECT COUNT(*) FROM test.test_tbl").show()
+spark.sql("SELECT * FROM test.test_tbl").show()
+```
+
+### 12.1 Parquet fast path (single file, append)
+
+```python
+spark.sql("CREATE TABLE test1.load_t (id INT, name STRING) USING iceberg").show()
+
+# Produce an external parquet file with schema (id INT, name STRING) on s3.
+# s3://work/loads/in/data.parquet with rows (1,'a'),(2,'b'),(3,'c')
+
+spark.sql("LOAD DATA INPATH 's3a://work/loads/in/data.parquet' INTO TABLE test1.load_t").show()
+# Expected: count = 3
+
+spark.sql("SELECT COUNT(*) FROM test1.load_t").show()
+# Expected: 3
+
+# No-rewrite verification (not via SQL metadata tables — Sail doesn't expose
+# <table>.files): after the load, the latest snapshot's manifest references the
+# SOURCE path s3a://work/loads/in/data.parquet directly (inspect the manifest list
+# on the object store), i.e. no new table-owned parquet file was written.
+```
+
+### 12.2 Many parquet files via glob / directory (append)
+
+```python
+# s3://work/loads/in/ has data1.parquet, data2.parquet, data3.parquet (all matching schema)
+spark.sql("LOAD DATA INPATH 's3a://work/loads/in/*.parquet' INTO TABLE test1.load_t").show()
+# Expected: count = 9 (3 per file; total_rows reported)
+
+spark.sql("LOAD DATA INPATH 's3a://work/loads/in/' INTO TABLE test1.load_t").show()
+# Expected: count = 9 (directory listing)
+```
+
+### 12.3 OVERWRITE (full-table replace)
+
+```python
+spark.sql("LOAD DATA INPATH 's3a://work/loads/in/data.parquet' OVERWRITE INTO TABLE test1.load_t").show()
+# Expected: count = 3
+spark.sql("SELECT COUNT(*) FROM test1.load_t").show()
+# Expected: 3  (previous 9 rows replaced; new snapshot contains only loaded files)
+```
+
+### 12.4 CSV fallback (rewrite)
+
+```python
+# s3://work/loads/in/data.csv with header "id,name" and rows (1,'a'),(2,'b')
+spark.sql("LOAD DATA INPATH 's3a://work/loads/in/data.csv' INTO TABLE test1.load_t").show()
+# Expected: count = 2  (rewritten to parquet; file_path is now a table-owned path)
+# Note: before the count-fix this reported 0; the writer's actual row count now flows through.
+spark.sql("SELECT COUNT(*) FROM test1.load_t").show()
+```
+
+### 12.5 Schema-mismatch parquet → fallback
+
+```python
+# s3://work/loads/in/bad.parquet with schema (id INT, extra STRING) — missing `name`
+spark.sql("LOAD DATA INPATH 's3a://work/loads/in/bad.parquet' INTO TABLE test1.load_t").show()
+# Expected: parquet is rewritten (schema mismatch) OR scan error if column mapping fails
+```
+
+### 12.6 Not-supported
+
+```python
+spark.sql("LOAD DATA LOCAL INPATH '/local/data.parquet' INTO TABLE test1.load_t").show()
+# Expected error: LOAD DATA LOCAL is not supported
+
+spark.sql("LOAD DATA INPATH 's3a://x/y.parquet' INTO TABLE test1.load_t PARTITION (id = 1)").show()
+# Expected error: LOAD DATA ... PARTITION is not supported
+
+spark.sql("LOAD DATA INPATH 'data/test/test.csv' INTO TABLE test1.load_t").show()
+# Expected error: invalid source location — a bare key (no scheme/bucket) is rejected;
+# the path must be a full s3a://<bucket>/<key> URL.
+```
+
+### 12.7 Cross-bucket load (path-resolution fix)
+
+```python
+# Write a parquet file into a SEPARATE bucket (same MinIO endpoint).
+(spark.createDataFrame([(10,"x"),(11,"y")], ["id","name"])
+      .coalesce(1).write.mode("overwrite").parquet("s3a://data-bucket/loads/in.parquet/"))
+
+spark.sql("LOAD DATA INPATH 's3a://data-bucket/loads/in.parquet/' INTO TABLE test1.load_t").show()
+# Expected: count = 2  (source read from data-bucket, NOT the table's work bucket)
+```
+
+### 12.8 Mixed formats in one glob (count-sum across branches)
+
+```python
+# s3a://work/loads/mix/ contains a.parquet (3 rows) + b.csv (2 rows)
+spark.sql("LOAD DATA INPATH 's3a://work/loads/mix/' INTO TABLE test1.load_t").show()
+# Expected: count = 5  (3 fast-register + 2 rewrite — count sums across both branches)
+```
+
+### 12.9 Empty source (known edge, harmless)
+
+```python
+# s3a://work/loads/empty/ exists but has no matching files
+spark.sql("LOAD DATA INPATH 's3a://work/loads/empty/' INTO TABLE test1.load_t").show()
+# Expected: succeeds; creates a no-op snapshot (zero data files) — not an error
+```
+
+### 12.10 Many CSVs in a directory (parallel fallback writers)
+
+The fallback now builds **one writer per chunk of files** (per-file when the count is small,
+bounded to `target_partitions` writers when large), so CSV parse + parquet encode run in
+parallel across files.
+
+```python
+# s3a://work/loads/many/ has 20 CSVs, each (id,name) with 3 rows → 60 rows total
+spark.sql("LOAD DATA INPATH 's3a://work/loads/many/' INTO TABLE test1.load_t").show()
+# Expected: count = 60  (summed across the parallel writer branches)
+
+spark.sql("SELECT COUNT(*) FROM test1.load_t").show()
+```
+
+### 12.11 Compressed CSV (gzip/zstd detection)
+
+```python
+# s3a://work/loads/gz/ has data.csv.gz (gzip-compressed, header "id,name", 2 rows)
+spark.sql("LOAD DATA INPATH 's3a://work/loads/gz/data.csv.gz' INTO TABLE test1.load_t").show()
+# Expected: count = 2  (gzip auto-detected from the .gz extension and decompressed)
+
+spark.sql("LOAD DATA INPATH 's3a://work/loads/gz/' INTO TABLE test1.load_t").show()
+# Expected: count = 2  (directory form; .csv.zst also supported)
+```
+
+---
+
+## 13. Known limitations / notes
 
 - **Bare `DESCRIBE <t>`** is not accepted by the Sail parser (requires `TABLE`/`VIEW`/`EXTENDED` keyword).
 - **`DESCRIBE EXTENDED view <v>`** is mis-parsed as a table + column describe and errors (`DESCRIBE VIEW EXTENDED <v>` is the supported order).
@@ -403,3 +560,13 @@ spark.sql("SHOW TABLES IN test1").show()
 - **Nested columns** in `ADD/DROP COLUMNS` (`a.b.c`) and column-level `DESCRIBE TABLE t a.b` are treated as flat names (top-level only); nested paths produce a "not found" error rather than traversing structs.
 - **Dropping a column referenced by the partition spec / sort order, or the last remaining column**, is rejected by the Iceberg REST server (surfaced as a 400 with the server message).
 - **`SHOW TBLPROPERTIES`/`ALTER TABLE` metadata ops** apply to catalog-managed (Iceberg REST) tables via the catalog commit; for filesystem-commit tables the storage layer is used.
+- **`LOAD DATA LOCAL` and `LOAD DATA ... PARTITION(...)`** are not supported (v1).
+- **`LOAD DATA`** is supported for **Iceberg tables only**; other formats error with `NotSupported`.
+- **`LOAD DATA` fast path** registers external parquet by column **name+type** match against the table's current schema; the file must contain all table columns with matching types (extra source columns are dropped). Missing/mismatched columns → rewrite fallback (or scan error if the CSV/parquet cannot be mapped to the table schema).
+- **`LOAD DATA` typed bounds** (`lower_bounds`/`upper_bounds`) are not yet populated on registered files (stats are present, bounds omitted) — a known v1 limitation.
+- **`LOAD DATA` overwrite** is a full-table replace (static overwrite), not partition-aware.
+- **`LOAD DATA` `count`** = total rows loaded (fast register + rewrite), summed across all writer branches.
+- **Empty source path/glob** → `LOAD DATA` succeeds but creates a **no-op snapshot** (zero data files) — harmless, not an error.
+- **Cross-bucket `LOAD DATA`** resolves the object store per source URL; the target bucket must be reachable with the same object-store config (e.g. same MinIO endpoint/credentials).
+- **`LOAD DATA` fallback (CSV/JSON/rewrite)** builds **one writer per chunk of files** — per-file up to `target_partitions`, then chunked — so parse + encode run in parallel across many files. Gzip/bzip2/xz/zstd CSV is auto-detected from the extension.
+- **`LOAD DATA` fallback compression** is inferred per chunk from the first file; a single statement should use uniform compression (a mixed `.csv` + `.csv.gz` directory is an edge case).

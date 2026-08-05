@@ -7911,6 +7911,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "datafusion-common",
+ "datafusion-datasource",
  "datafusion-expr",
  "educe",
  "flate2",

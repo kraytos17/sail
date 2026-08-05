@@ -17,6 +17,7 @@ mod delta;
 mod explain;
 mod function;
 mod insert;
+mod load;
 mod merge;
 mod show;
 mod update;
@@ -309,7 +310,16 @@ impl PlanResolver<'_> {
                     .await
             }
             CommandNode::AlterView { .. } => Err(PlanError::todo("CommandNode::AlterView")),
-            CommandNode::LoadData { .. } => Err(PlanError::todo("CommandNode::LoadData")),
+            CommandNode::LoadData {
+                local,
+                location,
+                table,
+                overwrite,
+                partition,
+            } => {
+                self.resolve_command_load_data(local, location, table, overwrite, partition, state)
+                    .await
+            }
             CommandNode::AnalyzeTable { .. } => Err(PlanError::todo("CommandNode::AnalyzeTable")),
             CommandNode::AnalyzeTables { .. } => Err(PlanError::todo("CommandNode::AnalyzeTables")),
             CommandNode::DescribeQuery { .. } => Err(PlanError::todo("CommandNode::DescribeQuery")),
