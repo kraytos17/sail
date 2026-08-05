@@ -97,6 +97,13 @@ pub async fn plan_load_data(
         .map(|s| s.spec_id())
         .unwrap_or(0);
 
+    // A partitioned table must go through the rewrite fallback: the fast path registers
+    // parquet files with empty partition tuples, which is invalid for a non-empty spec.
+    let partitioned = metadata
+        .default_partition_spec()
+        .map(|spec| !spec.fields().is_empty())
+        .unwrap_or(false);
+
     // Resolve the SOURCE object store from the source URL (any bucket), not the table's
     // store. Globs are truncated at the first `*` so the prefix parses as a valid URL.
     let glob_cut = node.location().find('*').unwrap_or(node.location().len());
@@ -114,6 +121,7 @@ pub async fn plan_load_data(
         table_schema,
         &table_arrow_schema,
         spec_id,
+        /* allow_fast = */ !partitioned,
     )
     .await?;
 
@@ -173,11 +181,14 @@ pub async fn plan_load_data(
     // Build fallback writer branches.
     // Group fallback files by extension, then split into chunks so there is one writer
     // per chunk. Each writer is single-partition (explicit CoalescePartitionsExec), so:
-    //   - few files  → one writer per file (parse + encode run in parallel);
-    //   - many files → bounded to `target_partitions` writers (chunked, still parallel).
+    //   - few/small files → one writer that accumulates into fewer, larger parquet files;
+    //   - many/large files → bounded to `target_partitions` writers (chunked, still parallel).
+    // Chunking is byte-aware: target ~= the writer's 128 MB file size so small CSV sets don't
+    // produce tiny-file sprawl in the table.
     let target_parts = ctx.session().config().target_partitions().max(1);
     for (format, files) in group_by_format(&fallback_files) {
-        let chunk_size = chunk_size_for(files.len(), target_parts);
+        let sizes: Vec<u64> = files.iter().map(|(_, size)| *size).collect();
+        let chunk_size = chunk_size_for_bytes(&sizes, TARGET_FILE_SIZE_BYTES, target_parts);
         for chunk in files.chunks(chunk_size) {
             let scan =
                 build_fallback_scan(session_state, chunk, format.as_str(), &table_arrow_schema)?;
@@ -215,11 +226,11 @@ pub async fn plan_load_data(
     )))
 }
 
-/// Group a list of file paths by their extension (csv / json / parquet).
-fn group_by_format(files: &[String]) -> Vec<(String, Vec<String>)> {
-    let mut groups: std::collections::HashMap<String, Vec<String>> =
+/// Group a list of `(url, size)` fallback files by their extension (csv / json / parquet).
+fn group_by_format(files: &[(String, u64)]) -> Vec<(String, Vec<(String, u64)>)> {
+    let mut groups: std::collections::HashMap<String, Vec<(String, u64)>> =
         std::collections::HashMap::new();
-    for f in files {
+    for (f, size) in files {
         let ext = if f.ends_with(".csv") {
             "csv"
         } else if f.ends_with(".json") || f.ends_with(".jsonl") {
@@ -229,36 +240,40 @@ fn group_by_format(files: &[String]) -> Vec<(String, Vec<String>)> {
         } else {
             "csv"
         };
-        groups.entry(ext.to_string()).or_default().push(f.clone());
+        groups
+            .entry(ext.to_string())
+            .or_default()
+            .push((f.clone(), *size));
     }
     groups.into_iter().collect()
 }
 
-/// Build a `DataSourceExec` scan over the given set of files for a specific format.
+/// Build a `DataSourceExec` scan over the given `(url, size)` files for a specific format.
 fn build_fallback_scan(
     session_state: &SessionState,
-    files: &[String],
+    files: &[(String, u64)],
     format: &str,
     table_schema: &datafusion::arrow::datatypes::Schema,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
     let _ = session_state;
 
     // Derive the object store URL from the first file path.
-    let parsed_url = url::Url::parse(&files[0])
+    let parsed_url = url::Url::parse(&files[0].0)
         .map_err(|e| DataFusionError::Plan(format!("invalid file URL: {e}")))?;
     let store_url_str = &parsed_url[..url::Position::BeforePath];
     let object_store_url = ObjectStoreUrl::parse(store_url_str)
         .map_err(|e| DataFusionError::Plan(format!("invalid object store URL: {e}")))?;
 
     // One file group per file for per-file parallelism. `PartitionedFile` paths are
-    // relative to the store bound by `object_store_url` (mirror scan_by_data_files_exec).
+    // relative to the store bound by `object_store_url` (mirror scan_by_data_files_exec),
+    // and carry the real source size for accurate scan planning.
     let file_groups: Vec<Vec<PartitionedFile>> = files
         .iter()
-        .map(|path| {
+        .map(|(path, size)| {
             let parsed = url::Url::parse(path)
                 .map_err(|e| DataFusionError::Plan(format!("invalid file URL: {e}")))?;
             let key = crate::utils::url_to_object_path(&parsed)?;
-            Ok(vec![PartitionedFile::new(key.to_string(), 0)])
+            Ok(vec![PartitionedFile::new(key.to_string(), *size)])
         })
         .collect::<DFResult<_>>()?;
 
@@ -278,7 +293,7 @@ fn build_fallback_scan(
     };
 
     use datafusion_datasource::file_groups::FileGroup;
-    let compression = infer_source_compression(&files[0]);
+    let compression = infer_source_compression(&files[0].0);
     let config = FileScanConfigBuilder::new(object_store_url, source)
         .with_file_groups(file_groups.into_iter().map(FileGroup::new).collect())
         .with_file_compression_type(FileCompressionType::from(compression))
@@ -286,6 +301,11 @@ fn build_fallback_scan(
 
     Ok(DataSourceExec::from_data_source(config))
 }
+
+/// The writer's parquet file size target (mirrors `IcebergWriterExec`'s
+/// `target_file_size: 134_217_728`). Used to size fallback load chunks so small source sets
+/// produce fewer, larger table files instead of tiny-file sprawl.
+const TARGET_FILE_SIZE_BYTES: u64 = 134_217_728;
 
 /// Infer the compression type of a source file from its extension.
 ///
@@ -316,9 +336,55 @@ fn chunk_size_for(count: usize, chunks: usize) -> usize {
     (count + chunks - 1) / chunks
 }
 
+/// Size-aware variant of [`chunk_size_for`]: choose a files-per-chunk count so each chunk
+/// accumulates roughly `target_bytes` worth of source bytes, capped at `max_chunks` writers.
+///
+/// Small total bytes → 1 chunk → one writer accumulates into fewer, larger parquet files
+/// (no tiny-file sprawl). Large totals → more chunks, bounded by `max_chunks`. Falls back to
+/// count-based chunking when sizes are unknown (total bytes == 0).
+fn chunk_size_for_bytes(sizes: &[u64], target_bytes: u64, max_chunks: usize) -> usize {
+    let count = sizes.len();
+    if count == 0 {
+        return 0;
+    }
+    let total: u64 = sizes.iter().sum();
+    if target_bytes == 0 || total == 0 {
+        return chunk_size_for(count, max_chunks);
+    }
+    let num_chunks = ((total + target_bytes - 1) / target_bytes).max(1) as usize;
+    let num_chunks = num_chunks.min(max_chunks.max(1));
+    chunk_size_for(count, num_chunks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_size_for_bytes_collapses_small_sets_to_one_writer() {
+        // 15 tiny files (~1 KB each) → well under 128 MB → a single chunk.
+        let sizes = vec![1_000u64; 15];
+        assert_eq!(chunk_size_for_bytes(&sizes, TARGET_FILE_SIZE_BYTES, 16), 15);
+        // 15 small files of ~5 MB → 75 MB total, still under target → single chunk.
+        let sizes = vec![5_000_000u64; 15];
+        assert_eq!(chunk_size_for_bytes(&sizes, TARGET_FILE_SIZE_BYTES, 16), 15);
+    }
+
+    #[test]
+    fn chunk_size_for_bytes_splits_large_sets_but_caps_at_max_chunks() {
+        // 15 files of 128 MB → total 1.875 GB → ~15 chunks, capped at 4.
+        let sizes = vec![134_217_728u64; 15];
+        assert_eq!(chunk_size_for_bytes(&sizes, TARGET_FILE_SIZE_BYTES, 4), 4);
+        // 20 files of 64 MB → total 1.25 GB → ~10 chunks, capped at 4.
+        let sizes = vec![67_108_864u64; 20];
+        assert_eq!(chunk_size_for_bytes(&sizes, TARGET_FILE_SIZE_BYTES, 4), 5);
+    }
+
+    #[test]
+    fn chunk_size_for_bytes_falls_back_to_count_based_when_sizes_unknown() {
+        let sizes = vec![0u64; 10];
+        assert_eq!(chunk_size_for_bytes(&sizes, TARGET_FILE_SIZE_BYTES, 4), 3);
+    }
 
     #[test]
     fn infers_compression_from_extension() {

@@ -451,6 +451,7 @@ spark.sql("SELECT COUNT(*) FROM test1.load_t").show()
 ```python
 # s3://work/loads/in/ has data1.parquet, data2.parquet, data3.parquet (all matching schema)
 spark.sql("LOAD DATA INPATH 's3a://work/loads/in/*.parquet' INTO TABLE test1.load_t").show()
+spark.sql("LOAD DATA INPATH 's3a://data/test/*.csv' INTO TABLE test.test_tbl").show()
 # Expected: count = 9 (3 per file; total_rows reported)
 
 spark.sql("LOAD DATA INPATH 's3a://work/loads/in/' INTO TABLE test1.load_t").show()
@@ -527,9 +528,10 @@ spark.sql("LOAD DATA INPATH 's3a://work/loads/empty/' INTO TABLE test1.load_t").
 
 ### 12.10 Many CSVs in a directory (parallel fallback writers)
 
-The fallback now builds **one writer per chunk of files** (per-file when the count is small,
-bounded to `target_partitions` writers when large), so CSV parse + parquet encode run in
-parallel across files.
+The fallback now builds **one writer per chunk of files, sized by source bytes** — small sets
+collapse into one writer (producing fewer, larger parquet files instead of tiny-file sprawl),
+and large sets are bounded to `target_partitions` writers — so CSV parse + parquet encode run
+in parallel while keeping the table file count healthy.
 
 ```python
 # s3a://work/loads/many/ has 20 CSVs, each (id,name) with 3 rows → 60 rows total
@@ -548,6 +550,26 @@ spark.sql("LOAD DATA INPATH 's3a://work/loads/gz/data.csv.gz' INTO TABLE test1.l
 
 spark.sql("LOAD DATA INPATH 's3a://work/loads/gz/' INTO TABLE test1.load_t").show()
 # Expected: count = 2  (directory form; .csv.zst also supported)
+```
+
+### 12.12 Partitioned table (fast path disabled → rewrite)
+
+Partitioned tables always go through the rewrite fallback (the fast path can't set partition
+values), so loaded rows land in the correct partitions.
+
+```python
+spark.sql("""
+CREATE TABLE test1.load_p (id INT, event_date DATE, name STRING) USING iceberg
+PARTITIONED BY (event_date)
+""").show()
+
+# s3a://work/loads/p/ has part1.parquet (rows for 2024-01-15) + part2.csv (rows for 2024-01-16)
+spark.sql("LOAD DATA INPATH 's3a://work/loads/p/' INTO TABLE test1.load_p").show()
+# Expected: count = total rows across both files (rewrite path, partitions computed)
+
+spark.sql("SELECT COUNT(*) FROM test1.load_p").show()
+spark.sql("SELECT * FROM test1.load_p WHERE event_date = '2024-01-15'").show()
+# Expected: only the 2024-01-15 rows (proves partition values are real, not empty)
 ```
 
 ---
@@ -570,3 +592,4 @@ spark.sql("LOAD DATA INPATH 's3a://work/loads/gz/' INTO TABLE test1.load_t").sho
 - **Cross-bucket `LOAD DATA`** resolves the object store per source URL; the target bucket must be reachable with the same object-store config (e.g. same MinIO endpoint/credentials).
 - **`LOAD DATA` fallback (CSV/JSON/rewrite)** builds **one writer per chunk of files** — per-file up to `target_partitions`, then chunked — so parse + encode run in parallel across many files. Gzip/bzip2/xz/zstd CSV is auto-detected from the extension.
 - **`LOAD DATA` fallback compression** is inferred per chunk from the first file; a single statement should use uniform compression (a mixed `.csv` + `.csv.gz` directory is an edge case).
+- **`LOAD DATA` on a partitioned table** always uses the rewrite fallback (the fast path can't set partition values); rows are partitioned correctly by the writer.
