@@ -1,7 +1,9 @@
 use either::Either;
 use sail_common::spec;
 use sail_common::spec::QueryPlan;
-use sail_sql_parser::ast::expression::{BooleanLiteral, Expr, OrderDirection};
+use sail_sql_parser::ast::expression::{
+    BooleanLiteral, Expr, FunctionArgument, FunctionArgumentList, OrderDirection,
+};
 use sail_sql_parser::ast::identifier::{Ident, ObjectName};
 use sail_sql_parser::ast::keywords::{Cascade, Overwrite, Restrict};
 use sail_sql_parser::ast::literal::{IntegerLiteral, NumberLiteral, StringLiteral};
@@ -1043,6 +1045,20 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::TruncateTable {
+            truncate: _,
+            table: _,
+            name,
+        } => {
+            // `TRUNCATE TABLE` is `DELETE` without a `WHERE` clause: the delete path
+            // produces an empty snapshot (see `plan_delete` when condition is None).
+            let node = spec::CommandNode::Delete {
+                table: from_ast_object_name(name)?,
+                table_alias: None,
+                condition: None,
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
         Statement::LoadData {
             load_data: _,
             local,
@@ -1062,6 +1078,36 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
                 table: from_ast_object_name(name)?,
                 overwrite: overwrite.is_some(),
                 partition,
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::Call {
+            call: _,
+            name,
+            arguments,
+        } => {
+            let FunctionArgumentList {
+                left: _,
+                duplicate_treatment: _,
+                arguments: args,
+                null_treatment: _,
+                right: _,
+            } = arguments;
+            let mut call_arguments = vec![];
+            for arg in args.into_iter().flat_map(|seq| seq.into_items()) {
+                match arg {
+                    FunctionArgument::Named(arg_name, _, value) => {
+                        call_arguments
+                            .push((Some(arg_name.value.into()), from_ast_expression(value)?));
+                    }
+                    FunctionArgument::Unnamed(value) => {
+                        call_arguments.push((None, from_ast_expression(value)?));
+                    }
+                }
+            }
+            let node = spec::CommandNode::CallProcedure {
+                name: from_ast_object_name(name)?,
+                arguments: call_arguments,
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
@@ -2923,6 +2969,69 @@ mod tests {
         let defs = parse_add_columns("ALTER TABLE t ADD COLUMN x FLOAT DEFAULT 3.14")?;
         assert_eq!(defs.len(), 1);
         assert!(defs[0].default.is_some(), "expected a default value");
+        Ok(())
+    }
+
+    #[test]
+    fn test_truncate_table_maps_to_delete_without_condition() -> SqlResult<()> {
+        let sql = "TRUNCATE TABLE landing.customers";
+        let plan = from_ast_statement(parse_one_statement(sql)?)?;
+        match plan {
+            spec::Plan::Command(command) => match command.node {
+                spec::CommandNode::Delete {
+                    table,
+                    table_alias,
+                    condition,
+                } => {
+                    let parts: Vec<String> = table.into();
+                    assert_eq!(parts, vec!["landing", "customers"]);
+                    assert!(table_alias.is_none());
+                    assert!(condition.is_none());
+                }
+                other => panic!("unexpected command node: {other:?}"),
+            },
+            other => panic!("unexpected plan: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_call_maps_to_call_procedure_positional() -> SqlResult<()> {
+        let sql = "CALL test.system.rollback_to_snapshot('landing.customers', 42)";
+        let plan = from_ast_statement(parse_one_statement(sql)?)?;
+        match plan {
+            spec::Plan::Command(command) => match command.node {
+                spec::CommandNode::CallProcedure { name, arguments } => {
+                    let parts: Vec<String> = name.into();
+                    assert_eq!(parts, vec!["test", "system", "rollback_to_snapshot"]);
+                    assert_eq!(arguments.len(), 2);
+                    assert!(arguments[0].0.is_none());
+                    assert!(arguments[1].0.is_none());
+                }
+                other => panic!("unexpected command node: {other:?}"),
+            },
+            other => panic!("unexpected plan: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_call_maps_to_call_procedure_named() -> SqlResult<()> {
+        let sql = "CALL test.system.expire_snapshots(table => 'landing.customers', older_than => TIMESTAMP '2021-01-01 00:00:00')";
+        let plan = from_ast_statement(parse_one_statement(sql)?)?;
+        match plan {
+            spec::Plan::Command(command) => match command.node {
+                spec::CommandNode::CallProcedure { name, arguments } => {
+                    let parts: Vec<String> = name.into();
+                    assert_eq!(parts, vec!["test", "system", "expire_snapshots"]);
+                    assert_eq!(arguments.len(), 2);
+                    assert!(arguments[0].0.is_some());
+                    assert!(arguments[1].0.is_some());
+                }
+                other => panic!("unexpected command node: {other:?}"),
+            },
+            other => panic!("unexpected plan: {other:?}"),
+        }
         Ok(())
     }
 }

@@ -26,7 +26,7 @@ use sail_catalog_system::physical_plan::SystemTableExec;
 use sail_common_datafusion::utils::items::ItemTaker;
 use sail_data_source::listing::delete::FileDeleteExec;
 use sail_delta_lake::physical_plan::DeltaCommitExec;
-use sail_iceberg::physical_plan::IcebergCommitExec;
+use sail_iceberg::physical_plan::{CallProcedureExec, IcebergCommitExec};
 use sail_physical_plan::barrier::BarrierExec;
 use sail_physical_plan::catalog_command::CatalogCommandExec;
 use sail_physical_plan::coalesce::CoalesceExec;
@@ -461,6 +461,7 @@ fn plan_job_graph_stages(
         || subtree.plan.is::<FileDeleteExec>()
         || subtree.plan.is::<DeltaCommitExec>()
         || subtree.plan.is::<IcebergCommitExec>()
+        || subtree.plan.is::<CallProcedureExec>()
     {
         if matches!(driver_stage_handling, DriverStageHandling::PreserveRoot) {
             subtree.into_planned_subtree()
@@ -611,6 +612,7 @@ fn is_driver_stage_plan(plan: &Arc<dyn ExecutionPlan>) -> bool {
         || plan.is::<FileDeleteExec>()
         || plan.is::<DeltaCommitExec>()
         || plan.is::<IcebergCommitExec>()
+        || plan.is::<CallProcedureExec>()
 }
 
 fn wrap_pending_scalar_subqueries(

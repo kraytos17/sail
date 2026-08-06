@@ -11,6 +11,7 @@ use crate::function::list_built_in_function_statuses;
 use crate::resolver::state::PlanResolverState;
 use crate::resolver::PlanResolver;
 
+mod call;
 mod catalog;
 mod delete;
 mod delta;
@@ -310,6 +311,10 @@ impl PlanResolver<'_> {
                     .await
             }
             CommandNode::AlterView { .. } => Err(PlanError::todo("CommandNode::AlterView")),
+            CommandNode::CallProcedure { name, arguments } => {
+                self.resolve_command_call_procedure(name, arguments, state)
+                    .await
+            }
             CommandNode::LoadData {
                 local,
                 location,

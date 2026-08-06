@@ -13,10 +13,12 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use sail_common_datafusion::datasource::MergeCapableSource;
+use sail_logical_plan::call_procedure::CallProcedureNode;
 use sail_logical_plan::load_data::LoadDataNode;
 use sail_logical_plan::merge::RowLevelWriteNode;
 
 use crate::logical::IcebergTableSource;
+use crate::physical::call_procedure_planner::plan_call_procedure;
 use crate::physical::load_data_planner::plan_load_data;
 use crate::physical::row_level_planner::plan_iceberg_row_level_write;
 use crate::physical_plan::{
@@ -62,6 +64,12 @@ impl ExtensionPlanner for IcebergPhysicalPlanner {
 
         if let Some(load_node) = node.as_any().downcast_ref::<LoadDataNode>() {
             return plan_load_data(session_state, load_node).await.map(Some);
+        }
+
+        if let Some(call_node) = node.as_any().downcast_ref::<CallProcedureNode>() {
+            return plan_call_procedure(session_state, call_node)
+                .await
+                .map(Some);
         }
 
         Ok(None)

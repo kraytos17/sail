@@ -11,6 +11,7 @@
 // limitations under the License.
 
 pub mod action_schema;
+pub mod call_procedure_exec;
 pub mod commit;
 pub mod delete_apply_exec;
 pub mod discovery_exec;
@@ -22,6 +23,8 @@ pub mod scan_by_data_files_exec;
 mod writer_exec;
 mod writer_options;
 
+pub use action_schema::{iceberg_action_schema, CommitMeta};
+pub use call_procedure_exec::{CallProcedureExec, CallProcedureOutput};
 pub use commit::commit_exec::IcebergCommitExec;
 pub use delete_apply_exec::IcebergDeleteApplyExec;
 pub use discovery_exec::IcebergDiscoveryExec;

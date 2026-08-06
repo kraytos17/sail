@@ -240,10 +240,12 @@ use sail_function::scalar::xml::xpath::Xpath;
 use sail_function::scalar::xml::xpath_typed::{xpath_typed_name_to_kind, XpathTyped};
 use sail_function::window::{SparkFirstLastValue, SparkFirstLastValueKind, SparkNtile};
 use sail_iceberg::physical_plan::{
-    IcebergCommitExec, IcebergDeleteApplyExec, IcebergDiscoveryExec, IcebergLoadDataFastExec,
-    IcebergManifestScanExec, IcebergScanByDataFilesExec, IcebergWriterExec,
+    CallProcedureExec, CallProcedureOutput, IcebergCommitExec, IcebergDeleteApplyExec,
+    IcebergDiscoveryExec, IcebergLoadDataFastExec, IcebergManifestScanExec,
+    IcebergScanByDataFilesExec, IcebergWriterExec,
 };
 use sail_iceberg::IcebergWriterExecOptions;
+use sail_logical_plan::call_procedure::CallProcedure;
 use sail_logical_plan::range::Range;
 use sail_logical_plan::show_string::{ShowStringFormat, ShowStringStyle};
 use sail_physical_plan::barrier::BarrierExec;
@@ -1343,6 +1345,40 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     reported_row_count,
                 )))
             }
+            NodeKind::CallProcedure(gen::CallProcedureExecNode {
+                procedure,
+                table_url,
+                lakehouse_table_json,
+                updates_json,
+                requirements_json,
+                output_json,
+            }) => {
+                let procedure: CallProcedure = self
+                    .try_decode_json(&procedure, "CALL procedure")
+                    .map_err(|e| {
+                    plan_datafusion_err!("failed to decode CALL procedure: {e}")
+                })?;
+                let table_url = Url::parse(&table_url)
+                    .map_err(|e| plan_datafusion_err!("failed to parse table URL: {e}"))?;
+                let lakehouse_table = self.try_decode_lakehouse_table(&lakehouse_table_json)?;
+                let updates: Vec<sail_iceberg::spec::TableUpdate> = self
+                    .try_decode_json(&updates_json, "CALL updates")
+                    .map_err(|e| plan_datafusion_err!("failed to decode CALL updates: {e}"))?;
+                let requirements: Vec<sail_iceberg::spec::TableRequirement> = self
+                    .try_decode_json(&requirements_json, "CALL requirements")
+                    .map_err(|e| plan_datafusion_err!("failed to decode CALL requirements: {e}"))?;
+                let output: CallProcedureOutput = self
+                    .try_decode_json(&output_json, "CALL output")
+                    .map_err(|e| plan_datafusion_err!("failed to decode CALL output: {e}"))?;
+                Ok(Arc::new(CallProcedureExec::new(
+                    procedure,
+                    table_url,
+                    lakehouse_table,
+                    updates,
+                    requirements,
+                    output,
+                )))
+            }
             NodeKind::IcebergDiscovery(gen::IcebergDiscoveryExecNode {
                 input,
                 table_url,
@@ -2172,6 +2208,25 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 table_properties_json,
                 lakehouse_table_json,
                 reported_row_count: load_data_fast.reported_row_count(),
+            })
+        } else if let Some(call_procedure) = node.downcast_ref::<CallProcedureExec>() {
+            let procedure_json = serde_json::to_string(call_procedure.procedure())
+                .map_err(|e| plan_datafusion_err!("failed to encode CALL procedure: {e}"))?;
+            let updates_json = serde_json::to_string(call_procedure.updates())
+                .map_err(|e| plan_datafusion_err!("failed to encode CALL updates: {e}"))?;
+            let requirements_json = serde_json::to_string(call_procedure.requirements())
+                .map_err(|e| plan_datafusion_err!("failed to encode CALL requirements: {e}"))?;
+            let output_json = serde_json::to_string(call_procedure.output())
+                .map_err(|e| plan_datafusion_err!("failed to encode CALL output: {e}"))?;
+            let lakehouse_table_json =
+                self.try_encode_lakehouse_table(call_procedure.lakehouse_table())?;
+            NodeKind::CallProcedure(gen::CallProcedureExecNode {
+                procedure: procedure_json,
+                table_url: call_procedure.table_url().to_string(),
+                lakehouse_table_json,
+                updates_json,
+                requirements_json,
+                output_json,
             })
         } else if let Some(discovery) = node.downcast_ref::<IcebergDiscoveryExec>() {
             let input = try_encode_physical_plan(self, discovery.input().clone())?;
@@ -5335,6 +5390,117 @@ mod tests {
         assert_eq!(
             decoded_node.table_properties(),
             &[("key".to_string(), "value".to_string())]
+        );
+
+        Ok(())
+    }
+
+    /// Round-trips a `CallProcedureExec` through the remote codec, proving the
+    /// `CallProcedureExecNode` proto survives encode/decode with all fields
+    /// (procedure, table URL, lakehouse, updates, requirements, output). The
+    /// result schema is not serialized — it is derived from `CallProcedureOutput`.
+    #[test]
+    fn test_round_trip_call_procedure_exec() -> Result<()> {
+        use sail_iceberg::physical_plan::CallProcedureOutput;
+        use sail_iceberg::spec::{SnapshotRetention, TableRequirement, TableUpdate};
+        use sail_logical_plan::call_procedure::CallProcedure;
+
+        let node = Arc::new(CallProcedureExec::new(
+            CallProcedure::RollbackToSnapshot {
+                table: "test1.events".to_string(),
+                snapshot_id: 2,
+            },
+            Url::parse("s3a://bucket/path")
+                .map_err(|e| plan_datafusion_err!("failed to parse table URL: {e}"))?,
+            None,
+            vec![TableUpdate::SetSnapshotRef {
+                ref_name: "main".to_string(),
+                reference: sail_iceberg::spec::SnapshotReference {
+                    snapshot_id: 2,
+                    retention: SnapshotRetention::Branch {
+                        min_snapshots_to_keep: None,
+                        max_snapshot_age_ms: None,
+                        max_ref_age_ms: None,
+                    },
+                },
+            }],
+            vec![TableRequirement::RefSnapshotIdMatch {
+                r#ref: "main".to_string(),
+                snapshot_id: Some(1),
+            }],
+            CallProcedureOutput::SnapshotRef {
+                previous_snapshot_id: 1,
+                current_snapshot_id: 2,
+            },
+        )) as Arc<dyn ExecutionPlan>;
+
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        codec.try_encode(node.clone(), &mut buf)?;
+
+        let ctx = make_task_context()?;
+        let decoded = codec.try_decode(&buf, &[], ctx.as_ref())?;
+
+        let decoded_node = decoded
+            .downcast_ref::<CallProcedureExec>()
+            .ok_or_else(|| plan_datafusion_err!("decoded plan is not CallProcedureExec"))?;
+        assert_eq!(
+            decoded_node.procedure(),
+            &CallProcedure::RollbackToSnapshot {
+                table: "test1.events".to_string(),
+                snapshot_id: 2,
+            }
+        );
+        assert_eq!(decoded_node.table_url().to_string(), "s3a://bucket/path");
+        assert_eq!(decoded_node.updates().len(), 1);
+        assert_eq!(decoded_node.requirements().len(), 1);
+        assert_eq!(
+            decoded_node.output(),
+            &CallProcedureOutput::SnapshotRef {
+                previous_snapshot_id: 1,
+                current_snapshot_id: 2,
+            }
+        );
+
+        // The widened `SetCurrentSnapshot` variant (with a `ref` argument) must survive
+        // encode/decode too.
+        let node = Arc::new(CallProcedureExec::new(
+            CallProcedure::SetCurrentSnapshot {
+                table: "test1.events".to_string(),
+                snapshot_id: None,
+                r#ref: Some("archive".to_string()),
+            },
+            Url::parse("s3a://bucket/path")
+                .map_err(|e| plan_datafusion_err!("failed to parse table URL: {e}"))?,
+            None,
+            vec![],
+            vec![],
+            CallProcedureOutput::SnapshotRef {
+                previous_snapshot_id: 2,
+                current_snapshot_id: 1,
+            },
+        )) as Arc<dyn ExecutionPlan>;
+
+        let mut buf = vec![];
+        codec.try_encode(node.clone(), &mut buf)?;
+        let decoded = codec.try_decode(&buf, &[], ctx.as_ref())?;
+        let decoded_node = decoded
+            .downcast_ref::<CallProcedureExec>()
+            .ok_or_else(|| plan_datafusion_err!("decoded plan is not CallProcedureExec"))?;
+        assert_eq!(
+            decoded_node.procedure(),
+            &CallProcedure::SetCurrentSnapshot {
+                table: "test1.events".to_string(),
+                snapshot_id: None,
+                r#ref: Some("archive".to_string()),
+            }
+        );
+        assert_eq!(
+            decoded_node.output(),
+            &CallProcedureOutput::SnapshotRef {
+                previous_snapshot_id: 2,
+                current_snapshot_id: 1,
+            }
         );
 
         Ok(())

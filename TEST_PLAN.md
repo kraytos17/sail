@@ -8,6 +8,7 @@ Copy and paste each command into the PySpark shell (`sail spark shell`).
 > - `DESCRIBE` requires a keyword after it. Bare `DESCRIBE <t>` is **not** parsed. Use `DESCRIBE TABLE <t>`, `DESCRIBE EXTENDED <t>`, `DESCRIBE VIEW <v>`, or `DESCRIBE TABLE <t> <col>`.
 > - `DESCRIBE VIEW [EXTENDED] <v>` — `VIEW` comes **before** `EXTENDED`. `DESCRIBE EXTENDED view <v>` is mis-parsed as a table+column describe.
 > - `ALTER TABLE ... SET/UNSET TBLPROPERTIES`, `ADD/DROP COLUMNS`, `RENAME TO`, `SHOW TBLPROPERTIES`, and column-level `DESCRIBE TABLE t col` target **catalog-managed (Iceberg REST)** tables.
+> - `CALL <catalog>.system.<procedure>(...)` — fully-qualified name required (`<catalog>.system.<proc>`); the table argument is a single-quoted `ns.table` string; positional or named (`arg => value`) arguments both work.
 
 ---
 
@@ -574,7 +575,129 @@ spark.sql("SELECT * FROM test1.load_p WHERE event_date = '2024-01-15'").show()
 
 ---
 
-## 13. Known limitations / notes
+## 13. CALL procedures (snapshot maintenance)
+
+`CALL <catalog>.system.<procedure>(...)` runs an Iceberg system procedure against an
+Iceberg table. Only `rollback_to_snapshot`, `set_current_snapshot`, and
+`expire_snapshots` are supported. Arguments may be **positional** or **named**
+(`arg => value`). The table argument is a **single-quoted `ns.table` string** (no catalog
+prefix — the catalog is the `CALL` name's first component).
+
+Procedure signatures:
+- `rollback_to_snapshot(table, snapshot_id)` — `snapshot_id` required.
+- `set_current_snapshot(table, snapshot_id | ref)` — exactly one of `snapshot_id`
+  (positional or named) or `ref` (named only, a branch/tag name).
+- `expire_snapshots(table, [older_than], [retain_last])` — both optional; defaults come
+  from `history.expire.max-snapshot-age-ms` (5 days) / `min-snapshots-to-keep` (1).
+
+The result is a **single spec-shaped row**:
+- `rollback_to_snapshot` / `set_current_snapshot` → `previous_snapshot_id`,
+  `current_snapshot_id` (INT64).
+- `expire_snapshots` → six `deleted_*_count` columns (INT64; all `0` because v1
+  `expire_snapshots` is metadata-only).
+
+> In this environment the catalog is `test` and tables live in namespace `test1`, so a
+> table is `test1.events` and the CALL is `CALL test.system.<procedure>(...)`.
+
+### 13.1 Setup — build a snapshot history
+
+```python
+spark.sql("""
+CREATE TABLE test1.events_call (id INT, name STRING, score DOUBLE) USING iceberg
+""").show()
+
+spark.sql("INSERT INTO test1.events_call VALUES (1, 'alice', 10.0), (2, 'bob', 20.0)").show()
+spark.sql("INSERT INTO test1.events_call VALUES (3, 'charlie', 30.0)").show()
+spark.sql("INSERT INTO test1.events_call VALUES (4, 'dave', 40.0)").show()
+# 3 INSERTs → 3 snapshots (plus the initial empty one). Inspect them:
+spark.sql("SELECT snapshot_id, committed_at FROM test1.events_call.snapshots ORDER BY committed_at DESC").show(truncate=False)
+spark.sql("SELECT name, snapshot_id, type FROM test1.events_call.refs").show(truncate=False)
+# Expected refs: main -> latest snapshot
+```
+
+### 13.2 rollback_to_snapshot
+
+Roll the table back to an earlier snapshot (re-points `main` to it).
+
+```python
+# Pick an EARLIER snapshot_id from the refs/snapshots output above (e.g. the 2nd insert).
+# Using snapshot 2 (from the first INSERT) as an example:
+spark.sql("CALL test.system.rollback_to_snapshot('test1.events_call', 2)").show()
+# Expected: one row: previous_snapshot_id = <main ref before>, current_snapshot_id = 2
+
+# The current main ref now points at snapshot 2:
+spark.sql("SELECT CAST(snapshot_id AS STRING) FROM test1.events_call.refs WHERE name = 'main'").show()
+# Expected: 2
+
+# Data now reflects only snapshot 2 (ids 1,2):
+spark.sql("SELECT * FROM test1.events_call ORDER BY id").show()
+# Expected: 1 alice | 2 bob
+```
+
+### 13.3 set_current_snapshot
+
+Point `main` at a specific snapshot without rolling data files around (same effect for
+the current ref, distinct procedure).
+
+```python
+# Advance back to the latest snapshot (id 3 from the last INSERT):
+spark.sql("CALL test.system.set_current_snapshot('test1.events_call', 3)").show()
+# Expected: one row: previous_snapshot_id = <main ref before>, current_snapshot_id = 3
+
+spark.sql("SELECT CAST(snapshot_id AS STRING) FROM test1.events_call.refs WHERE name = 'main'").show()
+# Expected: 3
+
+spark.sql("SELECT * FROM test1.events_call ORDER BY id").show()
+# Expected: 1 alice | 2 bob | 3 charlie
+```
+
+### 13.4 expire_snapshots
+
+Remove snapshots older than a timestamp (metadata-only expiry in v1; the current/main
+snapshot is never expired).
+
+```python
+# Expire snapshots older than a recent time. Choose a timestamp BEFORE the latest
+# snapshot but AFTER the oldest so only intermediate snapshots are dropped.
+# Example: expire everything committed before 2026-01-01 00:00:00 (adjust to your data):
+spark.sql("CALL test.system.expire_snapshots('test1.events_call', TIMESTAMP '2026-01-01 00:00:00')").show()
+# Expected: one row of six deleted_*_count columns, all 0 (v1 expire is metadata-only)
+
+# Remaining snapshots (older ones removed, current kept):
+spark.sql("SELECT snapshot_id, committed_at FROM test1.events_call.snapshots ORDER BY committed_at DESC").show(truncate=False)
+
+# Data is unchanged (current ref preserved):
+spark.sql("SELECT COUNT(*) FROM test1.events_call").show()
+# Expected: 3
+```
+
+### 13.5 Named arguments + errors
+
+```python
+# Named-argument form is supported:
+spark.sql("CALL test.system.set_current_snapshot(table => 'test1.events_call', snapshot_id => 3)").show()
+
+# Non-system namespace is rejected:
+spark.sql("CALL test.foo.rollback_to_snapshot('test1.events_call', 2)").show()
+# Expected error: CALL only supports the 'system' namespace, got 'foo'
+
+# Unknown procedure is rejected:
+spark.sql("CALL test.system.rewrite_data_files('test1.events_call')").show()
+# Expected error: unsupported system procedure: rewrite_data_files
+
+# Missing/nonexistent snapshot is rejected at plan time:
+spark.sql("CALL test.system.rollback_to_snapshot('test1.events_call', 999999)").show()
+# Expected error: snapshot 999999 does not exist
+
+# Non-table target (e.g. a temp view) is rejected:
+spark.sql("CREATE TEMP VIEW call_v AS SELECT 1 AS id").show()
+spark.sql("CALL test.system.set_current_snapshot('call_v', 1)").show()
+# Expected error: CALL procedures are only supported on tables, not views
+```
+
+---
+
+## 14. Known limitations / notes
 
 - **Bare `DESCRIBE <t>`** is not accepted by the Sail parser (requires `TABLE`/`VIEW`/`EXTENDED` keyword).
 - **`DESCRIBE EXTENDED view <v>`** is mis-parsed as a table + column describe and errors (`DESCRIBE VIEW EXTENDED <v>` is the supported order).
@@ -593,3 +716,6 @@ spark.sql("SELECT * FROM test1.load_p WHERE event_date = '2024-01-15'").show()
 - **`LOAD DATA` fallback (CSV/JSON/rewrite)** builds **one writer per chunk of files** — per-file up to `target_partitions`, then chunked — so parse + encode run in parallel across many files. Gzip/bzip2/xz/zstd CSV is auto-detected from the extension.
 - **`LOAD DATA` fallback compression** is inferred per chunk from the first file; a single statement should use uniform compression (a mixed `.csv` + `.csv.gz` directory is an edge case).
 - **`LOAD DATA` on a partitioned table** always uses the rewrite fallback (the fast path can't set partition values); rows are partitioned correctly by the writer.
+- **`CALL` procedures** support only `rollback_to_snapshot`, `set_current_snapshot`, and `expire_snapshots` in the `system` namespace; other procedures error with `NotSupported`. See `docs/dev/call-procedures-spec-deviations.md` for the full deviation list.
+- **`CALL` result shape matches the spec (Sail v1):** `rollback_to_snapshot`/`set_current_snapshot` return a single row with `previous_snapshot_id`, `current_snapshot_id`; `expire_snapshots` returns a single row with the six `deleted_*_count` columns (all `0` because v1 expire is metadata-only). `previous_snapshot_id` is the `main` ref snapshot at plan time.
+- **`expire_snapshots` retention matches the spec (Sail v1), but is metadata-only:** the retain-set algorithm keeps `main` (never expires), branch/tag-referenced snapshots, per-branch ancestry up to `retain_last`, and snapshots newer than `older_than`; `older_than`/`retain_last` default from `history.expire.*` properties. Orphaned data files are **not** physically deleted (the spec deletes files uniquely required by expired snapshots and reports non-zero `deleted_*_count`). `set_current_snapshot` accepts `snapshot_id` **or** `ref` (exactly one; `ref` is named-only). `rollback_to_snapshot` requires the target to be an **ancestor** of the current snapshot (otherwise `Cannot roll back to snapshot, not an ancestor of the current state`), while `set_current_snapshot` does not.

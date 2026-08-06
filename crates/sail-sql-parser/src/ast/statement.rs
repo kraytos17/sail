@@ -6,7 +6,7 @@ use crate::ast::data_type::DataType;
 use crate::ast::expression::{BooleanLiteral, Expr, OrderDirection};
 use crate::ast::identifier::{table_ident, Ident, ObjectName};
 use crate::ast::keywords::{
-    Add, After, All, Alter, Always, Analyze, And, As, Buckets, By, Cache, Cascade, Catalog,
+    Add, After, All, Alter, Always, Analyze, And, As, Buckets, By, Cache, Call, Cascade, Catalog,
     Catalogs, Change, Check, Clear, Cluster, Clustered, Codegen, Collection, Column, Columns,
     Comment, Compute, Constraint, Cost, Create, Data, Database, Databases, Dbproperties, Default,
     Defined, Delete, Delimited, Desc, Describe, Directory, Distributed, Drop, Escaped, Evolution,
@@ -17,8 +17,8 @@ use crate::ast::keywords::{
     Partition, Partitioned, Partitions, Properties, Purge, Recover, Refresh, Rename, Replace,
     Restrict, Row, Schema, Schemas, Serde, Serdeproperties, Set, Show, Sorted, Source, Start,
     Statistics, Stored, System, Table, Tables, Target, Tblproperties, Temp, Temporary, Terminated,
-    Then, Time, To, Type, Uncache, Unset, Update, Use, User, Using, Values, Verbose, View, Views,
-    When, With, Zone,
+    Then, Time, To, Truncate, Type, Uncache, Unset, Update, Use, User, Using, Values, Verbose,
+    View, Views, When, With, Zone,
 };
 use crate::ast::literal::{IntegerLiteral, NumberLiteral, StringLiteral};
 use crate::ast::operator::{
@@ -274,6 +274,11 @@ pub enum Statement {
         #[parser(function = |(_, _, e, _), o| compose(e, o))]
         r#where: Option<WhereClause>,
     },
+    TruncateTable {
+        truncate: Truncate,
+        table: Table,
+        name: ObjectName,
+    },
     LoadData {
         load_data: (Load, Data),
         local: Option<Local>,
@@ -283,6 +288,12 @@ pub enum Statement {
         name: ObjectName,
         #[parser(function = |(_, _, e, _), o| compose(e, o))]
         partition: Option<PartitionClause>,
+    },
+    Call {
+        call: Call,
+        name: ObjectName,
+        #[parser(function = |(_, _, e, _), o| compose(e, o))]
+        arguments: ast::expression::FunctionArgumentList,
     },
     CacheTable {
         cache: Cache,

@@ -68,6 +68,7 @@ message ExtendedPhysicalPlanNode {
     CsvExecNode csv = 53;
     ParquetExecNode parquet = 54;
     IcebergLoadDataFastExecNode iceberg_load_data_fast = 55;
+    CallProcedureExecNode call_procedure = 56;
   }
 }
 
@@ -922,6 +923,20 @@ message IcebergLoadDataFastExecNode {
   // Iceberg lakehouse execution context, serialized as JSON (empty = None).
   string lakehouse_table_json = 6;
   uint64 reported_row_count = 7;
+}
+
+message CallProcedureExecNode {
+  // The resolved CALL procedure, serialized as JSON.
+  string procedure = 1;
+  string table_url = 2;
+  // Iceberg lakehouse execution context, serialized as JSON (empty = None).
+  string lakehouse_table_json = 3;
+  // Iceberg table updates, serialized as JSON.
+  string updates_json = 4;
+  // Iceberg table requirements, serialized as JSON.
+  string requirements_json = 5;
+  // Procedure output row, serialized as JSON.
+  string output_json = 6;
 }
 
 message IcebergManifestScanExecNode {

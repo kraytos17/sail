@@ -15,7 +15,7 @@ use datafusion_common::{not_impl_err, plan_err, Constraints, DFSchema, DFSchemaR
 use datafusion_expr::expr::Sort;
 use datafusion_expr::{Expr, TableSource};
 
-use crate::catalog::{CatalogPartitionField, LakehouseExecutionContext};
+use crate::catalog::{CatalogPartitionField, IcebergMetadataTableType, LakehouseExecutionContext};
 use crate::extension::SessionExtension;
 use crate::logical_expr::ExprWithSource;
 
@@ -199,6 +199,10 @@ pub struct SourceInfo {
     /// The layers of options for the data source.
     /// A later layer can override earlier ones.
     pub options: Vec<OptionLayer>,
+    /// When set, this `SourceInfo` describes a read of an Iceberg *metadata table*
+    /// (e.g. `db.table.refs` / `db.table.snapshots`) instead of the table's data.
+    /// The base table is described by `paths` / `lakehouse_table` / `options`.
+    pub metadata_table: Option<IcebergMetadataTableType>,
     /// Whether reads match the requested columns case-sensitively against the
     /// physical file schema. Spark defaults to case-insensitive matching
     /// (`spark.sql.caseSensitive=false`). This only affects formats that

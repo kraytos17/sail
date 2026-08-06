@@ -158,6 +158,13 @@ impl TableMetadata {
         }
     }
 
+    /// Get a snapshot by id, if present.
+    pub fn snapshot(&self, snapshot_id: i64) -> Option<&Snapshot> {
+        self.snapshots
+            .iter()
+            .find(|snapshot| snapshot.snapshot_id() == snapshot_id)
+    }
+
     /// Get the default partition spec
     pub fn default_partition_spec(&self) -> Option<&PartitionSpec> {
         self.partition_specs

@@ -500,6 +500,10 @@ pub enum CommandNode {
         overwrite: bool,
         partition: Vec<(Identifier, Option<Expr>)>,
     },
+    CallProcedure {
+        name: ObjectName,
+        arguments: Vec<(Option<Identifier>, Expr)>,
+    },
     AnalyzeTable {
         table: ObjectName,
         partition: Vec<(Identifier, Option<Expr>)>,

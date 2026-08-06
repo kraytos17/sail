@@ -4433,6 +4433,14 @@
               }
             },
             {
+              "name": "Keyword(Call)",
+              "node": {
+                "terminal": {
+                  "keyword": "CALL"
+                }
+              }
+            },
+            {
               "name": "Keyword(Cascade)",
               "node": {
                 "terminal": {
@@ -6285,6 +6293,14 @@
               "node": {
                 "terminal": {
                   "keyword": "TRUE"
+                }
+              }
+            },
+            {
+              "name": "Keyword(Truncate)",
+              "node": {
+                "terminal": {
+                  "keyword": "TRUNCATE"
                 }
               }
             },
@@ -10201,6 +10217,19 @@
                   {
                     "sequence": [
                       {
+                        "nonTerminal": "Keyword(Truncate)"
+                      },
+                      {
+                        "nonTerminal": "Keyword(Table)"
+                      },
+                      {
+                        "nonTerminal": "ObjectName"
+                      }
+                    ]
+                  },
+                  {
+                    "sequence": [
+                      {
                         "nonTerminal": "Tuple(Keyword(Load), Keyword(Data))"
                       },
                       {
@@ -10220,6 +10249,19 @@
                       },
                       {
                         "nonTerminal": "Option(PartitionClause)"
+                      }
+                    ]
+                  },
+                  {
+                    "sequence": [
+                      {
+                        "nonTerminal": "Keyword(Call)"
+                      },
+                      {
+                        "nonTerminal": "ObjectName"
+                      },
+                      {
+                        "nonTerminal": "FunctionArgumentList"
                       }
                     ]
                   },

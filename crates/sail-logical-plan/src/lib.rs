@@ -1,4 +1,5 @@
 pub mod barrier;
+pub mod call_procedure;
 pub mod check_constraints;
 pub mod load_data;
 pub mod map_partitions;

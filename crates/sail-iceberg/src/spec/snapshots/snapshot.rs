@@ -115,6 +115,36 @@ impl SnapshotReference {
     pub fn is_branch(&self) -> bool {
         matches!(self.retention, SnapshotRetention::Branch { .. })
     }
+
+    /// The minimum number of snapshots to keep for a branch while expiring snapshots.
+    pub fn min_snapshots_to_keep(&self) -> Option<i32> {
+        match &self.retention {
+            SnapshotRetention::Branch {
+                min_snapshots_to_keep,
+                ..
+            } => *min_snapshots_to_keep,
+            SnapshotRetention::Tag { .. } => None,
+        }
+    }
+
+    /// The max age of snapshots to keep for a branch when expiring, including the latest snapshot.
+    pub fn max_snapshot_age_ms(&self) -> Option<i64> {
+        match &self.retention {
+            SnapshotRetention::Branch {
+                max_snapshot_age_ms,
+                ..
+            } => *max_snapshot_age_ms,
+            SnapshotRetention::Tag { .. } => None,
+        }
+    }
+
+    /// The max age of the snapshot reference to keep while expiring snapshots.
+    pub fn max_ref_age_ms(&self) -> Option<i64> {
+        match &self.retention {
+            SnapshotRetention::Branch { max_ref_age_ms, .. }
+            | SnapshotRetention::Tag { max_ref_age_ms } => *max_ref_age_ms,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

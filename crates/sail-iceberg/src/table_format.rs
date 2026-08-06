@@ -18,6 +18,7 @@ use bytes::Bytes;
 use datafusion::arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{not_impl_err, plan_err, DataFusionError, Result};
+use datafusion::datasource::provider_as_source;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{LogicalPlan, TableSource};
 use datafusion::physical_plan::ExecutionPlan;
@@ -93,6 +94,9 @@ impl TableFormat for IcebergTableFormat {
         ctx: &dyn Session,
         info: SourceInfo,
     ) -> Result<Arc<dyn TableSource>> {
+        if info.metadata_table.is_some() {
+            return build_iceberg_metadata_source(ctx, info).await;
+        }
         let provider = build_iceberg_provider(ctx, info).await?;
         Ok(Arc::new(IcebergTableSource::new(provider)))
     }
@@ -656,7 +660,7 @@ impl IcebergTableFormat {
         .await
     }
 
-    async fn retry_metadata_commit<F>(
+    pub(crate) async fn retry_metadata_commit<F>(
         object_store: Arc<dyn object_store::ObjectStore>,
         store_ctx: &StoreContext,
         table_url: &Url,
@@ -1152,6 +1156,7 @@ async fn build_iceberg_provider(
         bucket_by: _,
         sort_order: _,
         options,
+        metadata_table: _,
         read_case_sensitive: _,
     } = info;
 
@@ -1168,6 +1173,52 @@ async fn build_iceberg_provider(
         catalog_managed_table,
     )
     .await
+}
+
+/// Builds a read-only [`TableSource`] for an Iceberg *metadata table*
+/// (e.g. `db.table.refs` / `db.table.snapshots`).
+///
+/// The base table is described by `paths` / `lakehouse_table` / `options`; the
+/// metadata table name is carried in `info.metadata_table`. Rows are materialized
+/// in memory from the base table's `TableMetadata`, so no data scan is involved.
+async fn build_iceberg_metadata_source(
+    ctx: &dyn Session,
+    info: SourceInfo,
+) -> Result<Arc<dyn TableSource>> {
+    let SourceInfo {
+        paths,
+        lakehouse_table,
+        schema: _,
+        constraints: _,
+        partition_by: _,
+        bucket_by: _,
+        sort_order: _,
+        options,
+        metadata_table,
+        read_case_sensitive: _,
+    } = info;
+    let metadata_type = metadata_table.ok_or_else(|| {
+        datafusion::common::DataFusionError::Internal(
+            "build_iceberg_metadata_source requires a metadata table type".to_string(),
+        )
+    })?;
+
+    validate_iceberg_read_lakehouse_context(lakehouse_table.as_ref())?;
+    let table_url = IcebergTableFormat::parse_table_url(paths).await?;
+    let metadata_location = metadata_location_from_options(&options);
+    let catalog_managed_table = catalog_managed_iceberg_from_options(&options);
+    let metadata_location = catalog_managed_table.then_some(metadata_location).flatten();
+    let table =
+        Table::load_with_metadata_location(ctx, table_url.clone(), metadata_location).await?;
+
+    let provider = Arc::new(
+        crate::datasource::metadata_table::IcebergMetadataTableProvider::new(
+            table_url,
+            table.metadata().clone(),
+            metadata_type,
+        ),
+    );
+    Ok(provider_as_source(provider))
 }
 
 fn validate_iceberg_read_lakehouse_context(
