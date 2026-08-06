@@ -937,6 +937,8 @@ message CallProcedureExecNode {
   string requirements_json = 5;
   // Procedure output row, serialized as JSON.
   string output_json = 6;
+  // Pre-commit Iceberg table metadata (for expire_snapshots GC), JSON (empty = None).
+  string pre_commit_metadata_json = 7;
 }
 
 message IcebergManifestScanExecNode {

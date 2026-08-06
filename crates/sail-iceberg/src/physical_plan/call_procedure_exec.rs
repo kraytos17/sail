@@ -34,9 +34,11 @@ use crate::catalog_support::commit::{
     IcebergCatalogCommitMode,
 };
 use crate::io::StoreContext;
+use crate::physical_plan::expire_snapshots_gc::expire_files_gc;
 use crate::spec::snapshots::MAIN_BRANCH;
 use crate::spec::{SnapshotReference, SnapshotRetention, TableRequirement, TableUpdate};
 use crate::table::find_latest_metadata_file;
+use crate::table::metadata_loader::load_metadata_file_bytes;
 use crate::table_format::IcebergTableFormat;
 use crate::utils::get_object_store_from_context;
 
@@ -58,6 +60,10 @@ pub struct CallProcedureExec {
     updates: Vec<TableUpdate>,
     requirements: Vec<TableRequirement>,
     output: CallProcedureOutput,
+    /// The table metadata as of plan time, captured before the commit. Used by
+    /// `expire_snapshots` to compute the files owned by the expired snapshots (which no
+    /// longer exist in post-commit metadata). `None` for procedures that do not need it.
+    pre_commit_metadata: Option<crate::spec::TableMetadata>,
     cache: Arc<PlanProperties>,
 }
 
@@ -69,6 +75,26 @@ impl CallProcedureExec {
         updates: Vec<TableUpdate>,
         requirements: Vec<TableRequirement>,
         output: CallProcedureOutput,
+    ) -> Self {
+        Self::new_with_pre_commit_metadata(
+            procedure,
+            table_url,
+            lakehouse_table,
+            updates,
+            requirements,
+            output,
+            None,
+        )
+    }
+
+    pub fn new_with_pre_commit_metadata(
+        procedure: CallProcedure,
+        table_url: Url,
+        lakehouse_table: Option<LakehouseExecutionContext>,
+        updates: Vec<TableUpdate>,
+        requirements: Vec<TableRequirement>,
+        output: CallProcedureOutput,
+        pre_commit_metadata: Option<crate::spec::TableMetadata>,
     ) -> Self {
         let schema = output.schema();
         let cache = Arc::new(PlanProperties::new(
@@ -84,6 +110,7 @@ impl CallProcedureExec {
             updates,
             requirements,
             output,
+            pre_commit_metadata,
             cache,
         }
     }
@@ -112,6 +139,10 @@ impl CallProcedureExec {
         &self.output
     }
 
+    pub fn pre_commit_metadata(&self) -> Option<&crate::spec::TableMetadata> {
+        self.pre_commit_metadata.as_ref()
+    }
+
     /// Applies the procedure's updates at execution time, returning the output batch.
     async fn execute_call(&self, context: Arc<TaskContext>) -> Result<RecordBatch> {
         // Resolve the commit authority: catalog-managed (Polaris) vs filesystem.
@@ -133,6 +164,9 @@ impl CallProcedureExec {
 
         let mut updates = self.updates.clone();
         let mut requirements = self.requirements.clone();
+        // The metadata location committed by a catalog authority (if any), used to reload
+        // post-commit metadata for expire-snapshot physical GC.
+        let mut committed_metadata_location: Option<String> = None;
 
         match commit_mode {
             IcebergCatalogCommitMode::Filesystem => {
@@ -176,7 +210,10 @@ impl CallProcedureExec {
                     .commit(lakehouse_table, std::mem::take(&mut requirements), updates)
                     .await?
                 {
-                    CatalogCommitOutcome::Committed(_) => {}
+                    CatalogCommitOutcome::Committed(committed) => {
+                        committed_metadata_location =
+                            committed.metadata_location().map(ToString::to_string);
+                    }
                     CatalogCommitOutcome::NotSupported => {
                         return internal_err!(
                             "Iceberg catalog commit is not supported by the resolved catalog authority"
@@ -196,7 +233,59 @@ impl CallProcedureExec {
             }
         }
 
-        self.output.to_record_batch()
+        // After a successful metadata commit, physically delete files uniquely owned by
+        // the expired snapshots and report real counts (spec `expire_snapshots`). The
+        // post-commit metadata is reloaded to compute the retained set.
+        match &self.procedure {
+            CallProcedure::ExpireSnapshots { .. } => {
+                let pre_commit = self.pre_commit_metadata.as_ref().ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "missing pre-commit metadata for expire_snapshots GC".to_string(),
+                    )
+                })?;
+                let object_store = get_object_store_from_context(&context, &self.table_url)?;
+                let store_ctx = StoreContext::new(object_store.clone(), &self.table_url)?;
+                let post_commit = Self::reload_post_commit_metadata(
+                    &object_store,
+                    &self.table_url,
+                    committed_metadata_location.as_deref(),
+                )
+                .await?;
+                let counts = expire_files_gc(&store_ctx, pre_commit, &post_commit).await?;
+                Ok(CallProcedureOutput::ExpireSnapshots {
+                    deleted_data_files_count: counts.data_files as i64,
+                    deleted_position_delete_files_count: counts.position_delete_files as i64,
+                    deleted_equality_delete_files_count: counts.equality_delete_files as i64,
+                    deleted_manifest_files_count: counts.manifest_files as i64,
+                    deleted_manifest_lists_count: counts.manifest_lists as i64,
+                    deleted_statistics_files_count: counts.statistics_files as i64,
+                }
+                .to_record_batch()?)
+            }
+            _ => self.output.to_record_batch(),
+        }
+    }
+
+    /// Reloads the table metadata committed by the preceding commit.
+    ///
+    /// A catalog commit may report the authoritative `metadata_location` (used for
+    /// catalog-managed tables); the filesystem path has none, so it falls back to the
+    /// latest metadata file in the table's metadata directory. Reload failures propagate
+    /// (matching the Iceberg reference, which refreshes post-commit metadata and throws).
+    async fn reload_post_commit_metadata(
+        object_store: &Arc<dyn object_store::ObjectStore>,
+        table_url: &Url,
+        metadata_location: Option<&str>,
+    ) -> Result<crate::spec::TableMetadata> {
+        let location = match metadata_location {
+            Some(location) => {
+                crate::table::metadata_loader::metadata_location_to_object_path_string(location)?
+            }
+            None => find_latest_metadata_file(object_store, table_url).await?,
+        };
+        let bytes = load_metadata_file_bytes(object_store, &location).await?;
+        crate::spec::TableMetadata::from_json(&bytes)
+            .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 }
 
@@ -297,107 +386,7 @@ pub fn compute_procedure_updates(
             older_than_ms,
             retain_last,
             ..
-        } => {
-            let now = crate::utils::timestamp::monotonic_timestamp_ms();
-            let default_max_age_ms = metadata
-                .properties
-                .get("history.expire.max-snapshot-age-ms")
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(DEFAULT_MAX_SNAPSHOT_AGE_MS);
-            let default_min_keep = metadata
-                .properties
-                .get("history.expire.min-snapshots-to-keep")
-                .and_then(|v| v.parse::<i32>().ok())
-                .unwrap_or(DEFAULT_MIN_SNAPSHOTS_TO_KEEP);
-            let older_than = older_than_ms.unwrap_or(now - default_max_age_ms);
-            let retain_last = retain_last.unwrap_or(default_min_keep);
-
-            // Retained refs: `main` always; non-`main` refs only if their snapshot still
-            // exists and has not aged past `max-ref-age-ms` (default: never).
-            let default_max_ref_age_ms = metadata
-                .properties
-                .get("history.expire.max-ref-age-ms")
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(i64::MAX);
-            let mut retained_refs: std::collections::HashMap<&String, &SnapshotReference> =
-                std::collections::HashMap::new();
-            for (name, reference) in &metadata.refs {
-                if name == MAIN_BRANCH {
-                    retained_refs.insert(name, reference);
-                    continue;
-                }
-                let Some(snap) = metadata.snapshot(reference.snapshot_id) else {
-                    // Dangling ref: its snapshot no longer exists.
-                    continue;
-                };
-                let max_ref_age_ms = reference.max_ref_age_ms().unwrap_or(default_max_ref_age_ms);
-                if now - snap.timestamp_ms() <= max_ref_age_ms {
-                    retained_refs.insert(name, reference);
-                }
-            }
-
-            // Retained snapshot ids: every retained ref's target, plus per-branch ancestry
-            // (head-inclusive) up to `min_snapshots_to_keep` or `older_than`, plus
-            // unreferenced-but-recent snapshots.
-            let mut retained: std::collections::HashSet<i64> =
-                retained_refs.values().map(|r| r.snapshot_id).collect();
-            let mut referenced: std::collections::HashSet<i64> = std::collections::HashSet::new();
-            for (_, reference) in &retained_refs {
-                if !reference.is_branch() {
-                    referenced.insert(reference.snapshot_id);
-                    continue;
-                }
-                let min_keep = reference
-                    .min_snapshots_to_keep()
-                    .unwrap_or(retain_last)
-                    .max(1) as usize;
-                let cutoff_ms = reference
-                    .max_snapshot_age_ms()
-                    .map(|age| now - age)
-                    .unwrap_or(older_than);
-                let mut kept = 0usize;
-                let mut current = metadata.snapshot(reference.snapshot_id);
-                while let Some(snap) = current {
-                    referenced.insert(snap.snapshot_id());
-                    if kept < min_keep || snap.timestamp_ms() >= cutoff_ms {
-                        retained.insert(snap.snapshot_id());
-                        kept += 1;
-                        current = snap
-                            .parent_snapshot_id()
-                            .and_then(|id| metadata.snapshot(id));
-                    } else {
-                        break;
-                    }
-                }
-            }
-            for snap in &metadata.snapshots {
-                if !referenced.contains(&snap.snapshot_id()) && snap.timestamp_ms() >= older_than {
-                    retained.insert(snap.snapshot_id());
-                }
-            }
-
-            let expired_ids: Vec<i64> = metadata
-                .snapshots
-                .iter()
-                .filter(|s| !retained.contains(&s.snapshot_id()))
-                .map(|s| s.snapshot_id())
-                .collect();
-            if expired_ids.is_empty() {
-                return Ok(vec![]);
-            }
-            let mut updates = vec![TableUpdate::RemoveSnapshots {
-                snapshot_ids: expired_ids,
-            }];
-            for (name, reference) in &metadata.refs {
-                // Drop non-`main` refs whose target snapshot is being expired.
-                if name != MAIN_BRANCH && !retained.contains(&reference.snapshot_id) {
-                    updates.push(TableUpdate::RemoveSnapshotRef {
-                        ref_name: name.clone(),
-                    });
-                }
-            }
-            Ok(updates)
-        }
+        } => expire_snapshot_updates(metadata, *older_than_ms, *retain_last),
     }
 }
 
@@ -405,6 +394,141 @@ pub fn compute_procedure_updates(
 const DEFAULT_MAX_SNAPSHOT_AGE_MS: i64 = 432_000_000;
 /// Default `history.expire.min-snapshots-to-keep` per the Iceberg spec.
 const DEFAULT_MIN_SNAPSHOTS_TO_KEEP: i32 = 1;
+
+/// Computes `RemoveSnapshots` / `RemoveSnapshotRef` for `expire_snapshots` using the spec
+/// retain-set algorithm. Returns `Ok(vec![])` when nothing expires.
+///
+/// `older_than_ms` and `retain_last` are optional procedure arguments; defaults are read
+/// from the table's `history.expire.*` properties. See `retained_snapshot_ids`.
+fn expire_snapshot_updates(
+    metadata: &crate::spec::TableMetadata,
+    older_than_ms: Option<i64>,
+    retain_last: Option<i32>,
+) -> Result<Vec<TableUpdate>> {
+    let now = crate::utils::timestamp::monotonic_timestamp_ms();
+    let default_max_age_ms = metadata
+        .properties
+        .get("history.expire.max-snapshot-age-ms")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_MAX_SNAPSHOT_AGE_MS);
+    let default_min_keep = metadata
+        .properties
+        .get("history.expire.min-snapshots-to-keep")
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(DEFAULT_MIN_SNAPSHOTS_TO_KEEP);
+    let older_than = older_than_ms.unwrap_or(now - default_max_age_ms);
+    let retain_last = retain_last.unwrap_or(default_min_keep);
+
+    let (retained, _) = retained_snapshot_ids(metadata, older_than, retain_last);
+
+    let expired_ids: Vec<i64> = metadata
+        .snapshots
+        .iter()
+        .filter(|s| !retained.contains(&s.snapshot_id()))
+        .map(|s| s.snapshot_id())
+        .collect();
+    if expired_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut updates = vec![TableUpdate::RemoveSnapshots {
+        snapshot_ids: expired_ids,
+    }];
+    for (name, reference) in &metadata.refs {
+        // Drop non-`main` refs whose target snapshot is being expired.
+        if name != MAIN_BRANCH && !retained.contains(&reference.snapshot_id) {
+            updates.push(TableUpdate::RemoveSnapshotRef {
+                ref_name: name.clone(),
+            });
+        }
+    }
+    Ok(updates)
+}
+
+/// Computes the spec retain-set for `expire_snapshots` against the current metadata.
+///
+/// Returns `(retained_ids, referenced_ids)`:
+/// - `retained_ids` — every snapshot that must survive expiration: each retained ref's
+///   target (`main` always; non-`main` refs only if their snapshot still exists and has
+///   not aged past `max-ref-age-ms`, default: never), per-branch ancestry (head-inclusive)
+///   up to `min_snapshots_to_keep` or `older_than`, and unreferenced-but-recent snapshots.
+/// - `referenced_ids` — every snapshot reachable from a retained ref (branch ancestries +
+///   tag targets), used to decide the unreferenced-but-recent retention.
+fn retained_snapshot_ids(
+    metadata: &crate::spec::TableMetadata,
+    older_than: i64,
+    retain_last: i32,
+) -> (
+    std::collections::HashSet<i64>,
+    std::collections::HashSet<i64>,
+) {
+    let now = crate::utils::timestamp::monotonic_timestamp_ms();
+    let default_max_ref_age_ms = metadata
+        .properties
+        .get("history.expire.max-ref-age-ms")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(i64::MAX);
+
+    // Retained refs: `main` always; non-`main` refs only if their snapshot still exists
+    // and has not aged past `max-ref-age-ms` (default: never).
+    let mut retained_refs: std::collections::HashMap<&String, &SnapshotReference> =
+        std::collections::HashMap::new();
+    for (name, reference) in &metadata.refs {
+        if name == MAIN_BRANCH {
+            retained_refs.insert(name, reference);
+            continue;
+        }
+        let Some(snap) = metadata.snapshot(reference.snapshot_id) else {
+            // Dangling ref: its snapshot no longer exists.
+            continue;
+        };
+        let max_ref_age_ms = reference.max_ref_age_ms().unwrap_or(default_max_ref_age_ms);
+        if now - snap.timestamp_ms() <= max_ref_age_ms {
+            retained_refs.insert(name, reference);
+        }
+    }
+
+    // Retained snapshot ids: every retained ref's target, plus per-branch ancestry
+    // (head-inclusive) up to `min_snapshots_to_keep` or `older_than`, plus
+    // unreferenced-but-recent snapshots.
+    let mut retained: std::collections::HashSet<i64> =
+        retained_refs.values().map(|r| r.snapshot_id).collect();
+    let mut referenced: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for (_, reference) in &retained_refs {
+        if !reference.is_branch() {
+            referenced.insert(reference.snapshot_id);
+            continue;
+        }
+        let min_keep = reference
+            .min_snapshots_to_keep()
+            .unwrap_or(retain_last)
+            .max(1) as usize;
+        let cutoff_ms = reference
+            .max_snapshot_age_ms()
+            .map(|age| now - age)
+            .unwrap_or(older_than);
+        let mut kept = 0usize;
+        let mut current = metadata.snapshot(reference.snapshot_id);
+        while let Some(snap) = current {
+            referenced.insert(snap.snapshot_id());
+            if kept < min_keep || snap.timestamp_ms() >= cutoff_ms {
+                retained.insert(snap.snapshot_id());
+                kept += 1;
+                current = snap
+                    .parent_snapshot_id()
+                    .and_then(|id| metadata.snapshot(id));
+            } else {
+                break;
+            }
+        }
+    }
+    for snap in &metadata.snapshots {
+        if !referenced.contains(&snap.snapshot_id()) && snap.timestamp_ms() >= older_than {
+            retained.insert(snap.snapshot_id());
+        }
+    }
+
+    (retained, referenced)
+}
 
 /// Builds the `SetSnapshotRef` update pointing `main` at `snapshot_id`, preserving the
 /// current `main` retention policy (or a default branch retention when absent).
@@ -497,8 +621,16 @@ pub enum CallProcedureOutput {
         previous_snapshot_id: i64,
         current_snapshot_id: i64,
     },
-    /// `expire_snapshots` — metadata-only, so all counts are zero.
-    ExpireSnapshots,
+    /// `expire_snapshots` — the number of files physically deleted per kind. All zero when
+    /// the physical GC pass was skipped (e.g. `gc.enabled=false`).
+    ExpireSnapshots {
+        deleted_data_files_count: i64,
+        deleted_position_delete_files_count: i64,
+        deleted_equality_delete_files_count: i64,
+        deleted_manifest_files_count: i64,
+        deleted_manifest_lists_count: i64,
+        deleted_statistics_files_count: i64,
+    },
 }
 
 impl CallProcedureOutput {
@@ -509,7 +641,7 @@ impl CallProcedureOutput {
                 Field::new("previous_snapshot_id", DataType::Int64, true),
                 Field::new("current_snapshot_id", DataType::Int64, true),
             ],
-            Self::ExpireSnapshots => vec![
+            Self::ExpireSnapshots { .. } => vec![
                 Field::new("deleted_data_files_count", DataType::Int64, true),
                 Field::new("deleted_position_delete_files_count", DataType::Int64, true),
                 Field::new("deleted_equality_delete_files_count", DataType::Int64, true),
@@ -536,13 +668,32 @@ impl CallProcedureOutput {
                     *current_snapshot_id,
                 ])),
             ],
-            Self::ExpireSnapshots => vec![
-                Arc::new(datafusion::arrow::array::Int64Array::from(vec![0i64])),
-                Arc::new(datafusion::arrow::array::Int64Array::from(vec![0i64])),
-                Arc::new(datafusion::arrow::array::Int64Array::from(vec![0i64])),
-                Arc::new(datafusion::arrow::array::Int64Array::from(vec![0i64])),
-                Arc::new(datafusion::arrow::array::Int64Array::from(vec![0i64])),
-                Arc::new(datafusion::arrow::array::Int64Array::from(vec![0i64])),
+            Self::ExpireSnapshots {
+                deleted_data_files_count,
+                deleted_position_delete_files_count,
+                deleted_equality_delete_files_count,
+                deleted_manifest_files_count,
+                deleted_manifest_lists_count,
+                deleted_statistics_files_count,
+            } => vec![
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                    *deleted_data_files_count,
+                ])),
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                    *deleted_position_delete_files_count,
+                ])),
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                    *deleted_equality_delete_files_count,
+                ])),
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                    *deleted_manifest_files_count,
+                ])),
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                    *deleted_manifest_lists_count,
+                ])),
+                Arc::new(datafusion::arrow::array::Int64Array::from(vec![
+                    *deleted_statistics_files_count,
+                ])),
             ],
         };
         Ok(RecordBatch::try_new(schema, columns)?)
@@ -613,6 +764,14 @@ fn apply_procedure_updates(
                 table_meta
                     .snapshots
                     .retain(|s| !ids.contains(&s.snapshot_id()));
+                // The spec drops statistics / partition-statistics entries keyed by a removed
+                // snapshot, matching `TableMetadata.Builder.removeStatistics` / `removePartitionStatistics`.
+                table_meta
+                    .statistics
+                    .retain(|s| !ids.contains(&s.snapshot_id));
+                table_meta
+                    .partition_statistics
+                    .retain(|s| !ids.contains(&s.snapshot_id));
             }
             TableUpdate::RemoveSnapshotRef { ref_name } => {
                 table_meta.refs.remove(ref_name);
@@ -628,6 +787,12 @@ fn apply_procedure_updates(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::{ObjectStore, ObjectStoreExt};
+    use url::Url;
 
     use super::*;
     use crate::spec::snapshots::{SnapshotReference, SnapshotRetention, Summary};
@@ -931,6 +1096,43 @@ mod tests {
     }
 
     #[test]
+    fn expire_removes_statistics_for_removed_snapshots() {
+        use crate::spec::{PartitionStatisticsFile, StatisticsFile};
+
+        let mut meta = sample_metadata();
+        meta.statistics = vec![
+            StatisticsFile {
+                snapshot_id: 1,
+                statistics_path: "s3://bucket/stats-1.bin".to_string(),
+                file_size_in_bytes: 10,
+                file_footer_size_in_bytes: 5,
+                key_metadata: None,
+                blob_metadata: vec![],
+            },
+            StatisticsFile {
+                snapshot_id: 2,
+                statistics_path: "s3://bucket/stats-2.bin".to_string(),
+                file_size_in_bytes: 10,
+                file_footer_size_in_bytes: 5,
+                key_metadata: None,
+                blob_metadata: vec![],
+            },
+        ];
+        meta.partition_statistics = vec![PartitionStatisticsFile {
+            snapshot_id: 1,
+            statistics_path: "s3://bucket/pstats-1.bin".to_string(),
+            file_size_in_bytes: 10,
+        }];
+        let updates = vec![TableUpdate::RemoveSnapshots {
+            snapshot_ids: vec![1],
+        }];
+        apply_procedure_updates(&mut meta, &updates).unwrap();
+        assert_eq!(meta.statistics.len(), 1);
+        assert_eq!(meta.statistics[0].snapshot_id, 2);
+        assert!(meta.partition_statistics.is_empty());
+    }
+
+    #[test]
     fn output_snapshot_ref_has_spec_schema_and_row() {
         let output = CallProcedureOutput::SnapshotRef {
             previous_snapshot_id: 2,
@@ -961,8 +1163,15 @@ mod tests {
     }
 
     #[test]
-    fn output_expire_has_six_zero_counts() {
-        let output = CallProcedureOutput::ExpireSnapshots;
+    fn output_expire_has_six_count_columns() {
+        let output = CallProcedureOutput::ExpireSnapshots {
+            deleted_data_files_count: 1,
+            deleted_position_delete_files_count: 2,
+            deleted_equality_delete_files_count: 3,
+            deleted_manifest_files_count: 4,
+            deleted_manifest_lists_count: 5,
+            deleted_statistics_files_count: 6,
+        };
         let schema = output.schema();
         let fields: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(
@@ -980,12 +1189,13 @@ mod tests {
         let batch = output.to_record_batch().unwrap();
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 6);
-        for col in batch.columns() {
-            let arr = col
+        for (i, expected) in [1i64, 2, 3, 4, 5, 6].into_iter().enumerate() {
+            let arr = batch
+                .column(i)
                 .as_any()
                 .downcast_ref::<datafusion::arrow::array::Int64Array>()
                 .unwrap();
-            assert_eq!(arr.value(0), 0);
+            assert_eq!(arr.value(0), expected);
         }
     }
 
@@ -1163,6 +1373,35 @@ mod tests {
     }
 
     #[test]
+    fn retained_snapshot_ids_keeps_main_branch_ancestry_up_to_count_floor() {
+        let meta = chain_metadata();
+        // older_than = 3500ms: only snapshot 4 is recent. retain_last=2 keeps the head (4)
+        // and its first parent (3) by count; 1 and 2 are not in the retained set.
+        let (retained, referenced) = retained_snapshot_ids(&meta, 3_500, 2);
+        assert!(retained.contains(&4));
+        assert!(retained.contains(&3));
+        assert!(!retained.contains(&2));
+        assert!(!retained.contains(&1));
+        // The ancestry walk visits the head, parent, then stops at 2 (older than cutoff,
+        // beyond the count floor), so 1 is never visited.
+        assert_eq!(referenced, std::collections::HashSet::from([4, 3, 2]));
+    }
+
+    #[test]
+    fn retained_snapshot_ids_keeps_tag_target_and_recent_unreferenced() {
+        let mut meta = chain_metadata();
+        meta.refs.insert("t".to_string(), tag_ref(1));
+        let (retained, referenced) = retained_snapshot_ids(&meta, 3_500, 1);
+        // Tag target 1 is retained; the count floor keeps only head 4 for main; snapshot 3
+        // (3000ms) is older than the cutoff and beyond the count floor, so it is expired.
+        assert!(retained.contains(&4));
+        assert!(retained.contains(&1));
+        assert!(!retained.contains(&3));
+        // Tag target 1 is referenced even though it is not on main's ancestry.
+        assert!(referenced.contains(&1));
+    }
+
+    #[test]
     fn expire_uses_defaults_when_args_omitted() {
         let mut meta = chain_metadata();
         // No older_than/retain_last: defaults are 5 days ago and 1. All chain snapshots
@@ -1254,5 +1493,125 @@ mod tests {
         let meta = chain_metadata();
         assert_eq!(meta.snapshot(3).unwrap().snapshot_id(), 3);
         assert!(meta.snapshot(99).is_none());
+    }
+
+    fn table_url() -> Url {
+        Url::parse("memory://bucket/tbl").unwrap()
+    }
+
+    async fn put_metadata_json(
+        store: &Arc<dyn ObjectStore>,
+        key: &str,
+        meta: &crate::spec::TableMetadata,
+    ) {
+        store
+            .put(
+                &Path::from(key),
+                object_store::PutPayload::from(meta.to_json().unwrap()),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_post_commit_metadata_from_catalog_location() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let url = table_url();
+        let meta = sample_metadata();
+        put_metadata_json(&store, "tbl/metadata/v1.metadata.json", &meta).await;
+
+        // Absolute catalog metadata location (exercises the URL branch of
+        // `metadata_location_to_object_path_string`).
+        let loaded = CallProcedureExec::reload_post_commit_metadata(
+            &store,
+            &url,
+            Some("memory://bucket/tbl/metadata/v1.metadata.json"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.current_snapshot_id, Some(2));
+        assert_eq!(loaded.snapshots.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reload_post_commit_metadata_from_catalog_location_relative() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let url = table_url();
+        let meta = sample_metadata();
+        // Relative metadata locations are parsed as-is (not prefixed by the table URL), so
+        // the object key is `metadata/v1.metadata.json` on the base store.
+        put_metadata_json(&store, "metadata/v1.metadata.json", &meta).await;
+
+        // Relative catalog metadata location.
+        let loaded = CallProcedureExec::reload_post_commit_metadata(
+            &store,
+            &url,
+            Some("metadata/v1.metadata.json"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.current_snapshot_id, Some(2));
+    }
+
+    #[tokio::test]
+    async fn reload_post_commit_metadata_filesystem_with_version_hint() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let url = table_url();
+        let meta = sample_metadata();
+        put_metadata_json(&store, "tbl/metadata/v1.metadata.json", &meta).await;
+        store
+            .put(
+                &Path::from("tbl/metadata/version-hint.text"),
+                object_store::PutPayload::from("1".to_string()),
+            )
+            .await
+            .unwrap();
+
+        // No metadata location: falls back to `find_latest_metadata_file` via the hint.
+        let loaded = CallProcedureExec::reload_post_commit_metadata(&store, &url, None)
+            .await
+            .unwrap();
+        assert_eq!(loaded.current_snapshot_id, Some(2));
+        assert_eq!(loaded.snapshots.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reload_post_commit_metadata_filesystem_by_listing() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let url = table_url();
+        let meta = sample_metadata();
+        put_metadata_json(&store, "tbl/metadata/v1.metadata.json", &meta).await;
+
+        // No version hint: `find_latest_metadata_file` discovers it via directory listing.
+        let loaded = CallProcedureExec::reload_post_commit_metadata(&store, &url, None)
+            .await
+            .unwrap();
+        assert_eq!(loaded.current_snapshot_id, Some(2));
+        assert_eq!(loaded.snapshots.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reload_post_commit_metadata_propagates_missing_file() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let url = table_url();
+
+        // Explicit metadata location that does not exist → error propagates.
+        let err = CallProcedureExec::reload_post_commit_metadata(
+            &store,
+            &url,
+            Some("metadata/missing.json"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("metadata/missing.json"),
+            "unexpected error: {err}"
+        );
+
+        // No location and empty store → `find_latest_metadata_file` errors.
+        let err = CallProcedureExec::reload_post_commit_metadata(&store, &url, None)
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().is_empty());
     }
 }

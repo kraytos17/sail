@@ -593,8 +593,8 @@ Procedure signatures:
 The result is a **single spec-shaped row**:
 - `rollback_to_snapshot` / `set_current_snapshot` → `previous_snapshot_id`,
   `current_snapshot_id` (INT64).
-- `expire_snapshots` → six `deleted_*_count` columns (INT64; all `0` because v1
-  `expire_snapshots` is metadata-only).
+- `expire_snapshots` → six `deleted_*_count` columns (INT64; physical-delete counts from
+  the post-commit GC pass).
 
 > In this environment the catalog is `test` and tables live in namespace `test1`, so a
 > table is `test1.events` and the CALL is `CALL test.system.<procedure>(...)`.
@@ -653,15 +653,16 @@ spark.sql("SELECT * FROM test1.events_call ORDER BY id").show()
 
 ### 13.4 expire_snapshots
 
-Remove snapshots older than a timestamp (metadata-only expiry in v1; the current/main
-snapshot is never expired).
+Remove snapshots older than a timestamp. On the filesystem path, files uniquely owned by
+the expired snapshots are physically deleted and real counts are reported; the
+current/main snapshot is never expired.
 
 ```python
 # Expire snapshots older than a recent time. Choose a timestamp BEFORE the latest
 # snapshot but AFTER the oldest so only intermediate snapshots are dropped.
 # Example: expire everything committed before 2026-01-01 00:00:00 (adjust to your data):
 spark.sql("CALL test.system.expire_snapshots('test1.events_call', TIMESTAMP '2026-01-01 00:00:00')").show()
-# Expected: one row of six deleted_*_count columns, all 0 (v1 expire is metadata-only)
+# Expected: one row of six deleted_*_count columns with the physical-delete counts
 
 # Remaining snapshots (older ones removed, current kept):
 spark.sql("SELECT snapshot_id, committed_at FROM test1.events_call.snapshots ORDER BY committed_at DESC").show(truncate=False)
@@ -717,5 +718,5 @@ spark.sql("CALL test.system.set_current_snapshot('call_v', 1)").show()
 - **`LOAD DATA` fallback compression** is inferred per chunk from the first file; a single statement should use uniform compression (a mixed `.csv` + `.csv.gz` directory is an edge case).
 - **`LOAD DATA` on a partitioned table** always uses the rewrite fallback (the fast path can't set partition values); rows are partitioned correctly by the writer.
 - **`CALL` procedures** support only `rollback_to_snapshot`, `set_current_snapshot`, and `expire_snapshots` in the `system` namespace; other procedures error with `NotSupported`. See `docs/dev/call-procedures-spec-deviations.md` for the full deviation list.
-- **`CALL` result shape matches the spec (Sail v1):** `rollback_to_snapshot`/`set_current_snapshot` return a single row with `previous_snapshot_id`, `current_snapshot_id`; `expire_snapshots` returns a single row with the six `deleted_*_count` columns (all `0` because v1 expire is metadata-only). `previous_snapshot_id` is the `main` ref snapshot at plan time.
-- **`expire_snapshots` retention matches the spec (Sail v1), but is metadata-only:** the retain-set algorithm keeps `main` (never expires), branch/tag-referenced snapshots, per-branch ancestry up to `retain_last`, and snapshots newer than `older_than`; `older_than`/`retain_last` default from `history.expire.*` properties. Orphaned data files are **not** physically deleted (the spec deletes files uniquely required by expired snapshots and reports non-zero `deleted_*_count`). `set_current_snapshot` accepts `snapshot_id` **or** `ref` (exactly one; `ref` is named-only). `rollback_to_snapshot` requires the target to be an **ancestor** of the current snapshot (otherwise `Cannot roll back to snapshot, not an ancestor of the current state`), while `set_current_snapshot` does not.
+- **`CALL` result shape matches the spec (Sail v1):** `rollback_to_snapshot`/`set_current_snapshot` return a single row with `previous_snapshot_id`, `current_snapshot_id`; `expire_snapshots` returns a single row with the six `deleted_*_count` columns reporting the physical-delete counts. `previous_snapshot_id` is the `main` ref snapshot at plan time.
+- **`expire_snapshots` retention + physical GC match the spec (Sail v1):** the retain-set algorithm keeps `main` (never expires), branch/tag-referenced snapshots, per-branch ancestry up to `retain_last`, and snapshots newer than `older_than`; `older_than`/`retain_last` default from `history.expire.*` properties. On both the **filesystem** and **catalog-managed** paths, `expire_files_gc` best-effort deletes data/delete files, manifests, manifest lists, and statistics files uniquely owned by the expired snapshots and reports real counts. `set_current_snapshot` accepts `snapshot_id` **or** `ref` (exactly one; `ref` is named-only). `rollback_to_snapshot` requires the target to be an **ancestor** of the current snapshot (otherwise `Cannot roll back to snapshot, not an ancestor of the current state`), while `set_current_snapshot` does not.

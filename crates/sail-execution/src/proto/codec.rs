@@ -1352,6 +1352,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 updates_json,
                 requirements_json,
                 output_json,
+                pre_commit_metadata_json,
             }) => {
                 let procedure: CallProcedure = self
                     .try_decode_json(&procedure, "CALL procedure")
@@ -1370,13 +1371,30 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 let output: CallProcedureOutput = self
                     .try_decode_json(&output_json, "CALL output")
                     .map_err(|e| plan_datafusion_err!("failed to decode CALL output: {e}"))?;
-                Ok(Arc::new(CallProcedureExec::new(
+                let pre_commit_metadata: Option<sail_iceberg::spec::TableMetadata> =
+                    if pre_commit_metadata_json.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            self.try_decode_json(
+                                &pre_commit_metadata_json,
+                                "CALL pre-commit metadata",
+                            )
+                            .map_err(|e| {
+                                plan_datafusion_err!(
+                                    "failed to decode CALL pre-commit metadata: {e}"
+                                )
+                            })?,
+                        )
+                    };
+                Ok(Arc::new(CallProcedureExec::new_with_pre_commit_metadata(
                     procedure,
                     table_url,
                     lakehouse_table,
                     updates,
                     requirements,
                     output,
+                    pre_commit_metadata,
                 )))
             }
             NodeKind::IcebergDiscovery(gen::IcebergDiscoveryExecNode {
@@ -2220,6 +2238,14 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 .map_err(|e| plan_datafusion_err!("failed to encode CALL output: {e}"))?;
             let lakehouse_table_json =
                 self.try_encode_lakehouse_table(call_procedure.lakehouse_table())?;
+            let pre_commit_metadata_json = match call_procedure.pre_commit_metadata() {
+                Some(metadata) => self
+                    .try_encode_json(metadata, "CALL pre-commit metadata")
+                    .map_err(|e| {
+                        plan_datafusion_err!("failed to encode CALL pre-commit metadata: {e}")
+                    })?,
+                None => String::new(),
+            };
             NodeKind::CallProcedure(gen::CallProcedureExecNode {
                 procedure: procedure_json,
                 table_url: call_procedure.table_url().to_string(),
@@ -2227,6 +2253,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 updates_json,
                 requirements_json,
                 output_json,
+                pre_commit_metadata_json,
             })
         } else if let Some(discovery) = node.downcast_ref::<IcebergDiscoveryExec>() {
             let input = try_encode_physical_plan(self, discovery.input().clone())?;
@@ -5502,6 +5529,94 @@ mod tests {
                 current_snapshot_id: 1,
             }
         );
+
+        // `ExpireSnapshots` with pre-commit metadata (used for physical GC) must survive
+        // encode/decode too.
+        use sail_iceberg::spec::{FormatVersion, Operation, Schema, Summary};
+        let pre_commit = sail_iceberg::spec::TableMetadata {
+            format_version: FormatVersion::V2,
+            table_uuid: None,
+            location: "s3a://bucket/path".to_string(),
+            last_sequence_number: 0,
+            last_updated_ms: 0,
+            last_column_id: 0,
+            schemas: vec![Schema::builder().with_schema_id(0).build().unwrap()],
+            current_schema_id: 0,
+            partition_specs: vec![sail_iceberg::spec::PartitionSpec::unpartitioned_spec()],
+            default_spec_id: 0,
+            last_partition_id: 0,
+            properties: std::collections::HashMap::new(),
+            current_snapshot_id: Some(1),
+            next_row_id: None,
+            encryption_keys: vec![],
+            snapshots: vec![sail_iceberg::spec::Snapshot::builder()
+                .with_snapshot_id(1)
+                .with_sequence_number(1)
+                .with_timestamp_ms(1_000)
+                .with_manifest_list("s3a://bucket/path/metadata/snap-1.avro")
+                .with_summary(Summary::new(Operation::Append))
+                .build()
+                .unwrap()],
+            snapshot_log: vec![],
+            metadata_log: vec![],
+            sort_orders: vec![],
+            default_sort_order_id: None,
+            refs: std::collections::HashMap::new(),
+            statistics: vec![],
+            partition_statistics: vec![],
+        };
+        let node = Arc::new(CallProcedureExec::new_with_pre_commit_metadata(
+            CallProcedure::ExpireSnapshots {
+                table: "test1.events".to_string(),
+                older_than_ms: Some(1_000),
+                retain_last: Some(1),
+            },
+            Url::parse("s3a://bucket/path")
+                .map_err(|e| plan_datafusion_err!("failed to parse table URL: {e}"))?,
+            None,
+            vec![],
+            vec![],
+            CallProcedureOutput::ExpireSnapshots {
+                deleted_data_files_count: 1,
+                deleted_position_delete_files_count: 2,
+                deleted_equality_delete_files_count: 3,
+                deleted_manifest_files_count: 4,
+                deleted_manifest_lists_count: 5,
+                deleted_statistics_files_count: 6,
+            },
+            Some(pre_commit),
+        )) as Arc<dyn ExecutionPlan>;
+
+        let mut buf = vec![];
+        codec.try_encode(node.clone(), &mut buf)?;
+        let decoded = codec.try_decode(&buf, &[], ctx.as_ref())?;
+        let decoded_node = decoded
+            .downcast_ref::<CallProcedureExec>()
+            .ok_or_else(|| plan_datafusion_err!("decoded plan is not CallProcedureExec"))?;
+        assert_eq!(
+            decoded_node.procedure(),
+            &CallProcedure::ExpireSnapshots {
+                table: "test1.events".to_string(),
+                older_than_ms: Some(1_000),
+                retain_last: Some(1),
+            }
+        );
+        assert_eq!(
+            decoded_node.output(),
+            &CallProcedureOutput::ExpireSnapshots {
+                deleted_data_files_count: 1,
+                deleted_position_delete_files_count: 2,
+                deleted_equality_delete_files_count: 3,
+                deleted_manifest_files_count: 4,
+                deleted_manifest_lists_count: 5,
+                deleted_statistics_files_count: 6,
+            }
+        );
+        let decoded_pre = decoded_node
+            .pre_commit_metadata()
+            .ok_or_else(|| plan_datafusion_err!("pre-commit metadata was not decoded"))?;
+        assert_eq!(decoded_pre.snapshots.len(), 1);
+        assert_eq!(decoded_pre.snapshots[0].snapshot_id(), 1);
 
         Ok(())
     }

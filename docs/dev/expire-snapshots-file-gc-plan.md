@@ -1,6 +1,6 @@
 # Plan: `expire_snapshots` physical file GC (D3) — spec-accurate
 
-**Status:** Draft / to be implemented
+**Status:** Implemented (filesystem + catalog-managed paths)
 **Branch:** `feat/v0.6.6`
 **Scope:** Close the last remaining CALL-procedure deviation (D3): `expire_snapshots`
 currently removes snapshot/ref **metadata** only; the Iceberg spec also **physically deletes**
@@ -262,11 +262,11 @@ pub async fn expire_files_gc(
 ### Step 4 — wire into `execute_call`
 After the commit `match commit_mode { ... }` block and **only** for
 `CallProcedure::ExpireSnapshots`:
-- Filesystem: re-read post-commit metadata via `find_latest_metadata_file` +
-  `TableMetadata::from_json` (same store/url). 
-- Catalog commit: `CallProcedureExec` already has the lakehouse/catalog context; re-fetch
-  post-commit metadata via `IcebergCatalogCommitCoordinator::load_table_info` +
-  `Table::load`-style path (see §5 for catalog nuance).
+- Reload post-commit metadata via `reload_post_commit_metadata` (Step 4 helper):
+  - Filesystem: `find_latest_metadata_file` + `TableMetadata::from_json` (same store/url).
+  - Catalog commit: use the `metadata_location` returned by the commit
+    (`CatalogCommittedTable::metadata_location()`), falling back to
+    `find_latest_metadata_file`.
 - `pre_commit` = `self.pre_commit_metadata` (Step 2).
 - `expired_ids = pre_commit.snapshots − post_commit.snapshots` (set difference, matching
   `findExpiredSnapshotIds`).
@@ -312,27 +312,30 @@ statistics for removed snapshots), also drop `table_meta.statistics` /
 
 ## 5. Catalog (Polaris) path nuance
 
-- After a catalog commit, the post-commit metadata must be re-fetched. Follow the existing
-  `IcebergCatalogCommitCoordinator::load_table_info` / provider patterns; the exact
-  re-load call should reuse whatever `Table::load`/`commit_exec.rs` uses to refresh a
-  catalog table's metadata (validate the specific helper during implementation).
+- After a catalog commit, the post-commit metadata is reloaded from the **`metadata_location`
+  returned by the commit** (`CatalogCommittedTable::metadata_location()`), falling back to
+  `find_latest_metadata_file` on `table_url` when the location is absent.
 - Deletes use the same object store resolved from `table_url` (Polaris vends storage via
   the table's location / credentials), so `store_ctx` from `get_object_store_from_context`
   applies.
-- If post-commit re-fetch is not feasible for a catalog authority, degrade to
-  **`CleanupLevel::NONE`-equivalent** behavior (skip physical GC, return zero counts) and
-  log — never delete without a valid post-commit reference set.
+- Reload/collection failures **propagate** (the CALL errors after a successful metadata
+  commit) — matching the Iceberg reference (`ops.refresh()` post-commit throws; manifest
+  reads use `throwFailureWhenFinished`). There is no silent zero-count degradation.
 
 ---
 
 ## 6. Safety invariants (non-negotiable)
 
 1. **Never delete a path in the valid set.** The anti-join is authoritative.
-2. **Fail-safe on retained-manifest read failure:** if reading any retained snapshot's
-   manifests fails, do not delete *any* content files (return zero counts, log).
+2. **Computation failures propagate (spec-accurate):** failures to reload post-commit
+   metadata or to read manifests during the candidate/valid computation propagate — matching
+   the Iceberg reference (`ops.refresh()` post-commit throws; manifest reads use
+   `throwFailureWhenFinished`). The metadata commit has already succeeded, so the CALL
+   errors without deleting anything.
 3. **Best-effort deletes:** `NotFound` skipped, errors logged, never fatal to the CALL.
+   Counts reflect successful deletes only.
 4. **Metadata first:** physical deletes only after a successful commit.
-5. **`gc.enabled=false` ⇒ reject expire at plan time** (no commit, no deletes).
+5. **`gc.enabled` is always-on:** no gate (per project decision); expire always runs GC.
 
 ---
 

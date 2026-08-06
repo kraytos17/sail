@@ -15,6 +15,7 @@ pub mod call_procedure_exec;
 pub mod commit;
 pub mod delete_apply_exec;
 pub mod discovery_exec;
+pub mod expire_snapshots_gc;
 pub mod load_data_exec;
 pub mod manifest_scan_exec;
 pub mod plan_builder;

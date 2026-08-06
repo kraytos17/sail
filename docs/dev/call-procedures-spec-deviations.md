@@ -1,6 +1,7 @@
 # CALL procedures — spec deviations vs Apache Iceberg
 
-**Status:** Analysis / known limitations
+**Status:** All documented deviations (D1–D7) resolved; one residual scope note for the
+catalog-managed commit path (D3 physical GC not yet wired there).
 **Scope:** `CALL <catalog>.system.<procedure>(...)` implemented in Sail (`feat/v0.6.6`)
 **Spec reference:** [Apache Iceberg Spark procedures](https://iceberg.apache.org/docs/latest/spark-procedures/)
 
@@ -43,8 +44,8 @@ and `snapshot_id` accepts any integer scalar.
 | # | Area | Apache Iceberg spec | Sail v1 current | Severity |
 |---|---|---|---|---|
 | D1 | `rollback_to_snapshot` / `set_current_snapshot` output | Returns `previous_snapshot_id`, `current_snapshot_id` (long) | **Resolved** — returns `previous_snapshot_id`, `current_snapshot_id` | ~~High~~ ✅ |
-| D2 | `expire_snapshots` output | Returns 6 columns: `deleted_data_files_count`, `deleted_position_delete_files_count`, `deleted_equality_delete_files_count`, `deleted_manifest_files_count`, `deleted_manifest_lists_count`, `deleted_statistics_files_count` | **Resolved (schema)** — returns the 6 columns, all `0` (metadata-only) | ~~High~~ ✅ (values 0) |
-| D3 | `expire_snapshots` file deletion | Physically deletes snapshots **and data/manifest files** uniquely required by expired snapshots | Metadata-only: removes snapshots/refs; **no** data-file GC | **High** (behavior) |
+| D2 | `expire_snapshots` output | Returns 6 columns: `deleted_data_files_count`, `deleted_position_delete_files_count`, `deleted_equality_delete_files_count`, `deleted_manifest_files_count`, `deleted_manifest_lists_count`, `deleted_statistics_files_count` | **Resolved** — returns the 6 columns with real (non-zero) counts after the physical GC pass | ~~High~~ ✅ |
+| D3 | `expire_snapshots` file deletion | Physically deletes snapshots **and data/manifest files** uniquely required by expired snapshots | **Resolved** — post-commit physical GC (`expire_files_gc`) anti-joins files reachable from expired snapshots against the retained set and best-effort deletes data/delete files, manifests, manifest lists, and statistics files (filesystem and catalog-managed paths) | ~~High~~ ✅ |
 | D4 | `set_current_snapshot` `ref` argument | Accepts either `snapshot_id` **or** `ref` (branch/tag), not both | **Resolved** — accepts `snapshot_id` (positional or named) or `ref` (named only); exactly one required | ~~Medium~~ ✅ |
 | D5 | `expire_snapshots` `retain_last` (default 1) | Preserves the last N ancestor snapshots regardless of `older_than` | **Resolved** — spec retain-set algorithm: per-branch ancestry walk (head-inclusive) keeps first N or `>= older_than`; `older_than`/`retain_last` optional with `history.expire.*` property defaults | ~~Medium~~ ✅ |
 | D6 | `expire_snapshots` branch/tag preservation | Snapshots referenced by branches/tags are **not** removed; `main` never expires | **Resolved** — retained refs (main always; others within `max-ref-age-ms`, default never) keep their target snapshots and per-branch ancestry; non-main refs pointing at expired ids are dropped | ~~High~~ ✅ |
@@ -79,22 +80,34 @@ operations table. The CALL result now carries exactly this information.
 **Spec:** six `deleted_*_count` long columns (data files, position deletes, equality
 deletes, manifests, manifest lists, statistics files).
 
-**Sail (schema resolved):** `CallProcedureOutput::ExpireSnapshots` produces a single row
-with the six `deleted_*_count` columns. Because v1 `expire_snapshots` is metadata-only
-(see D3), every count is `0` — the column set matches the spec, but the values do not
-reflect physical deletions.
+**Sail (resolved):** `CallProcedureOutput::ExpireSnapshots` produces a single row with the
+six `deleted_*_count` columns populated with the counts of **successful physical deletes**
+from the post-commit GC pass.
 
-### D3 — `expire_snapshots` file deletion
+### D3 — `expire_snapshots` file deletion ✅ resolved
 
 **Spec:**
 > "The `expire_snapshots` procedure can be used to remove older snapshots **and their
 > files** which are no longer needed. This procedure will remove old snapshots and data
 > files which are uniquely required by those old snapshots."
 
-**Sail:** `compute_procedure_updates` only produces `TableUpdate::RemoveSnapshots` (+
-`RemoveSnapshotRef` for refs pointing at expired ids). Data files uniquely referenced by
-the expired snapshots remain on the object store forever. This is a deliberate v1 scope
-cut (metadata-only expiry), but it is **not** what the spec procedure does.
+**Sail (resolved):** after the metadata commit, `execute_call` runs `expire_files_gc`
+(`crates/sail-iceberg/src/physical_plan/expire_snapshots_gc.rs`), which anti-joins the
+`(path, kind)` set of all files reachable from the expired snapshots (pre-commit metadata)
+against the retained set (post-commit metadata) and best-effort deletes:
+- data / position-delete / equality-delete files (counted separately),
+- manifests reachable only by expired snapshots,
+- expired snapshots' manifest lists,
+- statistics / partition-statistics files of expired snapshots.
+
+Deletes are idempotent (missing keys on S3/InMemory still succeed and are counted;
+`NotFound` from strict stores is skipped). On both commit paths (filesystem and
+catalog-managed) the post-commit metadata is reloaded — from `find_latest_metadata_file`
+for filesystem, or from the commit-returned `metadata_location` for catalog — and the same
+anti-join runs. Reload/computation failures propagate (matching the Iceberg reference
+`ops.refresh()`); individual delete failures are best-effort and reduce the reported
+counts. Files referenced by any retained snapshot are never deleted (the anti-join is the
+authoritative safety check).
 
 ### D4 — `set_current_snapshot` `ref` argument ✅ resolved
 
@@ -154,10 +167,11 @@ the spec's distinction between the two procedures.
 - **Metadata table reads are unaffected:** `.refs` / `.snapshots` (Phase A) already expose
   the post-procedure state, so verification via `SELECT ... FROM ns.tbl.refs` /
   `.snapshots` works today.
-- **`expire_snapshots` correctness:** the retain-set algorithm now matches spec retention
+- **`expire_snapshots` correctness:** the retain-set algorithm matches spec retention
   semantics (branch/tag-referenced snapshots kept, `main` never expires, `retain_last`
-  honored). It is still metadata-only — orphaned data files are not physically deleted
-  (D3), so storage is not reclaimed.
+  honored), and the post-commit GC pass physically deletes files uniquely owned by the
+  expired snapshots on both the filesystem and catalog-managed paths — storage is
+  reclaimed and the `deleted_*_count` columns report real numbers.
 
 ---
 
@@ -167,7 +181,8 @@ the spec's distinction between the two procedures.
 `CallProcedureExec` now returns spec-shaped result batches:
 - `rollback_to_snapshot` / `set_current_snapshot` → `previous_snapshot_id`,
   `current_snapshot_id` (the `main` ref snapshot at plan time, and the target).
-- `expire_snapshots` → the six `deleted_*_count` columns (all `0` for metadata-only v1).
+- `expire_snapshots` → the six `deleted_*_count` columns (real counts after the physical
+  GC pass; zero if GC was skipped).
 
 To make this work in cluster mode, `CallProcedureExec` was also:
 - routed to the **driver** via `is_driver_stage_plan` and `plan_job_graph_stages`
@@ -193,10 +208,11 @@ spec error message.
 The target must be an ancestor of the current snapshot (walk `parent_snapshot_id`,
 current inclusive); `set_current_snapshot` keeps its existence-only check.
 
-### F. `expire_snapshots` physical file GC (D3, large, defer)
-After removing snapshots, delete data/manifest files uniquely owned by the expired
-snapshots and report real (non-zero) counts. This is the full spec behavior and the
-biggest scope item.
+### ✅ F. `expire_snapshots` physical file GC — DONE (D3)
+Post-commit `expire_files_gc` anti-joins expired-vs-retained file sets and best-effort
+deletes data/delete files, manifests, manifest lists, and statistics files on both the
+filesystem and catalog-managed commit paths, reporting real `deleted_*_count` counts —
+see `docs/dev/expire-snapshots-file-gc-plan.md`.
 
 ---
 

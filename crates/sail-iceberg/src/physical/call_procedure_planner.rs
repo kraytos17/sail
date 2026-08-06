@@ -44,13 +44,19 @@ pub async fn plan_call_procedure(
     let requirements = procedure_requirements(metadata);
     let output = compute_procedure_output(node.procedure(), metadata)?;
 
-    let exec = CallProcedureExec::new(
+    // Capture the plan-time metadata for procedures that need it after the commit
+    // (expire_snapshots computes its physical-GC candidates from the pre-commit state).
+    let pre_commit_metadata =
+        matches!(node.procedure(), CallProcedure::ExpireSnapshots { .. }).then(|| metadata.clone());
+
+    let exec = CallProcedureExec::new_with_pre_commit_metadata(
         node.procedure().clone(),
         table_url,
         node.target_lakehouse_table().cloned(),
         updates,
         requirements,
         output,
+        pre_commit_metadata,
     );
     Ok(Arc::new(exec))
 }
@@ -78,6 +84,14 @@ fn compute_procedure_output(
                 current_snapshot_id: current,
             })
         }
-        CallProcedure::ExpireSnapshots { .. } => Ok(CallProcedureOutput::ExpireSnapshots),
+        CallProcedure::ExpireSnapshots { .. } => Ok(CallProcedureOutput::ExpireSnapshots {
+            // Real counts are filled in at execution time after the physical GC pass.
+            deleted_data_files_count: 0,
+            deleted_position_delete_files_count: 0,
+            deleted_equality_delete_files_count: 0,
+            deleted_manifest_files_count: 0,
+            deleted_manifest_lists_count: 0,
+            deleted_statistics_files_count: 0,
+        }),
     }
 }
