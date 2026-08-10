@@ -43,6 +43,7 @@ pub struct VariantShreddingOptionPresence {
 pub struct IcebergWriterExecOptions {
     pub merge_schema: bool,
     pub overwrite_schema: bool,
+    pub compression_codec: String,
     pub write_data_path: Option<String>,
     pub write_folder_storage_path: Option<String>,
     pub table_properties: Vec<(String, String)>,
@@ -68,6 +69,7 @@ impl Default for IcebergWriterExecOptions {
         Self {
             merge_schema: false,
             overwrite_schema: false,
+            compression_codec: "snappy".to_string(),
             write_data_path: None,
             write_folder_storage_path: None,
             table_properties: vec![],
@@ -88,6 +90,7 @@ impl From<IcebergWriteOptions> for IcebergWriterExecOptions {
         Self {
             merge_schema: options.merge_schema,
             overwrite_schema: options.overwrite_schema,
+            compression_codec: options.compression_codec,
             write_data_path: options.write_data_path,
             write_folder_storage_path: options.write_folder_storage_path,
             table_properties: vec![],

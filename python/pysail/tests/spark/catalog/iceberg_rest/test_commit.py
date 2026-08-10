@@ -196,6 +196,48 @@ def test_insert_overwrite_advances_rest_catalog_metadata_location(
     assert [(row["id"], row["name"]) for row in rows] == [(3, "new"), (4, "new")]
 
 
+def test_create_or_replace_table_as_select_replaces_rest_catalog_metadata(
+    spark: SparkSession,
+    iceberg_rest_endpoint: str,
+) -> None:
+    table_name = "create_or_replace_t"
+    table_fqn = f"{NAMESPACE}.{table_name}"
+    spark.sql(f"DROP TABLE IF EXISTS {table_fqn}")
+
+    # First run: creates the table (was previously rejected as "Replace table is not supported yet").
+    spark.sql(
+        f"""
+        CREATE OR REPLACE TABLE {table_fqn}
+        USING iceberg
+        AS SELECT 1 AS id, 'a' AS name
+        """
+    )
+    created = _load_table(iceberg_rest_endpoint, table_name)
+    created_location = created["metadata-location"]
+    _assert_uuid_metadata_location(created_location, 0)
+    rows = spark.sql(f"SELECT id, name FROM {table_fqn}").collect()  # noqa: S608
+    assert [(row["id"], row["name"]) for row in rows] == [(1, "a")]
+
+    # Second run: replaces the table (fresh snapshot, new metadata version).
+    spark.sql(
+        f"""
+        CREATE OR REPLACE TABLE {table_fqn}
+        USING iceberg
+        AS SELECT 2 AS id, 'b' AS name
+        """
+    )
+    replaced = _load_table(iceberg_rest_endpoint, table_name)
+    assert replaced["metadata-location"] != created_location
+    _assert_uuid_metadata_location(replaced["metadata-location"], 1)
+    assert replaced["metadata"]["current-snapshot-id"] is not None
+    assert [entry["metadata-file"] for entry in replaced["metadata"]["metadata-log"]] == [
+        created_location,
+    ]
+
+    rows = spark.sql(f"SELECT id, name FROM {table_fqn} ORDER BY id").collect()  # noqa: S608
+    assert [(row["id"], row["name"]) for row in rows] == [(2, "b")]
+
+
 def test_rest_catalog_rejects_catalog_managed_iceberg_alter(
     spark: SparkSession,
     iceberg_rest_endpoint: str,

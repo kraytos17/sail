@@ -13,13 +13,10 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::catalog::Session;
 use datafusion::common::Result;
-use datafusion::physical_expr::expressions::Column;
-use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
-use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::sorts::sort::SortExec;
-use datafusion::physical_plan::{ExecutionPlan, Partitioning};
+use datafusion::physical_plan::ExecutionPlan;
 use sail_common_datafusion::catalog::CatalogPartitionField;
 use sail_common_datafusion::datasource::PhysicalSinkMode;
 use url::Url;
@@ -35,24 +32,21 @@ pub struct IcebergTableConfig {
     pub options: IcebergWriterExecOptions,
 }
 
-pub struct IcebergPlanBuilder<'a> {
+pub struct IcebergPlanBuilder {
     input: Arc<dyn ExecutionPlan>,
     table_config: IcebergTableConfig,
     sink_mode: PhysicalSinkMode,
     sort_order: Option<Vec<PhysicalSortExpr>>,
     logical_input_schema: Option<SchemaRef>,
-    #[expect(unused)]
-    session: &'a dyn Session,
 }
 
-impl<'a> IcebergPlanBuilder<'a> {
+impl IcebergPlanBuilder {
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         table_config: IcebergTableConfig,
         sink_mode: PhysicalSinkMode,
         sort_order: Option<Vec<PhysicalSortExpr>>,
         logical_input_schema: Option<SchemaRef>,
-        session: &'a dyn Session,
     ) -> Self {
         Self {
             input,
@@ -60,13 +54,11 @@ impl<'a> IcebergPlanBuilder<'a> {
             sink_mode,
             sort_order,
             logical_input_schema,
-            session,
         }
     }
 
     pub async fn build(self) -> Result<Arc<dyn ExecutionPlan>> {
         self.add_projection_node(self.input.clone())
-            .and_then(|plan| self.add_repartition_node(plan))
             .and_then(|plan| self.add_sort_node(plan))
             .and_then(|plan| self.add_writer_node(plan))
             .and_then(|plan| self.add_commit_node(plan))
@@ -86,45 +78,6 @@ impl<'a> IcebergPlanBuilder<'a> {
             }
         }
         Ok(input)
-    }
-
-    fn add_repartition_node(
-        &self,
-        input: Arc<dyn ExecutionPlan>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let repartitioning = if self.table_config.partition_columns.is_empty() {
-            Partitioning::RoundRobinBatch(4)
-        } else {
-            let schema = input.schema();
-            let mut seen = std::collections::HashSet::new();
-            let partition_source_columns = self
-                .table_config
-                .partition_columns
-                .iter()
-                .filter_map(|field| {
-                    if seen.insert(field.column.clone()) {
-                        Some(field.column.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            let exprs: Vec<Arc<dyn PhysicalExpr>> = partition_source_columns
-                .iter()
-                .map(|name| {
-                    let idx = schema.index_of(name).map_err(|_| {
-                        datafusion::common::DataFusionError::Plan(format!(
-                            "Partition column '{}' not found in schema",
-                            name
-                        ))
-                    })?;
-                    Ok(Arc::new(Column::new(name, idx)) as Arc<dyn PhysicalExpr>)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Partitioning::Hash(exprs, 4)
-        };
-
-        Ok(Arc::new(RepartitionExec::try_new(input, repartitioning)?))
     }
 
     fn add_sort_node(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
@@ -151,9 +104,14 @@ impl<'a> IcebergPlanBuilder<'a> {
     }
 
     fn add_commit_node(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+        // IcebergCommitExec is single-partition; gather the writer's partitions first so
+        // every writer task's action batch reaches the commit.
+        let coalesced = Arc::new(
+            datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(input),
+        );
         Ok(Arc::new(
             crate::physical_plan::commit::commit_exec::IcebergCommitExec::new(
-                input,
+                coalesced,
                 self.table_config.table_url.clone(),
                 self.table_config.options.lakehouse_table.clone(),
                 None,

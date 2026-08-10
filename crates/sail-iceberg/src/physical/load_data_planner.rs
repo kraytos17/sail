@@ -179,44 +179,37 @@ pub async fn plan_load_data(
     }
 
     // Build fallback writer branches.
-    // Group fallback files by extension, then split into chunks so there is one writer
-    // per chunk. Each writer is single-partition (explicit CoalescePartitionsExec), so:
-    //   - few/small files → one writer that accumulates into fewer, larger parquet files;
-    //   - many/large files → bounded to `target_partitions` writers (chunked, still parallel).
-    // Chunking is byte-aware: target ~= the writer's 128 MB file size so small CSV sets don't
-    // produce tiny-file sprawl in the table.
-    let target_parts = ctx.session().config().target_partitions().max(1);
+    // Group fallback files by extension; each format group gets ONE multi-partition writer.
+    // The scan is fed straight into the writer: `IcebergWriterExec` accepts any input
+    // distribution, so `EnforceDistribution` splits large files across `target_partitions`
+    // (e.g. a 549 MB CSV → 16 parallel writer tasks) while small sets stay single-partition.
+    // No explicit repartition is inserted here — the optimizer removes it anyway.
     for (format, files) in group_by_format(&fallback_files) {
-        let sizes: Vec<u64> = files.iter().map(|(_, size)| *size).collect();
-        let chunk_size = chunk_size_for_bytes(&sizes, TARGET_FILE_SIZE_BYTES, target_parts);
-        for chunk in files.chunks(chunk_size) {
-            let scan =
-                build_fallback_scan(session_state, chunk, format.as_str(), &table_arrow_schema)?;
-            let coalesced: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(scan));
-            let mut writer_options = IcebergWriterExecOptions::default();
-            writer_options.commit_operation = Some(operation.clone());
-            writer_options.lakehouse_table = ctx.lakehouse_table().cloned();
-            writer_options.table_properties = table_properties.clone();
+        let scan =
+            build_fallback_scan(session_state, &files, format.as_str(), &table_arrow_schema)?;
+        let writer_options = IcebergWriterExecOptions {
+            commit_operation: Some(operation.clone()),
+            lakehouse_table: ctx.lakehouse_table().cloned(),
+            table_properties: table_properties.clone(),
+            ..Default::default()
+        };
 
-            let writer: Arc<dyn ExecutionPlan> = Arc::new(IcebergWriterExec::new(
-                coalesced,
-                ctx.table_url().clone(),
-                partition_columns.clone(),
-                PhysicalSinkMode::Append,
-                true,
-                writer_options,
-                Some(Arc::new(table_arrow_schema.clone())),
-            ));
-            branches.push(writer);
-        }
+        let writer: Arc<dyn ExecutionPlan> = Arc::new(IcebergWriterExec::new(
+            scan,
+            ctx.table_url().clone(),
+            partition_columns.clone(),
+            PhysicalSinkMode::Append,
+            true,
+            writer_options,
+            Some(Arc::new(table_arrow_schema.clone())),
+        ));
+        branches.push(writer);
     }
 
-    let commit_input: Arc<dyn ExecutionPlan> = if branches.len() == 1 {
-        branches.into_iter().next().unwrap()
-    } else {
-        let union: Arc<dyn ExecutionPlan> = UnionExec::try_new(branches)?;
-        Arc::new(CoalescePartitionsExec::new(union))
-    };
+    // IcebergCommitExec is single-partition; gather every writer partition's action batches
+    // first. With multiple format groups the writers are unioned, then coalesced.
+    let union: Arc<dyn ExecutionPlan> = UnionExec::try_new(branches)?;
+    let commit_input = Arc::new(CoalescePartitionsExec::new(union));
 
     Ok(Arc::new(IcebergCommitExec::new(
         commit_input,
@@ -302,11 +295,6 @@ fn build_fallback_scan(
     Ok(DataSourceExec::from_data_source(config))
 }
 
-/// The writer's parquet file size target (mirrors `IcebergWriterExec`'s
-/// `target_file_size: 134_217_728`). Used to size fallback load chunks so small source sets
-/// produce fewer, larger table files instead of tiny-file sprawl.
-const TARGET_FILE_SIZE_BYTES: u64 = 134_217_728;
-
 /// Infer the compression type of a source file from its extension.
 ///
 /// Mirrors `sail-data-source`'s `infer_listing_compression` but operates on a single
@@ -327,64 +315,9 @@ fn infer_source_compression(path: &str) -> CompressionTypeVariant {
     CompressionTypeVariant::UNCOMPRESSED
 }
 
-/// Split `count` items into `chunks` balanced groups; returns the size of each group
-/// (≥ 1). Used to bound fallback-writer branches to `target_partitions`.
-fn chunk_size_for(count: usize, chunks: usize) -> usize {
-    if chunks == 0 {
-        return count;
-    }
-    (count + chunks - 1) / chunks
-}
-
-/// Size-aware variant of [`chunk_size_for`]: choose a files-per-chunk count so each chunk
-/// accumulates roughly `target_bytes` worth of source bytes, capped at `max_chunks` writers.
-///
-/// Small total bytes → 1 chunk → one writer accumulates into fewer, larger parquet files
-/// (no tiny-file sprawl). Large totals → more chunks, bounded by `max_chunks`. Falls back to
-/// count-based chunking when sizes are unknown (total bytes == 0).
-fn chunk_size_for_bytes(sizes: &[u64], target_bytes: u64, max_chunks: usize) -> usize {
-    let count = sizes.len();
-    if count == 0 {
-        return 0;
-    }
-    let total: u64 = sizes.iter().sum();
-    if target_bytes == 0 || total == 0 {
-        return chunk_size_for(count, max_chunks);
-    }
-    let num_chunks = ((total + target_bytes - 1) / target_bytes).max(1) as usize;
-    let num_chunks = num_chunks.min(max_chunks.max(1));
-    chunk_size_for(count, num_chunks)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn chunk_size_for_bytes_collapses_small_sets_to_one_writer() {
-        // 15 tiny files (~1 KB each) → well under 128 MB → a single chunk.
-        let sizes = vec![1_000u64; 15];
-        assert_eq!(chunk_size_for_bytes(&sizes, TARGET_FILE_SIZE_BYTES, 16), 15);
-        // 15 small files of ~5 MB → 75 MB total, still under target → single chunk.
-        let sizes = vec![5_000_000u64; 15];
-        assert_eq!(chunk_size_for_bytes(&sizes, TARGET_FILE_SIZE_BYTES, 16), 15);
-    }
-
-    #[test]
-    fn chunk_size_for_bytes_splits_large_sets_but_caps_at_max_chunks() {
-        // 15 files of 128 MB → total 1.875 GB → ~15 chunks, capped at 4.
-        let sizes = vec![134_217_728u64; 15];
-        assert_eq!(chunk_size_for_bytes(&sizes, TARGET_FILE_SIZE_BYTES, 4), 4);
-        // 20 files of 64 MB → total 1.25 GB → ~10 chunks, capped at 4.
-        let sizes = vec![67_108_864u64; 20];
-        assert_eq!(chunk_size_for_bytes(&sizes, TARGET_FILE_SIZE_BYTES, 4), 5);
-    }
-
-    #[test]
-    fn chunk_size_for_bytes_falls_back_to_count_based_when_sizes_unknown() {
-        let sizes = vec![0u64; 10];
-        assert_eq!(chunk_size_for_bytes(&sizes, TARGET_FILE_SIZE_BYTES, 4), 3);
-    }
 
     #[test]
     fn infers_compression_from_extension() {
@@ -418,20 +351,5 @@ mod tests {
             infer_source_compression("s3a://bucket/data.parquet"),
             CompressionTypeVariant::UNCOMPRESSED
         );
-    }
-
-    #[test]
-    fn chunk_size_yields_one_per_file_for_small_counts() {
-        // N <= target_parts → per-file branches.
-        assert_eq!(chunk_size_for(3, 4), 1);
-        assert_eq!(chunk_size_for(4, 4), 1);
-    }
-
-    #[test]
-    fn chunk_size_bounds_branches_for_large_counts() {
-        // N > target_parts → ceil(N/K) items per chunk → at most K chunks.
-        assert_eq!(chunk_size_for(10, 4), 3); // 4 chunks: 3,3,3,1
-        assert_eq!(chunk_size_for(20, 4), 5); // 4 chunks of 5
-        assert_eq!(chunk_size_for(5, 4), 2); // 3 chunks: 2,2,1
     }
 }

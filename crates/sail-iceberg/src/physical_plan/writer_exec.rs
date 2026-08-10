@@ -20,6 +20,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_expr::{Distribution, EquivalenceProperties};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
@@ -65,6 +66,7 @@ pub struct IcebergWriterExec {
     table_exists: bool,
     options: IcebergWriterExecOptions,
     logical_input_schema: Option<SchemaRef>,
+    metrics: ExecutionPlanMetricsSet,
     cache: Arc<PlanProperties>,
 }
 
@@ -109,7 +111,8 @@ impl IcebergWriterExec {
                 Arc::new(datafusion::arrow::datatypes::Schema::empty())
             }
         };
-        let cache = Self::compute_properties(schema.clone());
+        let output_partitions = input.output_partitioning().partition_count().max(1);
+        let cache = Self::compute_properties(schema, output_partitions);
         Self {
             input,
             table_url,
@@ -118,14 +121,18 @@ impl IcebergWriterExec {
             table_exists,
             options,
             logical_input_schema,
+            metrics: ExecutionPlanMetricsSet::new(),
             cache,
         }
     }
 
-    fn compute_properties(schema: datafusion::arrow::datatypes::SchemaRef) -> Arc<PlanProperties> {
+    fn compute_properties(
+        schema: datafusion::arrow::datatypes::SchemaRef,
+        output_partitions: usize,
+    ) -> Arc<PlanProperties> {
         Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
-            Partitioning::UnknownPartitioning(1),
+            Partitioning::UnknownPartitioning(output_partitions.max(1)),
             EmissionType::Final,
             Boundedness::Bounded,
         ))
@@ -303,8 +310,31 @@ impl ExecutionPlan for IcebergWriterExec {
         &self.cache
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
+        if self.partition_columns.is_empty() {
+            // Upstream repartitioning controls file counts and small-file behavior.
+            return vec![Distribution::UnspecifiedDistribution];
+        }
+
+        // For partitioned tables, require grouping by the partition key so that each task can
+        // write its partitions correctly without opening many writers concurrently.
+        let mut exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> =
+            Vec::with_capacity(self.partition_columns.len());
+        for field in &self.partition_columns {
+            let idx = match self.input.schema().index_of(&field.column) {
+                Ok(i) => i,
+                Err(_) => return vec![Distribution::UnspecifiedDistribution],
+            };
+            exprs.push(Arc::new(
+                datafusion::physical_expr::expressions::Column::new(&field.column, idx),
+            ));
+        }
+
+        vec![Distribution::HashPartitioned(exprs)]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -334,18 +364,21 @@ impl ExecutionPlan for IcebergWriterExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return internal_err!("IcebergWriterExec can only be executed in a single partition");
+        let input_partitions = self.input.output_partitioning().partition_count();
+        if input_partitions == 0 {
+            return internal_err!("IcebergWriterExec requires at least one input partition");
         }
 
-        let input_partitions = self.input.output_partitioning().partition_count();
-        if input_partitions != 1 {
+        if partition >= input_partitions {
             return internal_err!(
-                "IcebergWriterExec requires exactly one input partition, got {input_partitions}"
+                "IcebergWriterExec invalid partition {partition} (input partitions: {input_partitions})"
             );
         }
+        let stream = self.input.execute(partition, Arc::clone(&context))?;
 
-        let stream = self.input.execute(0, Arc::clone(&context))?;
+        let output_rows = MetricBuilder::new(&self.metrics).output_rows(partition);
+        let output_bytes = MetricBuilder::new(&self.metrics).output_bytes(partition);
+        let elapsed_compute = MetricBuilder::new(&self.metrics).elapsed_compute(partition);
 
         let table_url = self.table_url.clone();
         let partition_columns = self.partition_columns.clone();
@@ -357,6 +390,7 @@ impl ExecutionPlan for IcebergWriterExec {
 
         let schema = self.schema();
         let future = async move {
+            let _elapsed_compute_timer = elapsed_compute.timer();
             match sink_mode {
                 PhysicalSinkMode::ErrorIfExists => {
                     if table_exists {
@@ -555,10 +589,14 @@ impl ExecutionPlan for IcebergWriterExec {
                 UnboundPartitionSpec { fields: vec![] }
             };
 
+            let compression = resolve_compression_codec(&options.compression_codec)?;
+            let writer_properties = WriterProperties::builder()
+                .set_compression(compression)
+                .build();
             let writer_config = WriterConfig {
                 table_schema: table_schema.clone(),
                 partition_columns: partition_columns.clone(),
-                writer_properties: WriterProperties::default(),
+                writer_properties,
                 target_file_size: 134_217_728,
                 write_batch_size: 32 * 1024,
                 num_indexed_cols: 32,
@@ -584,6 +622,8 @@ impl ExecutionPlan for IcebergWriterExec {
             while let Some(batch_result) = data.next().await {
                 let batch = batch_result?;
                 let batch_row_count = batch.num_rows();
+                output_rows.add(batch_row_count);
+                output_bytes.add(batch.get_array_memory_size());
                 total_rows += u64::try_from(batch_row_count).map_err(|e| {
                     DataFusionError::Execution(format!("Row count overflow: {}", e))
                 })?;
@@ -621,7 +661,7 @@ impl ExecutionPlan for IcebergWriterExec {
             let commit_meta = CommitMeta {
                 table_uri: table_url.to_string(),
                 row_count: total_rows,
-                operation: options.commit_operation.unwrap_or_else(|| {
+                operation: options.commit_operation.unwrap_or(
                     if matches!(
                         sink_mode,
                         PhysicalSinkMode::Overwrite
@@ -631,8 +671,8 @@ impl ExecutionPlan for IcebergWriterExec {
                         crate::spec::Operation::Overwrite
                     } else {
                         crate::spec::Operation::Append
-                    }
-                }),
+                    },
+                ),
                 requirements: commit_requirements,
                 table_properties: options.table_properties,
                 lakehouse_table: options.lakehouse_table,
@@ -678,5 +718,24 @@ impl DisplayAs for IcebergWriterExec {
                 write!(f, "table_path={}", self.table_url)
             }
         }
+    }
+}
+
+/// Resolve a compression-codec string to the parquet `Compression` enum.
+///
+/// Accepts the Spark/Iceberg codec names; `none`/`uncompressed` disable compression.
+fn resolve_compression_codec(codec: &str) -> Result<parquet::basic::Compression> {
+    use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
+    match codec.to_ascii_lowercase().as_str() {
+        "snappy" => Ok(Compression::SNAPPY),
+        "zstd" => Ok(Compression::ZSTD(ZstdLevel::default())),
+        "gzip" => Ok(Compression::GZIP(GzipLevel::default())),
+        "lz4" => Ok(Compression::LZ4_RAW),
+        "brotli" => Ok(Compression::BROTLI(BrotliLevel::default())),
+        "none" | "uncompressed" => Ok(Compression::UNCOMPRESSED),
+        other => Err(DataFusionError::Plan(format!(
+            "unsupported parquet compression codec '{other}' (expected one of: \
+             snappy, zstd, gzip, lz4, brotli, none, uncompressed)"
+        ))),
     }
 }

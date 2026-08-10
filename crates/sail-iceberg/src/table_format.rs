@@ -625,7 +625,6 @@ pub(crate) async fn plan_iceberg_write(
         mode,
         physical_sort,
         Some(logical_input_schema),
-        ctx,
     );
     builder.build().await
 }

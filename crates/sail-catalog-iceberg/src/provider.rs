@@ -1323,10 +1323,44 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             }
         }
 
-        if mode.is_replace() {
-            return Err(CatalogError::NotSupported(
-                "Replace table is not supported yet".to_string(),
-            ));
+        // `CREATE OR REPLACE` / `REPLACE` must drop the existing catalog registration
+        // (metadata + data with purge) before recreating, matching Spark semantics and the
+        // in-repo `MemoryCatalogProvider`. Plain `Replace` requires an existing table;
+        // `CreateOrReplace` on a missing table simply creates it.
+        let existing = match self.get_table(database, table).await {
+            Ok(status) => Some(status),
+            Err(CatalogError::NotFound(CatalogObject::Table, _)) => None,
+            Err(e) => return Err(e),
+        };
+        match (existing, mode) {
+            (Some(_), CreateTableMode::Create) => {
+                return Err(CatalogError::AlreadyExists(
+                    CatalogObject::Table,
+                    table.to_string(),
+                ));
+            }
+            (Some(_), CreateTableMode::CreateIfNotExists) => {
+                // Handled by the `ignore_if_exists` branch above; kept for exhaustiveness.
+                return Ok(self.get_table(database, table).await?);
+            }
+            (Some(_), CreateTableMode::CreateOrReplace | CreateTableMode::Replace) => {
+                self.drop_table(
+                    database,
+                    table,
+                    DropTableOptions {
+                        if_exists: true,
+                        purge: true,
+                    },
+                )
+                .await?;
+            }
+            (None, CreateTableMode::Replace) => {
+                return Err(CatalogError::NotFound(
+                    CatalogObject::Table,
+                    table.to_string(),
+                ));
+            }
+            (None, _) => {}
         }
 
         let format_version = requested_iceberg_format_version(&properties)?;
@@ -3513,6 +3547,147 @@ mod tests {
             .unwrap();
 
         assert_eq!(status.name, "table1");
+    }
+
+    fn create_table_response() -> serde_json::Value {
+        serde_json::json!({
+            "metadata-location": "s3://bucket/table/metadata/v1.metadata.json",
+            "metadata": {
+                "format-version": 2,
+                "table-uuid": "12345678-1234-1234-1234-123456789012",
+                "location": "s3://bucket/table",
+                "current-schema-id": 0,
+                "schemas": [
+                    {
+                        "type": "struct",
+                        "schema-id": 0,
+                        "fields": [
+                            {
+                                "id": 1,
+                                "name": "id",
+                                "required": true,
+                                "type": "long"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "config": {}
+        })
+    }
+
+    async fn mock_get_table_404(server: &MockServer, path_str: &str) {
+        Mock::given(method("GET"))
+            .and(path(path_str))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": {
+                    "message": "The given table does not exist",
+                    "type": "NoSuchTableException",
+                    "code": 404
+                }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn create_table_create_or_replace_on_missing_table_creates() {
+        let ctx = TestContext::new(Some("test")).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        // Existing-table probe returns NotFound.
+        mock_get_table_404(&ctx.server, &ctx.path("/namespaces/db1/tables/table1")).await;
+
+        ctx.mock_post_json(&ctx.path("/namespaces/db1/tables"), create_table_response())
+            .await;
+
+        let mut options = simple_create_table_options();
+        options.mode = CreateTableMode::CreateOrReplace;
+        options.is_write_precondition = false;
+        let status = ctx
+            .catalog
+            .create_table(&namespace, "table1", options)
+            .await
+            .unwrap();
+
+        assert_eq!(status.name, "table1");
+    }
+
+    #[tokio::test]
+    async fn create_table_create_or_replace_on_existing_table_drops_then_creates() {
+        let ctx = TestContext::new(Some("test")).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        // Existing-table probe returns the current table.
+        ctx.mock_load_table(
+            &ctx.path("/namespaces/db1/tables/table1"),
+            serde_json::json!({}),
+        )
+        .await;
+
+        // Drop the old registration (with purge), then create.
+        ctx.mock_delete(&ctx.path("/namespaces/db1/tables/table1"))
+            .await;
+        ctx.mock_post_json(&ctx.path("/namespaces/db1/tables"), create_table_response())
+            .await;
+
+        let mut options = simple_create_table_options();
+        options.mode = CreateTableMode::CreateOrReplace;
+        options.is_write_precondition = false;
+        let status = ctx
+            .catalog
+            .create_table(&namespace, "table1", options)
+            .await
+            .unwrap();
+
+        assert_eq!(status.name, "table1");
+    }
+
+    #[tokio::test]
+    async fn create_table_replace_on_missing_table_returns_not_found() {
+        let ctx = TestContext::new(Some("test")).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        mock_get_table_404(&ctx.server, &ctx.path("/namespaces/db1/tables/table1")).await;
+
+        let mut options = simple_create_table_options();
+        options.mode = CreateTableMode::Replace;
+        options.is_write_precondition = false;
+        let err = ctx
+            .catalog
+            .create_table(&namespace, "table1", options)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CatalogError::NotFound(CatalogObject::Table, _)
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_table_create_on_existing_table_returns_already_exists() {
+        let ctx = TestContext::new(Some("test")).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        // Existing-table probe returns the current table; `Create` must not drop or create.
+        ctx.mock_load_table(
+            &ctx.path("/namespaces/db1/tables/table1"),
+            serde_json::json!({}),
+        )
+        .await;
+
+        let options = simple_create_table_options();
+        let err = ctx
+            .catalog
+            .create_table(&namespace, "table1", options)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CatalogError::AlreadyExists(CatalogObject::Table, _)
+        ));
     }
 
     #[tokio::test]
