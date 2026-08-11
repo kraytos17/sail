@@ -244,6 +244,65 @@
     when using the `exponential_backoff` retry strategy.
   experimental: true
 
+- key: cluster.worker_spawn_retry_strategy.type
+  type: string
+  default: "fixed"
+  description: |
+    The retry strategy used when re-spawning a worker whose pod failed to start
+    (e.g. because it could not be scheduled due to insufficient resources).
+    A worker that never registers is failed after `worker_launch_timeout`, and a
+    replacement is only spawned after the configured retry delay. Valid values
+    are `fixed` and `exponential_backoff`.
+  experimental: true
+
+- key: cluster.worker_spawn_retry_strategy.fixed.max_count
+  type: number
+  default: "1"
+  description: |
+    The maximum number of re-spawn attempts for a worker
+    when using the `fixed` retry strategy.
+  experimental: true
+
+- key: cluster.worker_spawn_retry_strategy.fixed.delay_secs
+  type: number
+  default: "180"
+  description: |
+    The delay in seconds before re-spawning a worker
+    when using the `fixed` retry strategy.
+  experimental: true
+
+- key: cluster.worker_spawn_retry_strategy.exponential_backoff.max_count
+  type: number
+  default: "3"
+  description: |
+    The maximum number of re-spawn attempts for a worker
+    when using the `exponential_backoff` retry strategy.
+  experimental: true
+
+- key: cluster.worker_spawn_retry_strategy.exponential_backoff.initial_delay_secs
+  type: number
+  default: "60"
+  description: |
+    The initial delay in seconds before re-spawning a worker
+    when using the `exponential_backoff` retry strategy.
+  experimental: true
+
+- key: cluster.worker_spawn_retry_strategy.exponential_backoff.max_delay_secs
+  type: number
+  default: "180"
+  description: |
+    The maximum delay in seconds between re-spawn attempts
+    when using the `exponential_backoff` retry strategy.
+  experimental: true
+
+- key: cluster.worker_spawn_retry_strategy.exponential_backoff.factor
+  type: number
+  default: "2"
+  description: |
+    The factor by which the delay increases after each re-spawn attempt
+    when using the `exponential_backoff` retry strategy.
+  experimental: true
+
 - key: execution.batch_size
   type: number
   default: "8192"

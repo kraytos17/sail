@@ -44,9 +44,10 @@ impl DriverActor {
         };
         info!("driver server is ready on port {port}");
         self.worker_pool.set_driver_server_port(port);
-        for _ in 0..self.options.worker_initial_count {
-            self.worker_pool.start_worker(ctx);
-        }
+        // Pre-spawn `worker_initial_count` workers, charged against `worker_max_count`
+        // via the task assigner's `Pending` tracking so they cannot push the fleet
+        // past the configured cap.
+        self.spawn_initial_workers(ctx);
         ActorAction::Continue
     }
 
@@ -96,9 +97,34 @@ impl DriverActor {
         worker_id: WorkerId,
     ) -> ActorAction {
         if self.worker_pool.fail_worker_if_pending(worker_id) {
-            self.task_assigner.track_worker_failed_to_start();
-            self.scale_up_workers(ctx);
+            self.task_assigner.track_worker_failed_to_start(worker_id);
+            // Delete the failed pod so it does not linger in the cluster in a
+            // `Pending` (e.g. `Insufficient cpu`) state until the pool is closed.
+            let manager = Arc::clone(&self.worker_manager);
+            ctx.spawn(async move {
+                if let Err(e) = manager.delete_worker(worker_id).await {
+                    warn!("failed to delete worker {worker_id}: {e}");
+                }
+            });
+            // The worker pod failed to start (e.g. it could not be scheduled due to
+            // insufficient resources). Re-spawning an identical replacement right away
+            // would likely fail again and churn pods every launch timeout. Instead,
+            // back off using the spawn retry strategy and only scale up again once a
+            // retry delay elapses; when the retries are exhausted we stop re-spawning
+            // entirely and let pending tasks fail via the scheduling timeout.
+            if let Some(delay) = self.worker_pool.next_spawn_retry_delay() {
+                ctx.send_with_delay(DriverEvent::RetryWorkerSpawn, delay);
+            }
         }
+        ActorAction::Continue
+    }
+
+    pub(super) fn handle_retry_worker_spawn(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+    ) -> ActorAction {
+        self.worker_pool.fire_spawn_retry();
+        self.scale_up_workers(ctx);
         ActorAction::Continue
     }
 
@@ -108,7 +134,12 @@ impl DriverActor {
         worker_id: WorkerId,
         instant: Instant,
     ) -> ActorAction {
-        if self.task_assigner.is_worker_idle(worker_id)
+        // Do not reap a worker while there is queued work it could take, or while the
+        // pool is mid-scale-up: a pending worker may still register and use this
+        // worker's vacant slots, so reaping now would only waste the spawn.
+        if self.task_assigner.is_task_queue_empty()
+            && !self.worker_pool.has_pending_workers()
+            && self.task_assigner.is_worker_idle(worker_id)
             && self
                 .worker_pool
                 .get_worker_last_update(worker_id)
@@ -270,7 +301,8 @@ impl DriverActor {
             // pending worker takes to register or be failed, so once the last
             // pending worker resolves the task fails promptly instead of waiting
             // another full launch window.
-            if self.worker_pool.has_pending_workers() {
+            if self.worker_pool.has_pending_workers() || self.worker_pool.has_pending_spawn_retry()
+            {
                 let delay = self
                     .options
                     .worker_launch_timeout
@@ -574,8 +606,28 @@ impl DriverActor {
     }
 
     fn scale_up_workers(&mut self, ctx: &mut ActorContext<Self>) {
-        for _ in 0..self.task_assigner.request_workers() {
-            self.worker_pool.start_worker(ctx);
+        let count = self.task_assigner.request_workers();
+        self.spawn_workers(ctx, count);
+    }
+
+    /// Pre-spawns `worker_initial_count` workers at session start (ignores the task
+    /// queue, which is empty at startup), capped by `worker_max_count`.
+    fn spawn_initial_workers(&mut self, ctx: &mut ActorContext<Self>) {
+        let count = self.task_assigner.request_initial_workers();
+        self.spawn_workers(ctx, count);
+    }
+
+    /// Reserves worker ids from the pool, marks them `Pending` in the task assigner
+    /// (so they are charged against `worker_max_count`), then launches the pods.
+    fn spawn_workers(&mut self, ctx: &mut ActorContext<Self>, count: usize) {
+        let Ok(ids) = self.worker_pool.reserve_worker_ids(count) else {
+            error!("failed to reserve worker IDs");
+            ctx.send(DriverEvent::Shutdown { history: None });
+            return;
+        };
+        for worker_id in ids {
+            self.task_assigner.add_pending_worker(worker_id);
+            self.worker_pool.start_worker_with_id(ctx, worker_id);
         }
     }
 

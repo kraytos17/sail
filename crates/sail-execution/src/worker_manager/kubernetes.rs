@@ -222,6 +222,17 @@ impl KubernetesWorkerManager {
     }
 }
 
+impl KubernetesWorkerManager {
+    /// The name of the pod for the given worker id. Shared by launch and delete
+    /// so a reaped worker is always deleted under the same name it was created.
+    fn worker_pod_name(&self, id: WorkerId) -> String {
+        format!(
+            "{}{}-{}",
+            self.options.worker_pod_name_prefix, self.name, id
+        )
+    }
+}
+
 #[tonic::async_trait]
 impl WorkerManager for KubernetesWorkerManager {
     async fn launch_worker(
@@ -229,10 +240,7 @@ impl WorkerManager for KubernetesWorkerManager {
         id: WorkerId,
         options: WorkerLaunchOptions,
     ) -> ExecutionResult<()> {
-        let name = format!(
-            "{}{}-{}",
-            self.options.worker_pod_name_prefix, self.name, id
-        );
+        let name = self.worker_pod_name(id);
         let mut spec = PodSpec {
             containers: vec![Container {
                 name: "worker".to_string(),
@@ -280,6 +288,13 @@ impl WorkerManager for KubernetesWorkerManager {
         Ok(())
     }
 
+    async fn delete_worker(&self, id: WorkerId) -> ExecutionResult<()> {
+        let name = self.worker_pod_name(id);
+        let pp = Default::default();
+        self.pods().await?.delete(&name, &pp).await?;
+        Ok(())
+    }
+
     async fn stop(&self) -> ExecutionResult<()> {
         self.pods()
             .await?
@@ -296,6 +311,27 @@ impl WorkerManager for KubernetesWorkerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_worker_pod_name_matches_launch_naming() {
+        let manager = KubernetesWorkerManager {
+            name: "test-manager".to_string(),
+            options: KubernetesWorkerManagerOptions {
+                image: "sail:latest".to_string(),
+                image_pull_policy: "IfNotPresent".to_string(),
+                namespace: "sail".to_string(),
+                driver_pod_name: "driver".to_string(),
+                worker_pod_name_prefix: "sail-worker-".to_string(),
+                worker_service_account_name: "sail-user".to_string(),
+                worker_pod_template: String::new(),
+            },
+            pods: OnceCell::new(),
+        };
+        assert_eq!(
+            manager.worker_pod_name(WorkerId::from(42)),
+            "sail-worker-test-manager-42"
+        );
+    }
 
     #[test]
     #[expect(clippy::unwrap_used)]

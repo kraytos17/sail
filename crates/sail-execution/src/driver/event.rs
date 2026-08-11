@@ -42,6 +42,9 @@ pub enum DriverEvent {
     ProbePendingWorker {
         worker_id: WorkerId,
     },
+    /// Triggered after the spawn retry delay when a worker pod failed to start,
+    /// to re-attempt scaling up the worker pool.
+    RetryWorkerSpawn,
     ProbeIdleWorker {
         worker_id: WorkerId,
         instant: Instant,
@@ -159,6 +162,7 @@ impl SpanAssociation for DriverEvent {
             DriverEvent::WorkerHeartbeat { .. } => "WorkerHeartbeat",
             DriverEvent::WorkerKnownPeers { .. } => "WorkerKnownPeers",
             DriverEvent::ProbePendingWorker { .. } => "ProbePendingWorker",
+            DriverEvent::RetryWorkerSpawn => "RetryWorkerSpawn",
             DriverEvent::ProbeIdleWorker { .. } => "ProbeIdleWorker",
             DriverEvent::ProbeLostWorker { .. } => "ProbeLostWorker",
             DriverEvent::ExecuteJob { .. } => "ExecuteJob",
@@ -376,6 +380,7 @@ impl SpanAssociation for DriverEvent {
                 p.push((SpanAttribute::EXECUTION_STREAM_REMOTE_URI, uri.clone()));
             }
             DriverEvent::ObserveState { observer: _ } => {}
+            DriverEvent::RetryWorkerSpawn => {}
             DriverEvent::Shutdown { .. } => {}
         }
         p.into_iter().map(|(k, v)| (k.into(), v.into()))

@@ -16,6 +16,12 @@ pub trait WorkerManager: Send + Sync + 'static {
         options: WorkerLaunchOptions,
     ) -> ExecutionResult<()>;
 
+    /// Delete a single worker that failed to start or has been reaped.
+    /// This is used to clean up a pod that never registered (e.g. stuck in
+    /// `Pending` because it could not be scheduled), which would otherwise linger
+    /// in the cluster until [`WorkerManager::stop`].
+    async fn delete_worker(&self, id: WorkerId) -> ExecutionResult<()>;
+
     /// Stop all workers on a best-effort basis.
     /// The driver have attempted to sent shutdown events to all workers
     /// at this point, but it is unknown whether the events have been received.

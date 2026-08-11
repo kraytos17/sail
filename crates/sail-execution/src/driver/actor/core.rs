@@ -24,6 +24,7 @@ impl Actor for DriverActor {
     }
 
     fn new(options: DriverOptions) -> Self {
+        let worker_manager = options.worker_manager.clone();
         let worker_pool = WorkerPool::new(
             options.worker_manager.clone(),
             WorkerPoolOptions::from(&options),
@@ -35,6 +36,7 @@ impl Actor for DriverActor {
             options,
             server: ServerMonitor::new(),
             worker_pool,
+            worker_manager,
             job_scheduler,
             task_assigner,
             task_runner: TaskRunner::new(),
@@ -77,6 +79,7 @@ impl Actor for DriverActor {
             DriverEvent::ProbePendingWorker { worker_id } => {
                 self.handle_probe_pending_worker(ctx, worker_id)
             }
+            DriverEvent::RetryWorkerSpawn => self.handle_retry_worker_spawn(ctx),
             DriverEvent::ProbeIdleWorker { worker_id, instant } => {
                 self.handle_probe_idle_worker(ctx, worker_id, instant)
             }

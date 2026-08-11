@@ -74,6 +74,10 @@ impl DriverResource {
 #[derive(Debug)]
 /// Represents the current state of a worker's resources as seen by the task assigner.
 pub enum WorkerResource {
+    /// A worker whose spawn was requested but which has not yet registered.
+    /// It consumes the `worker_max_count` budget (via `total_live_worker_count`)
+    /// but has no slots yet, so it is never assigned tasks or streams.
+    Pending,
     Active {
         /// The task slots on the worker.
         task_slots: Vec<TaskSlot>,
@@ -92,7 +96,6 @@ pub enum WorkerResource {
         /// active remote task streams stored in object storage.
         local_streams: IndexSet<TaskKey>,
     },
-    Inactive,
 }
 
 impl WorkerResource {
@@ -106,8 +109,8 @@ impl WorkerResource {
                     warn!("invalid task slot {slot} on worker");
                 }
             }
-            WorkerResource::Inactive => {
-                warn!("cannot add tasks to inactive worker");
+            WorkerResource::Pending => {
+                warn!("cannot add tasks to pending worker");
             }
         }
     }
@@ -122,8 +125,8 @@ impl WorkerResource {
                     false
                 }
             }
-            WorkerResource::Inactive => {
-                warn!("cannot remove tasks from inactive worker");
+            WorkerResource::Pending => {
+                warn!("cannot remove tasks from pending worker");
                 false
             }
         }
@@ -134,8 +137,8 @@ impl WorkerResource {
             WorkerResource::Active { local_streams, .. } => {
                 local_streams.extend(set.local_streams().cloned());
             }
-            WorkerResource::Inactive => {
-                warn!("cannot track local streams on inactive worker");
+            WorkerResource::Pending => {
+                warn!("cannot track local streams on pending worker");
             }
         }
     }
@@ -151,8 +154,8 @@ impl WorkerResource {
                 }
                 count != local_streams.len()
             }
-            WorkerResource::Inactive => {
-                warn!("cannot untrack local streams from inactive worker");
+            WorkerResource::Pending => {
+                warn!("cannot untrack local streams from pending worker");
                 false
             }
         }

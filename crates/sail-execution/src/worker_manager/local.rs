@@ -54,6 +54,14 @@ impl WorkerManager for LocalWorkerManager {
         Ok(())
     }
 
+    async fn delete_worker(&self, id: WorkerId) -> ExecutionResult<()> {
+        // Dropping the last `ActorHandle` closes the actor's message channel, which
+        // makes the worker actor terminate its receive loop.
+        let mut state = self.state.lock().await;
+        state.workers.remove(&id);
+        Ok(())
+    }
+
     async fn stop(&self) -> ExecutionResult<()> {
         let mut state = self.state.lock().await;
         state.system.join().await;

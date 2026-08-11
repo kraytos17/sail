@@ -67,7 +67,7 @@ impl RetryStrategy {
         }
     }
 
-    fn delay(&self) -> Box<dyn Iterator<Item = Duration> + Send> {
+    pub fn delay(&self) -> Box<dyn Iterator<Item = Duration> + Send> {
         match self {
             Self::ExponentialBackoff {
                 max_count,

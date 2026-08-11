@@ -3,6 +3,7 @@ mod handler;
 mod rpc;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use sail_common_datafusion::session::job::JobRunnerHistory;
 use tokio::sync::oneshot;
@@ -13,11 +14,13 @@ use crate::id::TaskKey;
 use crate::rpc::ServerMonitor;
 use crate::stream_manager::StreamManager;
 use crate::task_runner::TaskRunner;
+use crate::worker_manager::WorkerManager;
 
 pub struct DriverActor {
     options: super::options::DriverOptions,
     server: ServerMonitor,
     worker_pool: super::worker_pool::WorkerPool,
+    worker_manager: Arc<dyn WorkerManager>,
     job_scheduler: JobScheduler,
     task_assigner: TaskAssigner,
     task_runner: TaskRunner,

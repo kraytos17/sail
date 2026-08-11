@@ -41,12 +41,11 @@ impl WorkerPool {
         self.driver_server_port = Some(port);
     }
 
-    pub fn start_worker(&mut self, ctx: &mut ActorContext<DriverActor>) {
-        let Ok(worker_id) = self.worker_id_generator.next() else {
-            error!("failed to generate worker ID");
-            ctx.send(DriverEvent::Shutdown { history: None });
-            return;
-        };
+    pub fn start_worker_with_id(
+        &mut self,
+        ctx: &mut ActorContext<DriverActor>,
+        worker_id: WorkerId,
+    ) {
         let descriptor = WorkerDescriptor {
             state: WorkerState::Pending,
             messages: vec![],
@@ -102,34 +101,42 @@ impl WorkerPool {
         host: String,
         port: u16,
     ) -> ExecutionResult<()> {
-        let Some(worker) = self.workers.get_mut(&worker_id) else {
-            return Err(ExecutionError::InvalidArgument(format!(
-                "worker {worker_id} not found"
-            )));
-        };
-        match worker.state {
-            WorkerState::Pending => {
-                worker.state = WorkerState::Running {
-                    host,
-                    port,
-                    updated_at: Instant::now(),
-                    heartbeat_at: Instant::now(),
-                    client: None,
-                };
-                Self::schedule_lost_worker_probe(ctx, worker_id, worker, &self.options);
-                Self::schedule_idle_worker_probe(ctx, worker_id, worker, &self.options);
-                Ok(())
+        let mut reset_spawn_retry = false;
+        let out = {
+            let Some(worker) = self.workers.get_mut(&worker_id) else {
+                return Err(ExecutionError::InvalidArgument(format!(
+                    "worker {worker_id} not found"
+                )));
+            };
+            match worker.state {
+                WorkerState::Pending => {
+                    worker.state = WorkerState::Running {
+                        host,
+                        port,
+                        updated_at: Instant::now(),
+                        heartbeat_at: Instant::now(),
+                        client: None,
+                    };
+                    reset_spawn_retry = true;
+                    Self::schedule_lost_worker_probe(ctx, worker_id, worker, &self.options);
+                    Self::schedule_idle_worker_probe(ctx, worker_id, worker, &self.options);
+                    Ok(())
+                }
+                WorkerState::Running { .. } => Err(ExecutionError::InternalError(format!(
+                    "worker {worker_id} is already running"
+                ))),
+                WorkerState::Completed => Err(ExecutionError::InternalError(format!(
+                    "worker {worker_id} has completed"
+                ))),
+                WorkerState::Failed => Err(ExecutionError::InternalError(format!(
+                    "worker {worker_id} has failed"
+                ))),
             }
-            WorkerState::Running { .. } => Err(ExecutionError::InternalError(format!(
-                "worker {worker_id} is already running"
-            ))),
-            WorkerState::Completed => Err(ExecutionError::InternalError(format!(
-                "worker {worker_id} has completed"
-            ))),
-            WorkerState::Failed => Err(ExecutionError::InternalError(format!(
-                "worker {worker_id} has failed"
-            ))),
+        };
+        if reset_spawn_retry {
+            self.reset_spawn_retry();
         }
+        out
     }
 
     pub fn stop_worker(
