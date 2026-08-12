@@ -2,6 +2,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use arrow_flight::flight_service_client::FlightServiceClient;
+use sail_common::runtime::RuntimeHandle;
 use sail_telemetry::layers::{TracingClientLayer, TracingClientService};
 use tokio::sync::{oneshot, OnceCell};
 use tokio::task::JoinHandle;
@@ -39,11 +40,12 @@ impl ServerMonitor {
 
     pub async fn start(
         self,
+        handle: tokio::runtime::Handle,
         f: impl Future<Output = ExecutionResult<()>> + Send + 'static,
     ) -> Self {
         self.stop().await;
         Self::Pending {
-            handle: tokio::spawn(f),
+            handle: handle.spawn(f),
         }
     }
 
@@ -75,6 +77,10 @@ pub struct ClientOptions {
     pub enable_tls: bool,
     pub host: String,
     pub port: u16,
+    /// The runtime on which the connection task for the gRPC client runs.
+    /// This should be the `io` runtime so that control-plane keep-alive pings
+    /// are not starved by CPU-bound execution on the `primary` runtime.
+    pub runtime: RuntimeHandle,
 }
 
 impl ClientOptions {
@@ -96,16 +102,39 @@ pub trait ClientBuilder: Sized {
 /// If the header list size is larger than the allowed size, the error details would be
 /// dropped silently.
 const CLIENT_MAX_HEADER_LIST_SIZE: u32 = 1024 * 1024;
+/// The timeout for establishing a connection to the server.
+/// The default Tonic timeout is infinite, which can hang a worker or driver forever
+/// when the peer is unreachable.
+const CLIENT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// The TCP keep-alive interval for client connections.
+const CLIENT_TCP_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(60);
+/// The interval between HTTP/2 keep-alive pings sent by the client.
+/// This keeps idle connections alive and detects dead peers promptly.
+const CLIENT_HTTP2_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// The timeout for HTTP/2 keep-alive ping acknowledgements on the client.
+const CLIENT_HTTP2_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 macro_rules! impl_client_builder {
     ($client_type:ty) => {
         #[tonic::async_trait]
         impl ClientBuilder for $client_type {
             async fn connect(options: &ClientOptions) -> ExecutionResult<Self> {
-                let channel = tonic::transport::Endpoint::new(options.to_url_string())?
+                let endpoint = tonic::transport::Endpoint::new(options.to_url_string())?
                     .http2_max_header_list_size(CLIENT_MAX_HEADER_LIST_SIZE)
-                    .connect()
-                    .await?;
+                    .connect_timeout(CLIENT_CONNECT_TIMEOUT)
+                    .tcp_keepalive(Some(CLIENT_TCP_KEEPALIVE))
+                    .http2_keep_alive_interval(CLIENT_HTTP2_KEEPALIVE_INTERVAL)
+                    .keep_alive_timeout(CLIENT_HTTP2_KEEPALIVE_TIMEOUT)
+                    .keep_alive_while_idle(true);
+                // The HTTP/2 connection task (and therefore the keep-alive ping handling)
+                // is spawned by Tonic via `tokio::spawn` inside the `connect` future.
+                // Awaiting it on the `io` runtime ensures the control-plane connection
+                // is never starved by CPU-bound execution on the `primary` runtime.
+                let channel = options
+                    .runtime
+                    .io()
+                    .spawn(async move { endpoint.connect().await })
+                    .await??;
                 let channel = ServiceBuilder::new()
                     .layer(TracingClientLayer)
                     .service(channel);

@@ -19,6 +19,8 @@ pub struct WorkerOptions {
     pub worker_external_host: String,
     pub worker_external_port: u16,
     pub worker_heartbeat_interval: Duration,
+    pub http2_keepalive_interval: Duration,
+    pub http2_keepalive_timeout: Duration,
     pub task_stream_buffer: usize,
     pub task_stream_creation_timeout: Duration,
     pub rpc_retry_strategy: RetryStrategy,
@@ -43,6 +45,12 @@ impl WorkerOptions {
             worker_external_port: config.cluster.worker_external_port,
             worker_heartbeat_interval: Duration::from_secs(
                 config.cluster.worker_heartbeat_interval_secs,
+            ),
+            http2_keepalive_interval: Duration::from_secs(
+                config.cluster.http2_keepalive_interval_secs,
+            ),
+            http2_keepalive_timeout: Duration::from_secs(
+                config.cluster.http2_keepalive_timeout_secs,
             ),
             task_stream_buffer: config.cluster.task_stream_buffer,
             task_stream_creation_timeout: Duration::from_secs(
@@ -70,6 +78,8 @@ impl WorkerOptions {
             worker_external_host: "127.0.0.1".to_string(),
             worker_external_port: 0,
             worker_heartbeat_interval: options.worker_heartbeat_interval,
+            http2_keepalive_interval: options.http2_keepalive_interval,
+            http2_keepalive_timeout: options.http2_keepalive_timeout,
             task_stream_buffer: options.task_stream_buffer,
             task_stream_creation_timeout: options.task_stream_creation_timeout,
             rpc_retry_strategy: options.rpc_retry_strategy,

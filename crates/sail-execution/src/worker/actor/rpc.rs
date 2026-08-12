@@ -1,7 +1,7 @@
 use arrow_flight::flight_service_server::FlightServiceServer;
 use sail_common::config::GRPC_MAX_MESSAGE_LENGTH_DEFAULT;
 use sail_server::actor::ActorHandle;
-use sail_server::ServerBuilder;
+use sail_server::{ServerBuilder, ServerBuilderOptions};
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::sync::oneshot::Sender;
 use tonic::async_trait;
@@ -41,6 +41,7 @@ impl WorkerActor {
     pub(super) async fn serve(
         handle: ActorHandle<WorkerActor>,
         addr: impl ToSocketAddrs,
+        options: ServerBuilderOptions,
     ) -> ExecutionResult<()> {
         let listener = TcpListener::bind(addr).await?;
         let port = listener.local_addr()?.port();
@@ -68,7 +69,7 @@ impl WorkerActor {
             .send(WorkerEvent::ServerReady { port, signal: tx })
             .await?;
 
-        ServerBuilder::new("sail_worker", Default::default())
+        ServerBuilder::new("sail_worker", options)
             .add_service(service, Some(crate::worker::gen::FILE_DESCRIPTOR_SET))
             .await
             .add_service(flight_service, None)

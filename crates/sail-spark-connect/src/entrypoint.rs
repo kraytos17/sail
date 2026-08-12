@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use sail_common::config::{AppConfig, GRPC_MAX_MESSAGE_LENGTH_DEFAULT};
 use sail_common::runtime::RuntimeHandle;
-use sail_server::ServerBuilder;
+use sail_server::{ServerBuilder, ServerBuilderOptions};
 pub use sail_session::session_manager::SessionManagerOptions;
 use tokio::net::TcpListener;
 use tonic::codec::CompressionEncoding;
@@ -22,6 +22,7 @@ pub async fn serve<F>(
 where
     F: Future<Output = ()>,
 {
+    let options = ServerBuilderOptions::from(&config.cluster);
     let session_manager = create_spark_session_manager(config, runtime)?;
     let server = SparkConnectServer::new(session_manager);
     let service = SparkConnectServiceServer::new(server)
@@ -32,7 +33,7 @@ where
         .accept_compressed(CompressionEncoding::Zstd)
         .send_compressed(CompressionEncoding::Gzip)
         .send_compressed(CompressionEncoding::Zstd);
-    ServerBuilder::new("sail_spark_connect", Default::default())
+    ServerBuilder::new("sail_spark_connect", options)
         .add_service(service, Some(crate::spark::connect::FILE_DESCRIPTOR_SET))
         .await
         .serve(listener, signal)

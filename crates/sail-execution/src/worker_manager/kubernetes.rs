@@ -116,6 +116,8 @@ impl KubernetesWorkerManager {
             driver_external_host,
             driver_external_port,
             worker_heartbeat_interval,
+            http2_keepalive_interval,
+            http2_keepalive_timeout,
             task_stream_buffer,
             task_stream_creation_timeout,
             rpc_retry_strategy,
@@ -193,6 +195,16 @@ impl KubernetesWorkerManager {
             EnvVar {
                 name: ClusterConfigEnv::WORKER_HEARTBEAT_INTERVAL_SECS.to_string(),
                 value: Some(worker_heartbeat_interval.as_secs().to_string()),
+                value_from: None,
+            },
+            EnvVar {
+                name: ClusterConfigEnv::HTTP2_KEEPALIVE_INTERVAL_SECS.to_string(),
+                value: Some(http2_keepalive_interval.as_secs().to_string()),
+                value_from: None,
+            },
+            EnvVar {
+                name: ClusterConfigEnv::HTTP2_KEEPALIVE_TIMEOUT_SECS.to_string(),
+                value: Some(http2_keepalive_timeout.as_secs().to_string()),
                 value_from: None,
             },
             EnvVar {

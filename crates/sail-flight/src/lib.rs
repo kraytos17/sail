@@ -24,11 +24,12 @@ pub async fn serve<F>(
 where
     F: Future<Output = ()>,
 {
+    let options = ServerBuilderOptions::from(&config.cluster);
     let session_manager = create_flight_session_manager(config, runtime)?;
     let service = SailFlightSqlService::new(session_manager);
     let flight_service = FlightServiceServer::new(service);
 
-    let builder = ServerBuilder::new("flight_sql", ServerBuilderOptions::default())
+    let builder = ServerBuilder::new("flight_sql", options)
         .add_service(flight_service, None)
         .await;
 

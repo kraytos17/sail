@@ -541,7 +541,26 @@ impl IcebergTableProvider {
     /// Aggregate table-level statistics from a list of Iceberg data files
     fn aggregate_statistics(&self, data_files: &[DataFile]) -> Statistics {
         if data_files.is_empty() {
-            return Statistics::new_unknown(&self.arrow_schema);
+            // An empty scan produces exactly zero rows. Reporting exact `0` (instead
+            // of unknown) lets the DataFusion `AggregateStatistics` optimizer fold
+            // `COUNT(*)` to `0` without scanning, which avoids spawning workers for a
+            // query that reads nothing. This mirrors the delta-lake empty-file stats
+            // (`aggregate_table_stats_from_files`) and `EmptyExec` behavior.
+            let column_statistics = (0..self.arrow_schema.fields().len())
+                .map(|_| ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    max_value: Precision::Absent,
+                    min_value: Precision::Absent,
+                    distinct_count: Precision::Absent,
+                    sum_value: Precision::Absent,
+                    byte_size: Precision::Absent,
+                })
+                .collect();
+            return Statistics {
+                num_rows: Precision::Exact(0),
+                total_byte_size: Precision::Exact(0),
+                column_statistics,
+            };
         }
 
         let mut total_rows: usize = 0;
@@ -1212,5 +1231,75 @@ impl IcebergTableProvider {
         );
 
         Ok(scan_exec)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{NestedField, PrimitiveType, Schema, Type};
+
+    fn provider_with_schema() -> IcebergTableProvider {
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![Arc::new(NestedField::optional(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("build schema");
+        IcebergTableProvider::new_empty("s3://bucket/tbl".to_string(), schema, vec![], 0)
+            .expect("create provider")
+    }
+
+    #[test]
+    fn aggregate_statistics_empty_data_files_reports_zero_rows() {
+        let provider = provider_with_schema();
+        let stats = provider.aggregate_statistics(&[]);
+
+        assert_eq!(stats.num_rows, Precision::Exact(0));
+        assert_eq!(stats.total_byte_size, Precision::Exact(0));
+        // One column per schema field, each with exactly zero nulls and no
+        // min/max bounds (an empty scan has no values).
+        assert_eq!(stats.column_statistics.len(), 1);
+        assert_eq!(stats.column_statistics[0].null_count, Precision::Exact(0));
+        assert_eq!(stats.column_statistics[0].min_value, Precision::Absent);
+        assert_eq!(stats.column_statistics[0].max_value, Precision::Absent);
+    }
+
+    #[test]
+    fn aggregate_statistics_non_empty_data_files_are_aggregated() {
+        use crate::spec::manifest::{DataContentType, DataFileFormat};
+
+        let provider = provider_with_schema();
+        let data_file = DataFile {
+            content: DataContentType::Data,
+            file_path: "s3://bucket/tbl/data/part.parquet".to_string(),
+            file_format: DataFileFormat::Parquet,
+            partition: vec![],
+            record_count: 100,
+            file_size_in_bytes: 1024,
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            block_size_in_bytes: None,
+            key_metadata: None,
+            split_offsets: vec![],
+            equality_ids: vec![],
+            sort_order_id: None,
+            first_row_id: None,
+            partition_spec_id: 0,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
+        let stats = provider.aggregate_statistics(&[data_file]);
+
+        assert_eq!(stats.num_rows, Precision::Exact(100));
+        assert_eq!(stats.total_byte_size, Precision::Exact(1024));
     }
 }

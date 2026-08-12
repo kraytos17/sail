@@ -82,6 +82,8 @@ impl WorkerPool {
                 port
             },
             worker_heartbeat_interval: self.options.worker_heartbeat_interval,
+            http2_keepalive_interval: self.options.http2_keepalive_interval,
+            http2_keepalive_timeout: self.options.http2_keepalive_timeout,
             task_stream_buffer: self.options.task_stream_buffer,
             task_stream_creation_timeout: self.options.task_stream_creation_timeout,
             rpc_retry_strategy: self.options.rpc_retry_strategy.clone(),
@@ -442,6 +444,7 @@ impl WorkerPool {
                         enable_tls: options.enable_tls,
                         host: host.clone(),
                         port: *port,
+                        runtime: options.runtime.clone(),
                     };
                     WorkerClientSet::new(options)
                 });

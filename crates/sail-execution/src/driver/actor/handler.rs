@@ -187,8 +187,8 @@ impl DriverActor {
             let job_ids = keys.iter().map(|k| k.job_id).collect::<HashSet<_>>();
             for job_id in job_ids {
                 self.refresh_job(ctx, job_id);
-                self.run_tasks(ctx);
                 self.scale_up_workers(ctx);
+                self.run_tasks(ctx);
             }
         }
         ActorAction::Continue
@@ -204,8 +204,8 @@ impl DriverActor {
         let out = self.job_scheduler.accept_job(ctx, plan, context);
         if let Ok((job_id, _)) = &out {
             self.refresh_job(ctx, *job_id);
-            self.run_tasks(ctx);
             self.scale_up_workers(ctx);
+            self.run_tasks(ctx);
         }
         let _ = result.send(out.map(|(_, stream)| stream));
         ActorAction::Continue
@@ -252,8 +252,8 @@ impl DriverActor {
                     .update_task(&key, TaskState::Succeeded, message, cause);
                 self.task_assigner.unassign_task(&key);
                 self.refresh_job(ctx, key.job_id);
-                self.run_tasks(ctx);
                 self.scale_up_workers(ctx);
+                self.run_tasks(ctx);
             }
             TaskStatus::Failed => {
                 // Some canceled tasks may report failed status due to closed streams,
@@ -262,8 +262,8 @@ impl DriverActor {
                     .update_task(&key, TaskState::Failed, message, cause);
                 self.task_assigner.unassign_task(&key);
                 self.refresh_job(ctx, key.job_id);
-                self.run_tasks(ctx);
                 self.scale_up_workers(ctx);
+                self.run_tasks(ctx);
             }
             TaskStatus::Canceled => {
                 // The task attempt state should already be "canceled" but we update it

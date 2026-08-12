@@ -48,6 +48,7 @@ impl PeerTracker {
                 enable_tls: self.options.enable_tls,
                 host: peer.host.clone(),
                 port: peer.port,
+                runtime: self.options.runtime.clone(),
             };
             WorkerClientSet::new(options)
         });

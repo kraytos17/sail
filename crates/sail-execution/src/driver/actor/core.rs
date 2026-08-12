@@ -5,6 +5,7 @@ use fastrace::future::FutureExt;
 use fastrace::Span;
 use log::{error, info};
 use sail_server::actor::{Actor, ActorAction, ActorContext};
+use sail_server::ServerBuilderOptions;
 
 use crate::driver::job_scheduler::{JobScheduler, JobSchedulerOptions};
 use crate::driver::task_assigner::{TaskAssigner, TaskAssignerOptions};
@@ -53,8 +54,15 @@ impl Actor for DriverActor {
         );
         let server = mem::take(&mut self.server);
         let span = Span::enter_with_local_parent("DriverActor::serve");
+        let options = ServerBuilderOptions::from_keepalive(
+            Some(self.options.http2_keepalive_interval),
+            Some(self.options.http2_keepalive_timeout),
+        );
         self.server = server
-            .start(Self::serve(ctx.handle().clone(), addr).in_span(span))
+            .start(
+                self.options.runtime.io().clone(),
+                Self::serve(ctx.handle().clone(), addr, options).in_span(span),
+            )
             .await;
     }
 

@@ -159,6 +159,16 @@
   default: "120"
   description: The timeout in seconds for launching a worker.
 
+- key: cluster.http2_keepalive_interval_secs
+  type: number
+  default: "60"
+  description: The interval in seconds for HTTP/2 keep-alive pings on the driver, worker, Spark Connect, and Flight servers.
+
+- key: cluster.http2_keepalive_timeout_secs
+  type: number
+  default: "30"
+  description: The timeout in seconds for HTTP/2 keep-alive ping acknowledgements. A connection is closed if a peer does not acknowledge a ping within this window.
+
 - key: cluster.worker_task_slots
   type: number
   default: "8"

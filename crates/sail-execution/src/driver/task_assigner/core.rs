@@ -64,9 +64,33 @@ impl TaskAssigner {
                 .worker_max_count
                 .saturating_sub(self.total_live_worker_count())
         };
-        required_slots
-            .div_ceil(self.options.worker_task_slots)
-            .min(allowed_workers)
+        // Head-of-queue demand: provision up to `worker_max_count` workers so the
+        // widest queued region can spread its task sets across workers, even when
+        // the existing workers still have vacant slots. This is a target total
+        // live-worker count, so we subtract the workers already live.
+        let head_demand = self
+            .task_queue
+            .iter()
+            .map(|region| {
+                region
+                    .tasks
+                    .iter()
+                    .filter(|(placement, _)| matches!(placement, TaskPlacement::Worker))
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        let max_count = if self.options.worker_max_count == 0 {
+            usize::MAX
+        } else {
+            self.options.worker_max_count
+        };
+        let head_workers = max_count
+            .min(head_demand)
+            .saturating_sub(self.total_live_worker_count());
+        // Keep the deficit-based scaling so many-small-regions still scale correctly.
+        let deficit_workers = required_slots.div_ceil(self.options.worker_task_slots);
+        head_workers.max(deficit_workers).min(allowed_workers)
     }
 
     /// Number of workers to pre-spawn at session start so `worker_initial_count`
@@ -329,9 +353,13 @@ impl TaskSlotAssigner {
     }
 
     fn next(&mut self) -> Option<(WorkerId, usize)> {
-        self.slots
-            .iter_mut()
-            .find_map(|(worker_id, slots)| slots.pop().map(|slot| (*worker_id, slot)))
+        // Pick the worker with the most vacant slots (least loaded) so task sets
+        // spread across workers instead of packing onto the first worker.
+        // `max_by_key` returns the last maximum on ties, which naturally
+        // alternates between equally-loaded workers.
+        let (worker_id, slots) = self.slots.iter_mut().max_by_key(|(_, slots)| slots.len())?;
+        let slot = slots.pop()?;
+        Some((*worker_id, slot))
     }
 
     fn try_assign_task_region(
@@ -424,6 +452,51 @@ mod tests {
         assert_eq!(a.total_live_worker_count(), 4);
         // Budget exhausted: no more workers may be requested.
         assert_eq!(a.request_workers(), 0);
+    }
+
+    #[test]
+    fn request_workers_scales_for_single_wide_region() {
+        let mut a = TaskAssigner::new(options(0, 4, 5));
+        enqueue_worker_tasks(&mut a, 4);
+        // Head-of-queue demand: min(max_count, 4) = 4 workers, none live yet.
+        assert_eq!(a.request_workers(), 4);
+    }
+
+    #[test]
+    fn request_workers_scales_for_single_wide_region_respects_live_workers() {
+        let mut a = TaskAssigner::new(options(0, 4, 5));
+        enqueue_worker_tasks(&mut a, 4);
+        a.add_pending_worker(WorkerId::from(1));
+        // min(max_count, 4) = 4 target minus 1 live = 3 more requested.
+        assert_eq!(a.request_workers(), 3);
+    }
+
+    #[test]
+    fn request_workers_for_single_region_respects_max_count() {
+        let mut a = TaskAssigner::new(options(0, 4, 1));
+        enqueue_worker_tasks(&mut a, 4);
+        // Capped by worker_max_count = 1.
+        assert_eq!(a.request_workers(), 1);
+    }
+
+    #[test]
+    fn task_assigner_spreads_region_across_workers() {
+        let mut a = TaskAssigner::new(options(2, 4, 4));
+        for id in 1..=2u64 {
+            a.add_pending_worker(WorkerId::from(id));
+            a.activate_worker(WorkerId::from(id));
+        }
+        enqueue_worker_tasks(&mut a, 4);
+        let assignments = a.assign_tasks();
+        let worker_ids = assignments
+            .iter()
+            .filter_map(|x| match &x.assignment {
+                TaskAssignment::Worker { worker_id, .. } => Some(*worker_id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        // Least-loaded assignment must spread the 4 task sets across both workers.
+        assert_eq!(worker_ids.len(), 2);
     }
 
     #[test]

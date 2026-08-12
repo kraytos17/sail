@@ -1,6 +1,7 @@
 use std::convert::Infallible;
 use std::future::Future;
 
+use sail_common::config::ClusterConfig;
 use sail_telemetry::layers::TracingServerLayer;
 use tokio::net::TcpListener;
 use tonic::body::Body;
@@ -12,6 +13,7 @@ use tonic_health::server::HealthReporter;
 use tower::layer::util::{Identity, Stack};
 use tower::ServiceBuilder;
 
+#[derive(Debug, Clone)]
 pub struct ServerBuilderOptions {
     pub nodelay: bool,
     pub keepalive: Option<std::time::Duration>,
@@ -27,9 +29,35 @@ impl Default for ServerBuilderOptions {
             nodelay: true,
             keepalive: Some(std::time::Duration::from_secs(60)),
             http2_keepalive_interval: Some(std::time::Duration::from_secs(60)),
-            http2_keepalive_timeout: Some(std::time::Duration::from_secs(10)),
+            http2_keepalive_timeout: Some(std::time::Duration::from_secs(30)),
             http2_adaptive_window: Some(true),
         }
+    }
+}
+
+impl ServerBuilderOptions {
+    pub fn from_keepalive(
+        http2_keepalive_interval: Option<std::time::Duration>,
+        http2_keepalive_timeout: Option<std::time::Duration>,
+    ) -> Self {
+        Self {
+            http2_keepalive_interval,
+            http2_keepalive_timeout,
+            ..Self::default()
+        }
+    }
+}
+
+impl From<&ClusterConfig> for ServerBuilderOptions {
+    fn from(config: &ClusterConfig) -> Self {
+        Self::from_keepalive(
+            Some(std::time::Duration::from_secs(
+                config.http2_keepalive_interval_secs,
+            )),
+            Some(std::time::Duration::from_secs(
+                config.http2_keepalive_timeout_secs,
+            )),
+        )
     }
 }
 

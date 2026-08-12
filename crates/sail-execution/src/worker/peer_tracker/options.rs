@@ -1,3 +1,5 @@
+use sail_common::runtime::RuntimeHandle;
+
 use crate::id::WorkerId;
 use crate::worker::WorkerOptions;
 
@@ -5,6 +7,7 @@ use crate::worker::WorkerOptions;
 pub struct PeerTrackerOptions {
     pub worker_id: WorkerId,
     pub enable_tls: bool,
+    pub runtime: RuntimeHandle,
 }
 
 impl From<&WorkerOptions> for PeerTrackerOptions {
@@ -12,6 +15,7 @@ impl From<&WorkerOptions> for PeerTrackerOptions {
         Self {
             worker_id: options.worker_id,
             enable_tls: options.enable_tls,
+            runtime: options.runtime.clone(),
         }
     }
 }

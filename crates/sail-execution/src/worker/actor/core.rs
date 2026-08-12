@@ -4,6 +4,7 @@ use fastrace::future::FutureExt;
 use fastrace::Span;
 use log::info;
 use sail_server::actor::{Actor, ActorAction, ActorContext};
+use sail_server::ServerBuilderOptions;
 
 use crate::driver::DriverClientSet;
 use crate::rpc::{ClientOptions, ServerMonitor};
@@ -28,6 +29,7 @@ impl Actor for WorkerActor {
             enable_tls: options.enable_tls,
             host: options.driver_host.clone(),
             port: options.driver_port,
+            runtime: options.runtime.clone(),
         });
         let peer_tracker = PeerTracker::new(PeerTrackerOptions::from(&options));
         let stream_manager = StreamManager::new(StreamManagerOptions::from(&options));
@@ -49,8 +51,15 @@ impl Actor for WorkerActor {
         );
         let server = mem::take(&mut self.server);
         let span = Span::enter_with_local_parent("WorkerActor::serve");
+        let options = ServerBuilderOptions::from_keepalive(
+            Some(self.options.http2_keepalive_interval),
+            Some(self.options.http2_keepalive_timeout),
+        );
         self.server = server
-            .start(Self::serve(ctx.handle().clone(), addr).in_span(span))
+            .start(
+                self.options.runtime.io().clone(),
+                Self::serve(ctx.handle().clone(), addr, options).in_span(span),
+            )
             .await;
     }
 

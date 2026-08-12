@@ -1,6 +1,7 @@
 //! A dedicated module for worker pool options to ensure readonly access.
 use std::time::Duration;
 
+use sail_common::runtime::RuntimeHandle;
 use sail_server::RetryStrategy;
 
 use crate::driver::DriverOptions;
@@ -14,10 +15,13 @@ pub struct WorkerPoolOptions {
     pub worker_heartbeat_interval: Duration,
     pub worker_heartbeat_timeout: Duration,
     pub worker_launch_timeout: Duration,
+    pub http2_keepalive_interval: Duration,
+    pub http2_keepalive_timeout: Duration,
     pub spawn_retry_strategy: RetryStrategy,
     pub task_stream_buffer: usize,
     pub task_stream_creation_timeout: Duration,
     pub rpc_retry_strategy: RetryStrategy,
+    pub runtime: RuntimeHandle,
 }
 
 impl WorkerPoolOptions {
@@ -31,6 +35,8 @@ impl WorkerPoolOptions {
             worker_heartbeat_interval: Duration::from_secs(1),
             worker_heartbeat_timeout: Duration::from_secs(3),
             worker_launch_timeout: Duration::from_secs(5),
+            http2_keepalive_interval: Duration::from_secs(60),
+            http2_keepalive_timeout: Duration::from_secs(30),
             spawn_retry_strategy: RetryStrategy::Fixed {
                 max_count: 1,
                 delay: Duration::from_secs(1),
@@ -41,6 +47,7 @@ impl WorkerPoolOptions {
                 max_count: 1,
                 delay: Duration::from_millis(10),
             },
+            runtime: test_runtime_handle(),
         }
     }
 
@@ -53,6 +60,20 @@ impl WorkerPoolOptions {
     }
 }
 
+#[cfg(test)]
+fn test_runtime_handle() -> RuntimeHandle {
+    // The worker pool unit tests run outside a Tokio runtime, so we create a
+    // shared runtime whose handle remains valid for the lifetime of the tests.
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build test runtime")
+    });
+    RuntimeHandle::new(runtime.handle().clone(), runtime.handle().clone())
+}
+
 impl From<&DriverOptions> for WorkerPoolOptions {
     fn from(options: &DriverOptions) -> Self {
         Self {
@@ -63,10 +84,13 @@ impl From<&DriverOptions> for WorkerPoolOptions {
             worker_heartbeat_interval: options.worker_heartbeat_interval,
             worker_heartbeat_timeout: options.worker_heartbeat_timeout,
             worker_launch_timeout: options.worker_launch_timeout,
+            http2_keepalive_interval: options.http2_keepalive_interval,
+            http2_keepalive_timeout: options.http2_keepalive_timeout,
             spawn_retry_strategy: options.worker_spawn_retry_strategy.clone(),
             task_stream_buffer: options.task_stream_buffer,
             task_stream_creation_timeout: options.task_stream_creation_timeout,
             rpc_retry_strategy: options.rpc_retry_strategy.clone(),
+            runtime: options.runtime.clone(),
         }
     }
 }
