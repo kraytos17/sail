@@ -13,6 +13,7 @@ use fastrace::future::FutureExt;
 use fastrace::Span;
 use futures::stream::{StreamExt, TryStreamExt};
 use futures::Stream;
+use sail_common_datafusion::session::activity::ActivityTracker;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
@@ -126,18 +127,30 @@ struct ExecutorTaskContext {
     stream: SendableRecordBatchStream,
     heartbeat_interval: Duration,
     buffer: Arc<Mutex<ExecutorBuffer>>,
+    activity_tracker: Option<Arc<ActivityTracker>>,
 }
 
 impl ExecutorTaskContext {
-    fn new(stream: SendableRecordBatchStream, heartbeat_interval: Duration) -> Self {
+    fn new(
+        stream: SendableRecordBatchStream,
+        heartbeat_interval: Duration,
+        activity_tracker: Option<Arc<ActivityTracker>>,
+    ) -> Self {
         Self {
             stream,
             heartbeat_interval,
             buffer: Arc::new(Mutex::new(ExecutorBuffer::new())),
+            activity_tracker,
         }
     }
 
     async fn next(&mut self) -> SparkResult<Option<RecordBatch>> {
+        // Refresh session activity on every poll so a long-running operation is
+        // never reaped by the session idle timeout (`spark.session_timeout_secs`),
+        // which would otherwise only be refreshed on client RPC entry.
+        if let Some(tracker) = &self.activity_tracker {
+            let _ = tracker.track_activity();
+        }
         let span = Span::enter_with_local_parent("ExecutorTaskContext::next");
         tokio::select! {
             batch = self.stream.next().in_span(span) => Ok(batch.transpose()?),
@@ -170,11 +183,12 @@ impl Executor {
         metadata: ExecutorMetadata,
         stream: SendableRecordBatchStream,
         heartbeat_interval: Duration,
+        activity_tracker: Option<Arc<ActivityTracker>>,
     ) -> Self {
         Self {
             metadata,
             state: Mutex::new(ExecutorState::Pending {
-                context: ExecutorTaskContext::new(stream, heartbeat_interval),
+                context: ExecutorTaskContext::new(stream, heartbeat_interval, activity_tracker),
                 span: Span::enter_with_local_parent("Executor::new"),
             }),
         }

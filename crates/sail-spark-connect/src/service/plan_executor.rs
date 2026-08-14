@@ -10,6 +10,7 @@ use futures::stream;
 use log::{debug, warn};
 use sail_common::spec;
 use sail_common_datafusion::extension::SessionExtensionAccessor;
+use sail_common_datafusion::session::activity::ActivityTracker;
 use sail_common_datafusion::session::job::JobService;
 use sail_plan::resolve_and_execute_plan;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
@@ -134,10 +135,14 @@ async fn handle_execute_plan(
     let rx = match mode {
         ExecutePlanMode::Lazy => {
             let _guard = span.set_local_parent();
+            // Refresh session activity during streaming so the session is not reaped
+            // by the idle timeout while a long-running operation executes.
+            let activity_tracker = ctx.extension::<ActivityTracker>().ok();
             let executor = Executor::new(
                 metadata,
                 stream,
                 spark.options().execution_heartbeat_interval,
+                activity_tracker,
             );
             let rx = executor.start()?;
             spark.add_executor(executor)?;
