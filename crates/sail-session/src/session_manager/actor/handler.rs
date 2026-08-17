@@ -29,42 +29,26 @@ impl SessionManagerActor {
         user_id: String,
         result: oneshot::Sender<SessionResult<SessionContext>>,
     ) -> ActorAction {
-        let context = if let Some(session) = self.sessions.get(&session_id) {
-            if let ServerSessionState::Running { context } = &session.state {
+        let context = match self.sessions.get(&session_id) {
+            Some(session) if matches!(session.state, ServerSessionState::Running { .. }) => {
+                let ServerSessionState::Running { context } = &session.state else {
+                    unreachable!("state is guarded to be running")
+                };
                 Ok(context.clone())
-            } else {
-                Err(SessionError::invalid(format!(
-                    "session {session_id} is not running"
-                )))
             }
-        } else {
-            let session_id = session_id.clone();
-            info!("creating session {session_id}");
-            let span = Span::root(
-                "SessionManagerActor::create_session_context",
-                SpanContext::random(),
-            );
-            let _guard = span.set_local_parent();
-            let info = ServerSessionInfo {
-                session_id: session_id.clone(),
-                user_id: user_id.clone(),
-                session_manager: ctx.handle().clone(),
-            };
-            match self.factory.create(info) {
-                Ok(context) => {
-                    let session = ServerSession {
-                        user_id,
-                        created_at: Utc::now(),
-                        deleted_at: None,
-                        state: ServerSessionState::Running {
-                            context: context.clone(),
-                        },
-                    };
-                    self.sessions.insert(session_id, session);
-                    Ok(context)
-                }
-                Err(e) => Err(e.into()),
+            // A stale session (e.g. one reaped by the idle timeout) must not block
+            // future requests forever. Drop it and create a fresh session so the
+            // server self-heals on the next request instead of erroring until a
+            // process restart.
+            Some(session) => {
+                info!(
+                    "recreating stale session {session_id} in state {}",
+                    session.state.status()
+                );
+                self.sessions.shift_remove(&session_id);
+                self.create_session(ctx, session_id.clone(), user_id.clone())
             }
+            None => self.create_session(ctx, session_id.clone(), user_id.clone()),
         };
         if let Ok(context) = &context {
             if let Ok(active_at) = context
@@ -82,6 +66,40 @@ impl SessionManagerActor {
         }
         let _ = result.send(context);
         ActorAction::Continue
+    }
+
+    fn create_session(
+        &mut self,
+        ctx: &mut ActorContext<Self>,
+        session_id: String,
+        user_id: String,
+    ) -> SessionResult<SessionContext> {
+        info!("creating session {session_id}");
+        let span = Span::root(
+            "SessionManagerActor::create_session_context",
+            SpanContext::random(),
+        );
+        let _guard = span.set_local_parent();
+        let info = ServerSessionInfo {
+            session_id: session_id.clone(),
+            user_id: user_id.clone(),
+            session_manager: ctx.handle().clone(),
+        };
+        match self.factory.create(info) {
+            Ok(context) => {
+                let session = ServerSession {
+                    user_id,
+                    created_at: Utc::now(),
+                    deleted_at: None,
+                    state: ServerSessionState::Running {
+                        context: context.clone(),
+                    },
+                };
+                self.sessions.insert(session_id, session);
+                Ok(context)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub(super) fn handle_probe_idle_session(
@@ -163,7 +181,13 @@ impl SessionManagerActor {
             warn!("session not found: {session_id}");
             return ActorAction::Continue;
         };
-        session.state = ServerSessionState::Failed;
+        // Only a session in the middle of deletion may fail. A stale failure event
+        // must not clobber a session that has since been recreated (and is running).
+        if matches!(session.state, ServerSessionState::Deleting) {
+            session.state = ServerSessionState::Failed;
+        } else {
+            warn!("session is not being deleted: {session_id}");
+        }
         ActorAction::Continue
     }
 
@@ -339,5 +363,189 @@ impl SessionManagerActor {
             };
             let _ = handle.send(message).await;
         });
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use datafusion::common::Result;
+    use datafusion::prelude::SessionContext;
+    use sail_common::runtime::RuntimeHandle;
+    use sail_common_datafusion::session::job::JobRunnerHistory;
+    use sail_server::actor::ActorSystem;
+
+    use super::*;
+    use crate::session_factory::SessionFactory;
+    use crate::session_manager::event::SessionHistory;
+    use crate::session_manager::{SessionManager, SessionManagerOptions};
+
+    #[derive(Clone, Default)]
+    struct CountingFactory {
+        count: Arc<AtomicUsize>,
+    }
+
+    impl SessionFactory<ServerSessionInfo> for CountingFactory {
+        fn create(&mut self, _info: ServerSessionInfo) -> Result<SessionContext> {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            Ok(SessionContext::new())
+        }
+    }
+
+    fn test_options(count: Arc<AtomicUsize>) -> SessionManagerOptions {
+        let handle = tokio::runtime::Handle::current();
+        let runtime = RuntimeHandle::new(handle.clone(), handle);
+        let system = Arc::new(Mutex::new(ActorSystem::new()));
+        SessionManagerOptions::new(
+            runtime,
+            system,
+            Box::new(move || {
+                Box::new(CountingFactory {
+                    count: count.clone(),
+                })
+            }),
+        )
+    }
+
+    async fn test_manager(count: Arc<AtomicUsize>) -> SessionManager {
+        SessionManager::try_new(test_options(count)).expect("session manager should be created")
+    }
+
+    #[tokio::test]
+    async fn reuse_running_session() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let manager = test_manager(count.clone()).await;
+        manager
+            .get_or_create_session_context("session-1".to_string(), "user-1".to_string())
+            .await
+            .expect("session should be created");
+        manager
+            .get_or_create_session_context("session-1".to_string(), "user-1".to_string())
+            .await
+            .expect("session should be reused");
+        // The factory is only invoked once: the second call reuses the running session.
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn recreate_deleting_session_does_not_leak() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let manager = test_manager(count.clone()).await;
+        manager
+            .get_or_create_session_context("session-1".to_string(), "user-1".to_string())
+            .await
+            .expect("session should be created");
+        let (tx, _rx) = oneshot::channel();
+        manager
+            .handle
+            .send(SessionManagerEvent::DeleteSession {
+                session_id: "session-1".to_string(),
+                result: tx,
+            })
+            .await
+            .expect("delete session event should be sent");
+        manager
+            .get_or_create_session_context("session-1".to_string(), "user-1".to_string())
+            .await
+            .expect("stale session should be recreated");
+        // The stale session is dropped and a fresh one is created.
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn recreate_deleted_session() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let manager = test_manager(count.clone()).await;
+        manager
+            .get_or_create_session_context("session-1".to_string(), "user-1".to_string())
+            .await
+            .expect("session should be created");
+        let (tx, _rx) = oneshot::channel();
+        manager
+            .handle
+            .send(SessionManagerEvent::DeleteSession {
+                session_id: "session-1".to_string(),
+                result: tx,
+            })
+            .await
+            .expect("delete session event should be sent");
+        manager
+            .handle
+            .send(SessionManagerEvent::SetSessionHistory {
+                session_id: "session-1".to_string(),
+                history: SessionHistory {
+                    job_runner: JobRunnerHistory {
+                        jobs: vec![],
+                        stages: vec![],
+                        tasks: vec![],
+                        workers: vec![],
+                    },
+                },
+            })
+            .await
+            .expect("set session history event should be sent");
+        manager
+            .get_or_create_session_context("session-1".to_string(), "user-1".to_string())
+            .await
+            .expect("deleted session should be recreated");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn recreate_failed_session() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let manager = test_manager(count.clone()).await;
+        manager
+            .get_or_create_session_context("session-1".to_string(), "user-1".to_string())
+            .await
+            .expect("session should be created");
+        let (tx, _rx) = oneshot::channel();
+        manager
+            .handle
+            .send(SessionManagerEvent::DeleteSession {
+                session_id: "session-1".to_string(),
+                result: tx,
+            })
+            .await
+            .expect("delete session event should be sent");
+        manager
+            .handle
+            .send(SessionManagerEvent::SetSessionFailure {
+                session_id: "session-1".to_string(),
+            })
+            .await
+            .expect("set session failure event should be sent");
+        manager
+            .get_or_create_session_context("session-1".to_string(), "user-1".to_string())
+            .await
+            .expect("failed session should be recreated");
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn set_session_failure_only_applies_when_deleting() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let manager = test_manager(count.clone()).await;
+        manager
+            .get_or_create_session_context("session-1".to_string(), "user-1".to_string())
+            .await
+            .expect("session should be created");
+        // A stale failure event for a running session must not clobber it.
+        manager
+            .handle
+            .send(SessionManagerEvent::SetSessionFailure {
+                session_id: "session-1".to_string(),
+            })
+            .await
+            .expect("set session failure event should be sent");
+        manager
+            .get_or_create_session_context("session-1".to_string(), "user-1".to_string())
+            .await
+            .expect("session should still be running");
+        // The running session is not recreated by the stale failure event.
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

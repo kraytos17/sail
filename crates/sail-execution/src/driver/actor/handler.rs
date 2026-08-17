@@ -98,6 +98,10 @@ impl DriverActor {
     ) -> ActorAction {
         if self.worker_pool.fail_worker_if_pending(worker_id) {
             self.task_assigner.track_worker_failed_to_start(worker_id);
+            // The failed worker is no longer pending, so the fleet-readiness
+            // barrier in `run_tasks` may now be clear. Re-run assignment so the
+            // queued tasks can proceed on the remaining (active) workers.
+            self.run_tasks(ctx);
             // Delete the failed pod so it does not linger in the cluster in a
             // `Pending` (e.g. `Insufficient cpu`) state until the pool is closed.
             let manager = Arc::clone(&self.worker_manager);
@@ -569,6 +573,14 @@ impl DriverActor {
     /// scheduler, and dispatches each task to either the driver or a remote worker via gRPC.
     /// Tasks that fail to build a definition are reported as failed.
     fn run_tasks(&mut self, ctx: &mut ActorContext<Self>) {
+        // Fleet-readiness barrier: defer task assignment while the worker fleet
+        // is still launching. Assigning early lets the first worker(s) to
+        // register consume the whole task queue, leaving later-registered
+        // workers idle. Re-triggered on every worker registration and on the
+        // failed-to-start path.
+        if self.task_assigner.pending_worker_count() > 0 {
+            return;
+        }
         let assignments = self.task_assigner.assign_tasks();
         self.task_assigner.track_streams(&assignments);
         for assignment in assignments {

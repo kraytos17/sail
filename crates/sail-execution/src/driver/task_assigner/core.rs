@@ -14,7 +14,7 @@ use crate::task::scheduling::{
 impl TaskAssigner {
     /// Number of workers whose spawn was requested but which have not yet
     /// registered (`Pending`). Derived from state, never a separate counter.
-    fn pending_worker_count(&self) -> usize {
+    pub fn pending_worker_count(&self) -> usize {
         self.workers
             .values()
             .filter(|w| matches!(w, WorkerResource::Pending))
@@ -397,6 +397,8 @@ impl TaskSlotAssigner {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::driver::task_assigner::TaskAssignerOptions;
     use crate::id::JobId;
@@ -497,6 +499,46 @@ mod tests {
             .collect::<HashSet<_>>();
         // Least-loaded assignment must spread the 4 task sets across both workers.
         assert_eq!(worker_ids.len(), 2);
+    }
+
+    #[test]
+    fn task_assigner_spreads_region_across_full_fleet() {
+        // Regression test for worker under-utilization: once the whole fleet has
+        // registered (no pending workers), a 16-task-set region must spread evenly
+        // across all 4 workers instead of packing onto the first to register.
+        let mut a = TaskAssigner::new(options(0, 4, 4));
+        for id in 1..=4u64 {
+            a.add_pending_worker(WorkerId::from(id));
+            a.activate_worker(WorkerId::from(id));
+        }
+        enqueue_worker_tasks(&mut a, 16);
+        let assignments = a.assign_tasks();
+        let mut per_worker: HashMap<WorkerId, usize> = HashMap::new();
+        for x in &assignments {
+            if let TaskAssignment::Worker { worker_id, .. } = x.assignment {
+                *per_worker.entry(worker_id).or_default() += 1;
+            }
+        }
+        assert_eq!(per_worker.len(), 4, "all 4 workers should receive tasks");
+        assert!(
+            per_worker.values().all(|&n| n == 4),
+            "16 task sets should spread 4-per-worker, got: {per_worker:?}"
+        );
+    }
+
+    #[test]
+    fn pending_worker_count_tracks_pending_and_active() {
+        let mut a = TaskAssigner::new(options(0, 2, 4));
+        assert_eq!(a.pending_worker_count(), 0);
+        a.add_pending_worker(WorkerId::from(1));
+        a.add_pending_worker(WorkerId::from(2));
+        assert_eq!(a.pending_worker_count(), 2);
+        a.activate_worker(WorkerId::from(1));
+        assert_eq!(a.pending_worker_count(), 1);
+        a.activate_worker(WorkerId::from(2));
+        assert_eq!(a.pending_worker_count(), 0);
+        a.track_worker_failed_to_start(WorkerId::from(1));
+        assert_eq!(a.pending_worker_count(), 0);
     }
 
     #[test]
