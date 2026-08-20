@@ -56,7 +56,9 @@ use crate::table::metadata_loader::{
 };
 use crate::table_format::metadata_location_from_properties;
 use crate::utils::get_object_store_from_context;
-use crate::utils::metadata::metadata_files_for_version;
+use crate::utils::metadata::{
+    get_metadata_file_timestamp, is_stale_metadata_file, metadata_files_for_version,
+};
 const MAX_COMMIT_RETRIES: usize = 5;
 
 #[derive(Debug)]
@@ -64,6 +66,9 @@ pub struct IcebergCommitExec {
     input: Arc<dyn ExecutionPlan>,
     table_url: Url,
     lakehouse_table: Option<LakehouseExecutionContext>,
+    /// When set, the reported row count overrides the sum of written rows (e.g. UPDATE
+    /// reports the number of rows matching the predicate).
+    reported_row_count: Option<u64>,
     cache: Arc<PlanProperties>,
 }
 
@@ -72,6 +77,15 @@ impl IcebergCommitExec {
         input: Arc<dyn ExecutionPlan>,
         table_url: Url,
         lakehouse_table: Option<LakehouseExecutionContext>,
+    ) -> Self {
+        Self::new_with_reported_row_count(input, table_url, lakehouse_table, None)
+    }
+
+    pub fn new_with_reported_row_count(
+        input: Arc<dyn ExecutionPlan>,
+        table_url: Url,
+        lakehouse_table: Option<LakehouseExecutionContext>,
+        reported_row_count: Option<u64>,
     ) -> Self {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "count",
@@ -88,6 +102,7 @@ impl IcebergCommitExec {
             input,
             table_url,
             lakehouse_table,
+            reported_row_count,
             cache,
         }
     }
@@ -98,6 +113,10 @@ impl IcebergCommitExec {
 
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
+    }
+
+    pub fn reported_row_count(&self) -> Option<u64> {
+        self.reported_row_count
     }
 
     pub fn lakehouse_table(&self) -> Option<&LakehouseExecutionContext> {
@@ -421,6 +440,7 @@ impl ExecutionPlan for IcebergCommitExec {
 
         let table_url = self.table_url.clone();
         let lakehouse_table = self.lakehouse_table.clone();
+        let reported_row_count = self.reported_row_count;
         let schema = self.schema();
         let future = async move {
             let object_store = get_object_store_from_context(&context, &table_url)?;
@@ -468,7 +488,14 @@ impl ExecutionPlan for IcebergCommitExec {
                 operation: commit_meta.operation,
                 schema: commit_meta.schema,
                 partition_spec: commit_meta.partition_spec,
+                touched_file_paths: commit_meta.touched_file_paths,
+                overwrite_predicate: commit_meta.overwrite_predicate,
+                overwrite_partition_values: commit_meta.overwrite_partition_values,
             };
+
+            // Operations that report a specific "rows affected" count (e.g. UPDATE reports
+            // the number of rows matching the predicate) override the total rows written.
+            let reported_count = reported_row_count.unwrap_or(commit_info.row_count);
 
             let catalog_table = commit_info
                 .lakehouse_table
@@ -578,7 +605,7 @@ impl ExecutionPlan for IcebergCommitExec {
                     }
                 }
 
-                let array = Arc::new(UInt64Array::from(vec![commit_info.row_count]));
+                let array = Arc::new(UInt64Array::from(vec![reported_count]));
                 let batch = RecordBatch::try_new(schema, vec![array])?;
                 return Ok(batch);
             }
@@ -717,8 +744,7 @@ impl ExecutionPlan for IcebergCommitExec {
                                 if committed.payload().is_some() {
                                     log::trace!("Iceberg catalog commit returned a payload");
                                 }
-                                let array =
-                                    Arc::new(UInt64Array::from(vec![commit_info.row_count]));
+                                let array = Arc::new(UInt64Array::from(vec![reported_count]));
                                 let batch = RecordBatch::try_new(schema, vec![array])?;
                                 return Ok(batch);
                             }
@@ -793,7 +819,7 @@ impl ExecutionPlan for IcebergCommitExec {
                         .await?;
                     }
 
-                    let array = Arc::new(UInt64Array::from(vec![commit_info.row_count]));
+                    let array = Arc::new(UInt64Array::from(vec![reported_count]));
                     let batch = RecordBatch::try_new(schema, vec![array])?;
                     return Ok(batch);
                 }
@@ -808,19 +834,26 @@ impl ExecutionPlan for IcebergCommitExec {
                 let existing_for_next =
                     metadata_files_for_version(&store_ctx, next_version).await?;
                 if !existing_for_next.is_empty() {
-                    log::warn!(
-                        "Detected existing metadata files for version {}: {:?}. Retrying attempt {}",
-                        next_version,
-                        existing_for_next,
-                        attempt
-                    );
-                    if attempt >= MAX_COMMIT_RETRIES {
-                        return Err(commit_conflict_error());
+                    let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+                    if existing_for_next
+                        .iter()
+                        .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts))
+                    {
+                        log::warn!(
+                            "Detected existing metadata files for version {}: {:?}. Retrying attempt {}",
+                            next_version,
+                            existing_for_next,
+                            attempt
+                        );
+                        if attempt >= MAX_COMMIT_RETRIES {
+                            return Err(commit_conflict_error());
+                        }
+                        continue;
                     }
-                    continue;
                 }
 
                 // Build transaction and action based on operation
+                let snapshot_for_commit = snapshot.clone();
                 let tx = Transaction::new(table_url.to_string(), snapshot);
                 let manifest_meta = tx.default_manifest_metadata(
                     &schema_iceberg,
@@ -843,13 +876,63 @@ impl ExecutionPlan for IcebergCommitExec {
                             .map_err(DataFusionError::Execution)?
                     }
                     crate::spec::Operation::Overwrite => {
+                        // Compute parent manifests to keep.
+                        // - Predicate overwrite (INSERT ... REPLACE WHERE): keep manifests
+                        //   whose partition bounds do not match the predicate.
+                        // - Dynamic partition overwrite: keep manifests whose partition
+                        //   bounds do not overlap the written partition values.
+                        // - Row-level operations: keep manifests whose data files are NOT
+                        //   in the touched set; touched files are replaced by new files.
+                        // - Otherwise: full replacement (no parent manifests kept).
+                        let parent_entries =
+                            if let Some(ref predicate_json) = commit_info.overwrite_predicate {
+                                filter_parent_manifest_entries(
+                                    &store_ctx,
+                                    &snapshot_for_commit,
+                                    table_meta.format_version,
+                                    predicate_json,
+                                    &partition_spec_for_commit,
+                                )
+                                .await
+                                .map_err(DataFusionError::Execution)?
+                            } else if let Some(ref partition_values_json) =
+                                commit_info.overwrite_partition_values
+                            {
+                                filter_parent_manifest_entries_by_values(
+                                    &store_ctx,
+                                    &snapshot_for_commit,
+                                    table_meta.format_version,
+                                    partition_values_json,
+                                    &partition_spec_for_commit,
+                                )
+                                .await
+                                .map_err(DataFusionError::Execution)?
+                            } else if !commit_info.touched_file_paths.is_empty() {
+                                compute_untouched_manifest_entries(
+                                    &store_ctx,
+                                    &snapshot_for_commit,
+                                    table_meta.format_version,
+                                    &commit_info.touched_file_paths,
+                                )
+                                .await
+                                .unwrap_or_else(|e| {
+                                    log::warn!(
+                                        "Failed to compute untouched parent manifests: {e}; \
+                                         falling back to full replacement"
+                                    );
+                                    vec![]
+                                })
+                            } else {
+                                vec![]
+                            };
                         let producer = crate::operations::SnapshotProducer::new(
                             &tx,
                             commit_info.data_files.clone(),
                             Some(store_ctx.clone()),
                             Some(manifest_meta),
                         )
-                        .with_row_lineage_start_row_id(row_lineage_start_row_id);
+                        .with_row_lineage_start_row_id(row_lineage_start_row_id)
+                        .with_parent_manifest_entries(Some(parent_entries));
                         struct LocalOverwriteOperation;
                         impl SnapshotProduceOperation for LocalOverwriteOperation {
                             fn operation(&self) -> &'static str {
@@ -861,10 +944,46 @@ impl ExecutionPlan for IcebergCommitExec {
                             .await
                             .map_err(DataFusionError::Execution)?
                     }
-                    _ => {
-                        return Err(DataFusionError::NotImplemented(
-                            "Unsupported Iceberg operation in commit".to_string(),
-                        ));
+                    crate::spec::Operation::Delete => {
+                        let data_files = commit_info.data_files.clone();
+                        let producer = crate::operations::SnapshotProducer::new(
+                            &tx,
+                            data_files,
+                            Some(store_ctx.clone()),
+                            Some(manifest_meta),
+                        )
+                        .with_row_lineage_start_row_id(row_lineage_start_row_id)
+                        .with_parent_manifest_entries(Some(vec![]));
+                        struct LocalDeleteOperation;
+                        impl SnapshotProduceOperation for LocalDeleteOperation {
+                            fn operation(&self) -> &'static str {
+                                "delete"
+                            }
+                        }
+                        producer
+                            .commit(LocalDeleteOperation)
+                            .await
+                            .map_err(DataFusionError::Execution)?
+                    }
+                    crate::spec::Operation::Replace => {
+                        let producer = crate::operations::SnapshotProducer::new(
+                            &tx,
+                            commit_info.data_files.clone(),
+                            Some(store_ctx.clone()),
+                            Some(manifest_meta),
+                        )
+                        .with_row_lineage_start_row_id(row_lineage_start_row_id)
+                        .with_parent_manifest_entries(Some(vec![]));
+                        struct LocalReplaceOperation;
+                        impl SnapshotProduceOperation for LocalReplaceOperation {
+                            fn operation(&self) -> &'static str {
+                                "replace"
+                            }
+                        }
+                        producer
+                            .commit(LocalReplaceOperation)
+                            .await
+                            .map_err(DataFusionError::Execution)?
                     }
                 };
 
@@ -902,7 +1021,7 @@ impl ExecutionPlan for IcebergCommitExec {
                             if committed.payload().is_some() {
                                 log::trace!("Iceberg catalog commit returned a payload");
                             }
-                            let array = Arc::new(UInt64Array::from(vec![commit_info.row_count]));
+                            let array = Arc::new(UInt64Array::from(vec![reported_count]));
                             let batch = RecordBatch::try_new(schema, vec![array])?;
                             return Ok(batch);
                         }
@@ -1024,7 +1143,8 @@ impl ExecutionPlan for IcebergCommitExec {
                     Err(e) => return Err(DataFusionError::External(Box::new(e))),
                 }
                 let version_files = metadata_files_for_version(&store_ctx, next_version).await?;
-                let conflict_after_write = version_files.iter().any(|path| path != &new_meta_rel);
+                let conflict_after_write =
+                    version_files.iter().any(|(path, _)| path != &new_meta_rel);
                 if conflict_after_write {
                     log::warn!(
                         "Concurrent metadata writes detected for version {}: {:?}. Retrying attempt {}",
@@ -1083,7 +1203,7 @@ impl ExecutionPlan for IcebergCommitExec {
                     .await?;
                 }
 
-                let array = Arc::new(UInt64Array::from(vec![commit_info.row_count]));
+                let array = Arc::new(UInt64Array::from(vec![reported_count]));
                 let batch = RecordBatch::try_new(schema, vec![array])?;
                 return Ok(batch);
             }
@@ -1111,8 +1231,357 @@ impl DisplayAs for IcebergCommitExec {
     }
 }
 
+/// Compute the subset of the parent snapshot's manifest entries that do NOT reference any
+/// of `touched_file_paths`. Row-level operations (DELETE / UPDATE / MERGE) pass these as
+/// the parent manifest entries so untouched files are carried through into the new snapshot.
+async fn compute_untouched_manifest_entries(
+    store_ctx: &StoreContext,
+    parent_snapshot: &crate::spec::Snapshot,
+    format_version: crate::spec::FormatVersion,
+    touched_file_paths: &[String],
+) -> std::result::Result<Vec<crate::spec::ManifestFile>, String> {
+    let touched: std::collections::HashSet<&str> =
+        touched_file_paths.iter().map(|s| s.as_str()).collect();
+
+    let manifest_list_path_str = parent_snapshot.manifest_list();
+    let (store_ref, manifest_list_path) = store_ctx
+        .resolve(manifest_list_path_str)
+        .map_err(|e| format!("failed to resolve manifest list path: {e}"))?;
+    let manifest_list_data = store_ref
+        .get(&manifest_list_path)
+        .await
+        .map_err(|e| format!("failed to get parent manifest list: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("failed to read parent manifest list bytes: {e}"))?;
+    let parent_manifest_list =
+        crate::spec::ManifestList::parse_with_version(&manifest_list_data, format_version)?;
+    let parent_entries: Vec<crate::spec::ManifestFile> = parent_manifest_list.entries().to_vec();
+    let total_parent_entries = parent_entries.len();
+
+    let mut untouched = Vec::new();
+
+    for entry in parent_entries {
+        if !matches!(entry.content, crate::spec::ManifestContentType::Data) {
+            // Keep non-data manifests (e.g., delete manifests).
+            untouched.push(entry);
+            continue;
+        }
+
+        let (manifest_store, manifest_path_obj) = store_ctx
+            .resolve(&entry.manifest_path)
+            .map_err(|e| format!("failed to resolve manifest path: {e}"))?;
+        let manifest_data = match manifest_store.get(&manifest_path_obj).await {
+            Ok(data) => data
+                .bytes()
+                .await
+                .map_err(|e| format!("manifest read: {e}"))?,
+            Err(e) => {
+                log::warn!(
+                    "Failed to load parent manifest {}: {e}; keeping it",
+                    entry.manifest_path
+                );
+                untouched.push(entry);
+                continue;
+            }
+        };
+
+        let manifest = match crate::spec::Manifest::parse_avro(&manifest_data) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!(
+                    "Failed to parse parent manifest {}: {e}; keeping it",
+                    entry.manifest_path
+                );
+                untouched.push(entry);
+                continue;
+            }
+        };
+
+        let has_touched = manifest
+            .entries()
+            .iter()
+            .any(|me| touched.contains(me.data_file.file_path()));
+
+        if !has_touched {
+            // This manifest has no touched files -> keep it in the new snapshot.
+            untouched.push(entry);
+        }
+        // If has_touched, skip this manifest entry (it will be replaced by new files).
+    }
+
+    let excluded = total_parent_entries - untouched.len();
+    log::debug!(
+        "commit: {}/{} parent manifests untouched ({} excluded, {} touched file paths)",
+        untouched.len(),
+        total_parent_entries,
+        excluded,
+        touched_file_paths.len()
+    );
+
+    Ok(untouched)
+}
+
+/// Load the parent snapshot's manifest list and filter entries by the overwrite predicate.
+/// Returns only manifest entries whose partition values do NOT match the predicate.
+async fn filter_parent_manifest_entries(
+    store_ctx: &StoreContext,
+    snapshot: &crate::spec::Snapshot,
+    format_version: crate::spec::FormatVersion,
+    predicate_json: &str,
+    partition_spec: &crate::spec::PartitionSpec,
+) -> std::result::Result<Vec<crate::spec::ManifestFile>, String> {
+    use std::collections::HashMap;
+
+    let predicate_pairs: Vec<(String, String)> = serde_json::from_str(predicate_json)
+        .map_err(|e| format!("Invalid overwrite predicate JSON: {e}"))?;
+
+    let pred_by_field: HashMap<String, String> = predicate_pairs.into_iter().collect();
+
+    let mut field_predicate: Vec<(usize, String)> = Vec::new();
+    for (idx, field) in partition_spec.fields().iter().enumerate() {
+        if let Some(pred_val) = pred_by_field.get(&field.name) {
+            field_predicate.push((idx, pred_val.clone()));
+        }
+    }
+
+    if field_predicate.is_empty() {
+        // No matching partition fields - fall back to full overwrite.
+        return Ok(Vec::new());
+    }
+
+    let parent_manifest_list_path_str = snapshot.manifest_list();
+    if parent_manifest_list_path_str.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (store_ref, manifest_list_path) = store_ctx
+        .resolve(parent_manifest_list_path_str)
+        .map_err(|e| format!("failed to resolve manifest list path: {e}"))?;
+    let manifest_list_data = store_ref
+        .get(&manifest_list_path)
+        .await
+        .map_err(|e| format!("failed to get parent manifest list: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("failed to read parent manifest list bytes: {e}"))?;
+    let parent_manifest_list =
+        crate::spec::ManifestList::parse_with_version(&manifest_list_data, format_version)
+            .map_err(|e| format!("failed to parse parent manifest list: {e}"))?;
+
+    let mut kept = Vec::new();
+    for entry in parent_manifest_list.entries() {
+        let partitions = match entry.partitions.as_ref() {
+            Some(p) => p,
+            None => {
+                // No partition summary - conservatively keep the entry.
+                kept.push(entry.clone());
+                continue;
+            }
+        };
+
+        let mut matches_predicate = false;
+        for &(field_idx, ref pred_val) in &field_predicate {
+            if field_idx >= partitions.len() {
+                continue;
+            }
+            let summary = &partitions[field_idx];
+            let lower = summary.lower_bound_bytes.as_deref();
+            let upper = summary.upper_bound_bytes.as_deref();
+            if let (Some(lb), Some(ub)) = (lower, upper) {
+                let pred_bytes = pred_val.as_bytes();
+                if pred_bytes >= lb && pred_bytes <= ub {
+                    matches_predicate = true;
+                    break;
+                }
+            } else {
+                // No bounds - conservatively assume match.
+                matches_predicate = true;
+                break;
+            }
+        }
+
+        if !matches_predicate {
+            // No partition overlap - this manifest is safe to keep.
+            kept.push(entry.clone());
+        }
+    }
+
+    Ok(kept)
+}
+
+/// Filter parent manifest entries by comparing against written partition values.
+/// Keeps entries whose partition bounds do NOT overlap with any of the written partition values.
+async fn filter_parent_manifest_entries_by_values(
+    store_ctx: &StoreContext,
+    snapshot: &crate::spec::Snapshot,
+    format_version: crate::spec::FormatVersion,
+    partition_values_json: &str,
+    _partition_spec: &crate::spec::PartitionSpec,
+) -> std::result::Result<Vec<crate::spec::ManifestFile>, String> {
+    let written_partitions: Vec<Vec<String>> = serde_json::from_str(partition_values_json)
+        .map_err(|e| format!("Invalid partition values JSON: {e}"))?;
+
+    if written_partitions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parent_manifest_list_path_str = snapshot.manifest_list();
+    if parent_manifest_list_path_str.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (store_ref, manifest_list_path) = store_ctx
+        .resolve(parent_manifest_list_path_str)
+        .map_err(|e| format!("failed to resolve manifest list path: {e}"))?;
+    let manifest_list_data = store_ref
+        .get(&manifest_list_path)
+        .await
+        .map_err(|e| format!("failed to get parent manifest list: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("failed to read parent manifest list bytes: {e}"))?;
+    let parent_manifest_list =
+        crate::spec::ManifestList::parse_with_version(&manifest_list_data, format_version)
+            .map_err(|e| format!("failed to parse parent manifest list: {e}"))?;
+
+    let mut kept = Vec::new();
+    for entry in parent_manifest_list.entries() {
+        let partitions = match entry.partitions.as_ref() {
+            Some(p) => p,
+            None => {
+                // No partition summary - conservatively keep the entry.
+                kept.push(entry.clone());
+                continue;
+            }
+        };
+
+        let mut matches_any = false;
+        for written in &written_partitions {
+            let mut all_fields_match = true;
+            for (field_idx, pred_val) in written.iter().enumerate() {
+                if field_idx >= partitions.len() {
+                    continue;
+                }
+                let summary = &partitions[field_idx];
+                let lower = summary.lower_bound_bytes.as_deref();
+                let upper = summary.upper_bound_bytes.as_deref();
+                if let (Some(lb), Some(ub)) = (lower, upper) {
+                    let pred_bytes = pred_val.as_bytes();
+                    if pred_bytes >= lb && pred_bytes <= ub {
+                        // This field's partition value overlaps - check next field.
+                        continue;
+                    } else {
+                        all_fields_match = false;
+                        break;
+                    }
+                } else {
+                    // No bounds - conservatively assume match.
+                    continue;
+                }
+            }
+            if all_fields_match {
+                matches_any = true;
+                break;
+            }
+        }
+
+        if !matches_any {
+            kept.push(entry.clone());
+        }
+    }
+
+    Ok(kept)
+}
+
 fn commit_conflict_error() -> DataFusionError {
     DataFusionError::Execution(format!(
         "Iceberg commit failed after {MAX_COMMIT_RETRIES} retries due to concurrent metadata updates"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::physical_plan::action_schema::encode_commit_meta;
+    use crate::spec::Operation;
+
+    fn commit_meta(row_count: u64) -> CommitMeta {
+        CommitMeta {
+            table_uri: "s3://bucket/table".to_string(),
+            row_count,
+            operation: Operation::Append,
+            requirements: vec![],
+            table_properties: vec![],
+            lakehouse_table: None,
+            schema: None,
+            partition_spec: None,
+            touched_file_paths: vec![],
+            overwrite_predicate: None,
+            overwrite_partition_values: None,
+        }
+    }
+
+    fn action_batches(row_counts: &[u64]) -> Result<Vec<RecordBatch>> {
+        row_counts
+            .iter()
+            .map(|&rc| encode_commit_meta(commit_meta(rc)))
+            .collect::<Result<Vec<_>>>()
+    }
+
+    fn reported_count(batches: &[RecordBatch], reported_row_count: Option<u64>) -> Result<u64> {
+        let mut accumulated: Option<CommitMeta> = None;
+        for batch in batches {
+            let (_, _, meta) = decode_actions_and_meta_from_batch(batch)?;
+            if let Some(meta) = meta {
+                IcebergCommitExec::merge_writer_commit_meta(&mut accumulated, meta)?;
+            }
+        }
+        let total = accumulated.map(|meta| meta.row_count).unwrap_or(0);
+        Ok(reported_row_count.unwrap_or(total))
+    }
+
+    #[test]
+    fn count_sums_multiple_commit_meta() -> Result<()> {
+        // LOAD DATA union: fast-register branch (3 rows) + rewrite writer (2 rows).
+        let batches = action_batches(&[3, 2])?;
+        assert_eq!(reported_count(&batches, None)?, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn count_single_commit_meta() -> Result<()> {
+        // INSERT-like: a single writer with no override.
+        let batches = action_batches(&[3])?;
+        assert_eq!(reported_count(&batches, None)?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn count_reported_row_count_overrides() -> Result<()> {
+        // UPDATE/DELETE/MERGE pass an explicit reported count; it must win.
+        let batches = action_batches(&[3, 2])?;
+        assert_eq!(reported_count(&batches, Some(7))?, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn count_zero_for_no_commit_meta() -> Result<()> {
+        // No commit_meta actions -> zero reported rows.
+        let batches = action_batches(&[])?;
+        assert_eq!(reported_count(&batches, None)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn merge_rejects_inconsistent_commit_meta() -> Result<()> {
+        // A second commit_meta targeting a different table is inconsistent and
+        // must be rejected rather than silently accepted.
+        let mut accumulated = Some(commit_meta(3));
+        let mut incoming = commit_meta(4);
+        incoming.table_uri = "s3://bucket/other".to_string();
+        let result = IcebergCommitExec::merge_writer_commit_meta(&mut accumulated, incoming);
+        assert!(result.is_err());
+        Ok(())
+    }
 }

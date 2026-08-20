@@ -2,7 +2,7 @@ use prost::Message;
 
 use crate::error::ExecutionResult;
 use crate::id::{JobId, TaskKey};
-use crate::rpc::{ClientHandle, ClientOptions, ClientService};
+use crate::rpc::{ClientHandle, ClientOptions, ClientService, rpc_error};
 use crate::stream_service::{TaskStreamFlightClient, TaskStreamOwner};
 use crate::task::definition::TaskDefinition;
 use crate::worker::event::WorkerLocation;
@@ -57,7 +57,14 @@ impl WorkerClient {
             definition,
             peers: peers.into_iter().map(|x| x.into()).collect(),
         };
-        let response = self.inner.get().await?.run_task(request).await?;
+        let response = self
+            .inner
+            .get()
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?
+            .run_task(request)
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?;
         let RunTaskResponse {} = response.into_inner();
         Ok(())
     }
@@ -69,7 +76,14 @@ impl WorkerClient {
             partition: key.partition as u64,
             attempt: key.attempt as u64,
         };
-        let response = self.inner.get().await?.stop_task(request).await?;
+        let response = self
+            .inner
+            .get()
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?
+            .stop_task(request)
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?;
         let StopTaskResponse {} = response.into_inner();
         Ok(())
     }
@@ -79,14 +93,28 @@ impl WorkerClient {
             job_id: job_id.into(),
             stage: stage.map(|x| x as u64),
         };
-        let response = self.inner.get().await?.clean_up_job(request).await?;
+        let response = self
+            .inner
+            .get()
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?
+            .clean_up_job(request)
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?;
         let CleanUpJobResponse {} = response.into_inner();
         Ok(())
     }
 
     pub async fn stop_worker(&self) -> ExecutionResult<()> {
         let request = StopWorkerRequest {};
-        let response = self.inner.get().await?.stop_worker(request).await?;
+        let response = self
+            .inner
+            .get()
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?
+            .stop_worker(request)
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?;
         let StopWorkerResponse {} = response.into_inner();
         Ok(())
     }

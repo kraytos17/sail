@@ -26,6 +26,7 @@ pub struct WorkerOptions {
     pub task_stream_creation_timeout: Duration,
     pub rpc_retry_strategy: RetryStrategy,
     pub shuffle_backend: ShuffleBackendKind,
+    pub http2_keepalive_timeout: Duration,
     pub runtime: RuntimeHandle,
     pub session: SessionContext,
 }
@@ -56,6 +57,9 @@ impl WorkerOptions {
             ),
             rpc_retry_strategy: (&config.cluster.rpc_retry_strategy).into(),
             shuffle_backend: (&config.cluster.shuffle_backend).into(),
+            http2_keepalive_timeout: Duration::from_secs(
+                config.server.http2_keepalive_timeout_secs,
+            ),
             runtime,
             session,
         }
@@ -83,6 +87,7 @@ impl WorkerOptions {
             task_stream_creation_timeout: options.task_stream_creation_timeout,
             rpc_retry_strategy: options.rpc_retry_strategy,
             shuffle_backend: options.shuffle_backend,
+            http2_keepalive_timeout: Duration::from_secs(60),
             runtime: runtime.clone(),
             session,
         }

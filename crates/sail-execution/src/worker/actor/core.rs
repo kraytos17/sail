@@ -30,6 +30,10 @@ impl Actor for WorkerActor {
                 enable_tls: options.enable_tls,
                 host: options.driver_host.clone(),
                 port: options.driver_port,
+                peer: format!(
+                    "driver {} at {}:{}",
+                    options.driver_id, options.driver_host, options.driver_port
+                ),
             },
         );
         let peer_tracker = PeerTracker::new(PeerTrackerOptions::from(&options));
@@ -53,7 +57,14 @@ impl Actor for WorkerActor {
         let server = mem::take(&mut self.server);
         let span = Span::enter_with_local_parent("WorkerActor::serve");
         self.server = server
-            .start(Self::serve(ctx.handle().clone(), addr).in_span(span))
+            .start(
+                Self::serve(
+                    ctx.handle().clone(),
+                    addr,
+                    self.options.http2_keepalive_timeout,
+                )
+                .in_span(span),
+            )
             .await;
     }
 

@@ -651,6 +651,7 @@ impl PlanResolver<'_> {
                         options: vec![OptionLayer::TablePropertyList {
                             items: properties.to_vec(),
                         }],
+                        metadata_table: None,
                         read_case_sensitive: self.config.case_sensitive,
                     };
                     let metadata = table_format
@@ -689,6 +690,7 @@ impl PlanResolver<'_> {
                         options: vec![OptionLayer::TablePropertyList {
                             items: properties.to_vec(),
                         }],
+                        metadata_table: None,
                         read_case_sensitive: self.config.case_sensitive,
                     };
                     match table_format.infer_metadata(&self.ctx.state(), info).await {

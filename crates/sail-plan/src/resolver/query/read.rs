@@ -9,7 +9,9 @@ use datafusion_expr::{Expr, LogicalPlan, SubqueryAlias, TableScan, TableSource, 
 use rand::{RngExt, rng};
 use sail_catalog::manager::CatalogManager;
 use sail_common::spec;
-use sail_common_datafusion::catalog::{LakehouseOperation, TableColumnStatus, TableKind};
+use sail_common_datafusion::catalog::{
+    IcebergMetadataTableType, LakehouseOperation, TableColumnStatus, TableKind,
+};
 use sail_common_datafusion::datasource::{OptionLayer, SourceInfo, TableFormatRegistry};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::literal::LiteralEvaluator;
@@ -80,6 +82,19 @@ impl PlanResolver<'_> {
             };
         }
 
+        // Iceberg metadata tables: `db.table.refs` / `db.table.snapshots` expose the
+        // base table's metadata as data. Detect a trailing metadata-table name and, if
+        // the remaining prefix resolves to an Iceberg table, route the read through the
+        // metadata-table provider (see `IcebergMetadataTableProvider`). This mirrors
+        // Iceberg's `BaseMetastoreCatalog.loadTable`, where the last identifier is the
+        // metadata table name and the namespace is the base table.
+        if let Some(metadata_type) = self
+            .try_resolve_iceberg_metadata_table(&name, state)
+            .await?
+        {
+            return Ok(metadata_type);
+        }
+
         let reference: Vec<String> = name.clone().into();
         let status = self
             .ctx
@@ -128,6 +143,7 @@ impl PlanResolver<'_> {
                             items: temporal_options,
                         },
                     ],
+                    metadata_table: None,
                     read_case_sensitive: self.config.case_sensitive,
                 };
                 let registry = self.ctx.extension::<TableFormatRegistry>()?;
@@ -174,6 +190,93 @@ impl PlanResolver<'_> {
         } else {
             Ok(plan)
         }
+    }
+
+    /// If `name` ends with an Iceberg metadata-table name (`refs`, `snapshots`) and the
+    /// remaining prefix resolves to an Iceberg table, build a read of that metadata table.
+    /// Returns `Ok(None)` when the name is not a metadata-table read, so the caller falls
+    /// through to normal table resolution.
+    async fn try_resolve_iceberg_metadata_table(
+        &self,
+        name: &spec::ObjectName,
+        state: &mut PlanResolverState,
+    ) -> PlanResult<Option<LogicalPlan>> {
+        let parts = name.parts();
+        let Some(metadata_type) = parts
+            .last()
+            .and_then(|p| IcebergMetadataTableType::from_name(p.as_ref()))
+        else {
+            return Ok(None);
+        };
+        // A metadata table needs at least `db.table.<name>`.
+        let Some((_, base_parts)) = parts.split_last() else {
+            return Ok(None);
+        };
+        if base_parts.len() < 2 {
+            return Ok(None);
+        }
+
+        // Resolve the base table; it must exist and be an Iceberg table.
+        let base_reference: Vec<String> =
+            base_parts.iter().map(|p| p.as_ref().to_string()).collect();
+        let catalog_manager = self.ctx.extension::<CatalogManager>()?;
+        let status = match catalog_manager.get_table_or_view(&base_reference).await {
+            Ok(status) => status,
+            Err(_) => return Ok(None),
+        };
+        let TableKind::Table {
+            format,
+            location: Some(location),
+            properties,
+            ..
+        } = &status.kind
+        else {
+            return Ok(None);
+        };
+        if !format.eq_ignore_ascii_case("iceberg") {
+            return Ok(None);
+        }
+
+        let lakehouse_table = self
+            .resolve_lakehouse_table_context(
+                &base_reference,
+                LakehouseOperation::Read,
+                Some(format),
+                vec![],
+            )
+            .await?;
+
+        let info = SourceInfo {
+            paths: vec![location.clone()],
+            lakehouse_table: Some(lakehouse_table),
+            schema: None,
+            constraints: Default::default(),
+            partition_by: vec![],
+            bucket_by: None,
+            sort_order: vec![],
+            options: vec![OptionLayer::TablePropertyList {
+                items: properties.clone(),
+            }],
+            metadata_table: Some(metadata_type),
+            read_case_sensitive: self.config.case_sensitive,
+        };
+
+        let registry = self.ctx.extension::<TableFormatRegistry>()?;
+        let table_source = registry
+            .get("iceberg")?
+            .create_source(&self.ctx.state(), info)
+            .await?;
+
+        let table_reference = self.resolve_table_reference(name)?;
+        let plan = self.resolve_table_source_with_rename(
+            table_source,
+            table_reference,
+            None,
+            vec![],
+            None,
+            state,
+        )?;
+        Ok(Some(plan))
     }
 
     pub(super) async fn resolve_query_read_dynamic_table(
@@ -478,6 +581,7 @@ impl PlanResolver<'_> {
             options: vec![OptionLayer::OptionList {
                 items: options.into_iter().collect(),
             }],
+            metadata_table: None,
             read_case_sensitive: self.config.case_sensitive,
         };
         let registry = self.ctx.extension::<TableFormatRegistry>()?;

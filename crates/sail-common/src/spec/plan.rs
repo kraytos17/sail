@@ -317,6 +317,10 @@ pub enum CommandNode {
         database: Option<ObjectName>,
         pattern: String,
     },
+    ShowTblProperties {
+        table: ObjectName,
+        property_key: Option<String>,
+    },
     ShowFunctions {
         database: Option<ObjectName>,
         pattern: Option<String>,
@@ -506,6 +510,10 @@ pub enum CommandNode {
         table: ObjectName,
         overwrite: bool,
         partition: Vec<(Identifier, Option<Expr>)>,
+    },
+    CallProcedure {
+        name: ObjectName,
+        arguments: Vec<(Option<Identifier>, Expr)>,
     },
     AnalyzeTable {
         table: ObjectName,
@@ -1372,6 +1380,9 @@ pub enum ExplainMode {
 #[serde(rename_all = "camelCase")]
 pub enum AlterTableOperation {
     Unknown,
+    RenameTable {
+        new_name: ObjectName,
+    },
     SetTableProperties {
         properties: Vec<(String, String)>,
     },
@@ -1387,11 +1398,55 @@ pub enum AlterTableOperation {
         name: ObjectName,
         default: Option<String>,
     },
+    AlterColumnComment {
+        name: ObjectName,
+        comment: Option<String>,
+    },
+    AlterColumnNullability {
+        name: ObjectName,
+        nullable: bool,
+    },
+    AlterColumnPosition {
+        name: ObjectName,
+        position: ColumnPosition,
+    },
     AddCheckConstraint {
         name: Identifier,
         expression: ExprWithSource,
     },
-    // TODO: add all the alter table operations
+    AddColumns {
+        items: Vec<ColumnDefinition>,
+    },
+    DropColumns {
+        names: Vec<ObjectName>,
+        if_exists: bool,
+    },
+}
+
+/// Definition of a column for ALTER TABLE ADD COLUMNS.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColumnDefinition {
+    pub name: ObjectName,
+    pub data_type: DataType,
+    pub nullable: bool,
+    pub default: Option<String>,
+    pub comment: Option<String>,
+}
+
+/// Column alteration option for ALTER TABLE ADD COLUMNS.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ColumnAlterationOption {
+    NotNull,
+    Default(Box<Expr>),
+    Comment(String),
+    Position(ColumnPosition),
+}
+
+/// Column position for ALTER TABLE ADD COLUMNS.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ColumnPosition {
+    First,
+    After(ObjectName),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

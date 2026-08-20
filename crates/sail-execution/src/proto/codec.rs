@@ -250,8 +250,8 @@ use sail_function::scalar::xml::xpath_typed::{XpathTyped, xpath_typed_name_to_ki
 use sail_function::window::{SparkFirstLastValue, SparkFirstLastValueKind, SparkNtile};
 use sail_iceberg::IcebergWriterExecOptions;
 use sail_iceberg::physical_plan::{
-    IcebergCommitExec, IcebergDeleteApplyExec, IcebergDiscoveryExec, IcebergManifestScanExec,
-    IcebergScanByDataFilesExec, IcebergWriterExec,
+    IcebergCommitExec, IcebergDeleteApplyExec, IcebergDiscoveryExec, IcebergLoadDataFastExec,
+    IcebergManifestScanExec, IcebergScanByDataFilesExec, IcebergWriterExec,
 };
 use sail_logical_plan::range::Range;
 use sail_logical_plan::show_string::{ShowStringFormat, ShowStringStyle};
@@ -1416,13 +1416,56 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 input,
                 table_url,
                 output_schema,
+                file_path_column,
             }) => {
                 let input = try_decode_physical_plan(ctx, self, &input)?;
                 let output_schema = Arc::new(try_decode_schema(&output_schema)?);
-                Ok(Arc::new(IcebergScanByDataFilesExec::new(
-                    input,
+                Ok(Arc::new(
+                    IcebergScanByDataFilesExec::new_with_file_path_column(
+                        input,
+                        table_url,
+                        output_schema,
+                        file_path_column,
+                    ),
+                ))
+            }
+            NodeKind::IcebergLoadDataFast(r#gen::IcebergLoadDataFastExecNode {
+                data_files_json,
+                table_url,
+                operation,
+                requirements_json,
+                table_properties_json,
+                lakehouse_table_json,
+            }) => {
+                let data_files: Vec<sail_iceberg::spec::DataFile> = self
+                    .try_decode_json(&data_files_json, "iceberg data files")
+                    .map_err(|e| {
+                        plan_datafusion_err!("failed to decode iceberg data files: {e}")
+                    })?;
+                let table_url = Url::parse(&table_url)
+                    .map_err(|e| plan_datafusion_err!("failed to parse table URL: {e}"))?;
+                let operation: sail_iceberg::spec::Operation = self
+                    .try_decode_json(&operation, "iceberg operation")
+                    .map_err(|e| plan_datafusion_err!("failed to decode iceberg operation: {e}"))?;
+                let requirements: Vec<sail_iceberg::spec::TableRequirement> = self
+                    .try_decode_json(&requirements_json, "iceberg requirements")
+                    .map_err(|e| {
+                        plan_datafusion_err!("failed to decode iceberg requirements: {e}")
+                    })?;
+                let table_properties: Vec<(String, String)> = self
+                    .try_decode_json(&table_properties_json, "iceberg table properties")
+                    .map_err(|e| {
+                        plan_datafusion_err!("failed to decode iceberg table properties: {e}")
+                    })?;
+                let lakehouse_table = self.try_decode_lakehouse_table(&lakehouse_table_json)?;
+
+                Ok(Arc::new(IcebergLoadDataFastExec::new(
+                    data_files,
                     table_url,
-                    output_schema,
+                    operation,
+                    requirements,
+                    table_properties,
+                    lakehouse_table,
                 )))
             }
             NodeKind::IcebergDeleteApply(r#gen::IcebergDeleteApplyExecNode {
@@ -2258,6 +2301,28 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 input,
                 table_url: scan_by_files.table_url().to_string(),
                 output_schema,
+                file_path_column: scan_by_files.file_path_column().clone(),
+            })
+        } else if let Some(load_data_fast) = node.downcast_ref::<IcebergLoadDataFastExec>() {
+            let data_files_json = serde_json::to_string(load_data_fast.data_files())
+                .map_err(|e| plan_datafusion_err!("failed to encode Iceberg data files: {e}"))?;
+            let operation_json = serde_json::to_string(load_data_fast.operation())
+                .map_err(|e| plan_datafusion_err!("failed to encode Iceberg operation: {e}"))?;
+            let requirements_json = serde_json::to_string(load_data_fast.requirements())
+                .map_err(|e| plan_datafusion_err!("failed to encode Iceberg requirements: {e}"))?;
+            let table_properties_json = serde_json::to_string(load_data_fast.table_properties())
+                .map_err(|e| {
+                    plan_datafusion_err!("failed to encode Iceberg table properties: {e}")
+                })?;
+            let lakehouse_table_json =
+                self.try_encode_lakehouse_table(load_data_fast.lakehouse_table())?;
+            NodeKind::IcebergLoadDataFast(r#gen::IcebergLoadDataFastExecNode {
+                data_files_json,
+                table_url: load_data_fast.table_url().to_string(),
+                operation: operation_json,
+                requirements_json,
+                table_properties_json,
+                lakehouse_table_json,
             })
         } else if let Some(delete_apply) = node.downcast_ref::<IcebergDeleteApplyExec>() {
             let input = try_encode_physical_plan(self, delete_apply.input().clone())?;
@@ -5836,6 +5901,69 @@ mod tests {
 
         assert!(decoded.inner().downcast_ref::<SparkDatePart>().is_some());
         assert_eq!(decoded.name(), "date_part");
+
+        Ok(())
+    }
+
+    /// Round-trips an `IcebergLoadDataFastExec` through the remote codec, proving the
+    /// `IcebergLoadDataFastExecNode` proto survives encode/decode with all fields
+    /// (data files JSON, operation, requirements, table properties, lakehouse).
+    #[test]
+    fn test_round_trip_iceberg_load_data_fast_exec() -> Result<()> {
+        use sail_iceberg::spec::{DataContentType, DataFile, DataFileFormat, Operation};
+
+        let data_file = DataFile {
+            content: DataContentType::Data,
+            file_path: "s3a://bucket/path/data.parquet".to_string(),
+            file_format: DataFileFormat::Parquet,
+            partition: vec![],
+            record_count: 42,
+            file_size_in_bytes: 1024,
+            column_sizes: Default::default(),
+            value_counts: Default::default(),
+            null_value_counts: Default::default(),
+            nan_value_counts: Default::default(),
+            lower_bounds: Default::default(),
+            upper_bounds: Default::default(),
+            block_size_in_bytes: None,
+            key_metadata: None,
+            split_offsets: vec![4, 8],
+            equality_ids: vec![],
+            sort_order_id: None,
+            first_row_id: None,
+            partition_spec_id: 0,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
+
+        let node = Arc::new(IcebergLoadDataFastExec::new(
+            vec![data_file],
+            Url::parse("s3a://bucket/path")
+                .map_err(|e| plan_datafusion_err!("failed to parse table URL: {e}"))?,
+            Operation::Append,
+            vec![sail_iceberg::spec::TableRequirement::NotExist],
+            vec![("key".to_string(), "value".to_string())],
+            None,
+        )) as Arc<dyn ExecutionPlan>;
+
+        let codec = RemoteExecutionCodec;
+        let mut buf = vec![];
+        codec.try_encode(node.clone(), &mut buf)?;
+
+        let ctx = datafusion::execution::context::SessionContext::new().task_ctx();
+        let decoded = codec.try_decode(&buf, &[], ctx.as_ref())?;
+
+        let decoded_node = decoded
+            .downcast_ref::<IcebergLoadDataFastExec>()
+            .ok_or_else(|| plan_datafusion_err!("decoded plan is not IcebergLoadDataFastExec"))?;
+        assert_eq!(decoded_node.data_files().len(), 1);
+        assert_eq!(decoded_node.data_files()[0].record_count, 42);
+        assert_eq!(decoded_node.operation(), &Operation::Append);
+        assert_eq!(
+            decoded_node.table_properties(),
+            &[("key".to_string(), "value".to_string())]
+        );
 
         Ok(())
     }

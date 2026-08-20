@@ -36,6 +36,12 @@ pub struct SnapshotProducer<'a> {
     /// If true, create a snapshot with no parent (for bootstrap scenarios)
     pub is_bootstrap: bool,
     pub row_lineage_start_row_id: Option<i64>,
+    /// When set, overrides how the parent manifest entries are resolved at commit:
+    /// row-level operations pass the untouched subset of the parent manifests so the
+    /// new snapshot keeps only those files that were not rewritten. `None` restores the
+    /// default behavior (Append loads the full parent list; overwrite-style ops start
+    /// from an empty parent list).
+    pub parent_manifest_entries: Option<Vec<crate::spec::manifest_list::ManifestFile>>,
 }
 
 impl<'a> SnapshotProducer<'a> {
@@ -53,6 +59,7 @@ impl<'a> SnapshotProducer<'a> {
             write_path_mode: crate::utils::WritePathMode::Absolute,
             is_bootstrap: false,
             row_lineage_start_row_id: None,
+            parent_manifest_entries: None,
         }
     }
 
@@ -73,6 +80,16 @@ impl<'a> SnapshotProducer<'a> {
         self
     }
 
+    /// Override how the parent manifest entries are resolved at commit (see the
+    /// `parent_manifest_entries` field docs).
+    pub fn with_parent_manifest_entries(
+        mut self,
+        entries: Option<Vec<crate::spec::manifest_list::ManifestFile>>,
+    ) -> Self {
+        self.parent_manifest_entries = entries;
+        self
+    }
+
     pub fn validate_added_data_files(&self, _files: &[DataFile]) -> Result<(), String> {
         // TODO: Implement this function to validate the added data files
         Ok(())
@@ -80,12 +97,18 @@ impl<'a> SnapshotProducer<'a> {
 
     pub async fn commit(self, op: impl SnapshotProduceOperation) -> Result<ActionCommit, String> {
         let timestamp_ms = crate::utils::timestamp::monotonic_timestamp_ms();
-        let is_overwrite = op.operation() == Operation::Overwrite.as_str();
-        let summary = if is_overwrite {
-            crate::spec::snapshots::Summary::new(Operation::Overwrite)
-        } else {
-            crate::spec::snapshots::Summary::new(Operation::Append)
+        let op_str = op.operation();
+
+        // Map the producer operation string to the Iceberg Operation enum so that
+        // DELETE produces Operation::Delete, COMPACT produces Operation::Replace, etc.
+        let op_type = match op_str {
+            "append" => Operation::Append,
+            "overwrite" => Operation::Overwrite,
+            "delete" => Operation::Delete,
+            "replace" => Operation::Replace,
+            _ => Operation::Append, // fallback
         };
+        let summary = crate::spec::snapshots::Summary::new(op_type);
 
         // Build manifest metadata: prefer caller-provided metadata derived from table schema/spec
         // Fall back to deriving from the current transaction snapshot if not provided
@@ -127,7 +150,17 @@ impl<'a> SnapshotProducer<'a> {
         let parent_manifest_list_path_str = parent_snapshot.manifest_list();
         let mut parent_manifest_entries = Vec::new();
 
-        if !self.is_bootstrap && !is_overwrite && !parent_manifest_list_path_str.is_empty() {
+        // Resolve parent manifest entries:
+        // - If explicit override is Some, use it directly.
+        // - If explicit override is None, use the default behavior:
+        //   - Append (and not bootstrap): load the parent manifests.
+        //   - Overwrite / Delete / Replace (and not bootstrap): start from an empty list.
+        if let Some(entries) = self.parent_manifest_entries {
+            parent_manifest_entries = entries;
+        } else if !self.is_bootstrap
+            && op_str == Operation::Append.as_str()
+            && !parent_manifest_list_path_str.is_empty()
+        {
             let (store_ref, manifest_list_path) = store_ctx
                 .resolve(parent_manifest_list_path_str)
                 .map_err(|e| format!("{}", e))?;

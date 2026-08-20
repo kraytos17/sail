@@ -1,12 +1,16 @@
 mod planner;
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+
+use crate::error::{ExecutionError, ExecutionResult};
+use crate::proto::encode_remote_physical_plan;
 
 #[derive(Debug, Clone)]
 pub struct JobGraphOptions {
@@ -96,11 +100,29 @@ impl fmt::Display for JobGraph {
 pub struct Stage {
     pub inputs: Vec<StageInput>,
     pub plan: Arc<dyn ExecutionPlan>,
+    /// The serialized stage plan, encoded lazily once and shared by every task
+    /// (and task re-attempt) of this stage.
+    encoded_plan: OnceLock<Arc<[u8]>>,
     /// The name of the "slot sharing group" for the stage.
     pub group: String,
     pub mode: OutputMode,
     pub distribution: OutputDistribution,
     pub placement: TaskPlacement,
+}
+
+impl Stage {
+    /// Returns the serialized stage plan, encoding it lazily once and sharing it
+    /// across all tasks (and task re-attempts) of this stage.
+    pub fn encoded_plan(&self, codec: &dyn PhysicalExtensionCodec) -> ExecutionResult<Arc<[u8]>> {
+        if let Some(plan) = self.encoded_plan.get() {
+            return Ok(plan.clone());
+        }
+        let plan = Arc::from(encode_remote_physical_plan(codec, self.plan.clone())?);
+        let _ = self.encoded_plan.set(plan);
+        Ok(self.encoded_plan.get().cloned().ok_or_else(|| {
+            ExecutionError::InternalError("encoded stage plan was not cached".to_string())
+        })?)
+    }
 }
 
 /// Specifies whether a task must run on the driver or on any available worker node.

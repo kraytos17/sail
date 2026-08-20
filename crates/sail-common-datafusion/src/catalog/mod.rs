@@ -1,6 +1,7 @@
 pub mod delta;
 pub mod display;
 pub mod iceberg;
+pub use iceberg::IcebergMetadataTableType;
 pub mod lakehouse;
 pub mod managed;
 mod status;

@@ -10,6 +10,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -19,6 +20,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_expr::{Distribution, EquivalenceProperties};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
@@ -65,6 +67,7 @@ pub struct IcebergWriterExec {
     options: IcebergWriterExecOptions,
     logical_input_schema: Option<SchemaRef>,
     cache: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl IcebergWriterExec {
@@ -119,6 +122,7 @@ impl IcebergWriterExec {
             options,
             logical_input_schema,
             cache,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -299,7 +303,30 @@ impl ExecutionPlan for IcebergWriterExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::UnspecifiedDistribution]
+        if self.partition_columns.is_empty() {
+            // Upstream repartitioning controls file counts and small-file behavior.
+            return vec![Distribution::UnspecifiedDistribution];
+        }
+
+        // For partitioned tables, require grouping by the partition key so that each task can
+        // write its partitions correctly without opening many writers concurrently.
+        let mut exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> =
+            Vec::with_capacity(self.partition_columns.len());
+        for field in &self.partition_columns {
+            let idx = match self.input.schema().index_of(&field.column) {
+                Ok(i) => i,
+                Err(_) => return vec![Distribution::UnspecifiedDistribution],
+            };
+            exprs.push(Arc::new(
+                datafusion::physical_expr::expressions::Column::new(&field.column, idx),
+            ));
+        }
+
+        vec![Distribution::HashPartitioned(exprs)]
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -341,6 +368,10 @@ impl ExecutionPlan for IcebergWriterExec {
 
         let stream = self.input.execute(partition, Arc::clone(&context))?;
 
+        let output_rows = MetricBuilder::new(&self.metrics).output_rows(partition);
+        let output_bytes = MetricBuilder::new(&self.metrics).output_bytes(partition);
+        let elapsed_compute = MetricBuilder::new(&self.metrics).elapsed_compute(partition);
+
         let table_url = self.table_url.clone();
         let partition_columns = self.partition_columns.clone();
         let sink_mode = self.sink_mode.clone();
@@ -351,6 +382,7 @@ impl ExecutionPlan for IcebergWriterExec {
 
         let schema = self.schema();
         let future = async move {
+            let _elapsed_compute_timer = elapsed_compute.timer();
             match sink_mode {
                 PhysicalSinkMode::ErrorIfExists => {
                     if table_exists {
@@ -560,10 +592,14 @@ impl ExecutionPlan for IcebergWriterExec {
                 UnboundPartitionSpec { fields: vec![] }
             };
 
+            let compression = resolve_compression_codec(&options.compression_codec)?;
+            let writer_properties = WriterProperties::builder()
+                .set_compression(compression)
+                .build();
             let writer_config = WriterConfig {
                 table_schema: table_schema.clone(),
                 partition_columns: partition_columns.clone(),
-                writer_properties: WriterProperties::default(),
+                writer_properties,
                 target_file_size: 134_217_728,
                 write_batch_size: 32 * 1024,
                 num_indexed_cols: 32,
@@ -589,6 +625,8 @@ impl ExecutionPlan for IcebergWriterExec {
             while let Some(batch_result) = data.next().await {
                 let batch = batch_result?;
                 let batch_row_count = batch.num_rows();
+                output_rows.add(batch_row_count);
+                output_bytes.add(batch.get_array_memory_size());
                 total_rows += u64::try_from(batch_row_count).map_err(|e| {
                     DataFusionError::Execution(format!("Row count overflow: {}", e))
                 })?;
@@ -600,14 +638,44 @@ impl ExecutionPlan for IcebergWriterExec {
 
             let data_files = writer.close().await.map_err(DataFusionError::Execution)?;
 
+            // Extract unique partition value tuples for partition overwrite mode.
+            let overwrite_partition_values =
+                if matches!(sink_mode, PhysicalSinkMode::OverwritePartitions) {
+                    let mut unique_partitions: HashSet<Vec<String>> = HashSet::new();
+                    for df in &data_files {
+                        let parts: Vec<String> = df
+                            .partition
+                            .iter()
+                            .map(|opt| match opt {
+                                Some(lit) => format!("{lit:?}"),
+                                None => "__NULL__".to_string(),
+                            })
+                            .collect();
+                        unique_partitions.insert(parts);
+                    }
+                    Some(
+                        serde_json::to_string(&unique_partitions.into_iter().collect::<Vec<_>>())
+                            .unwrap_or_else(|_| "[]".to_string()),
+                    )
+                } else {
+                    None
+                };
+
             let commit_meta = CommitMeta {
                 table_uri: table_url.to_string(),
                 row_count: total_rows,
-                operation: if matches!(sink_mode, PhysicalSinkMode::Overwrite) {
-                    crate::spec::Operation::Overwrite
-                } else {
-                    crate::spec::Operation::Append
-                },
+                operation: options.commit_operation.unwrap_or(
+                    if matches!(
+                        sink_mode,
+                        PhysicalSinkMode::Overwrite
+                            | PhysicalSinkMode::OverwriteIf { .. }
+                            | PhysicalSinkMode::OverwritePartitions
+                    ) {
+                        crate::spec::Operation::Overwrite
+                    } else {
+                        crate::spec::Operation::Append
+                    },
+                ),
                 requirements: commit_requirements,
                 table_properties: options.table_properties,
                 lakehouse_table: options.lakehouse_table,
@@ -619,6 +687,9 @@ impl ExecutionPlan for IcebergWriterExec {
                 } else {
                     None
                 },
+                touched_file_paths: options.touched_file_paths.clone(),
+                overwrite_predicate: options.overwrite_predicate,
+                overwrite_partition_values,
             };
 
             let schema = iceberg_action_schema()?;
@@ -650,5 +721,78 @@ impl DisplayAs for IcebergWriterExec {
                 write!(f, "table_path={}", self.table_url)
             }
         }
+    }
+}
+
+/// Resolve a compression-codec string to the parquet `Compression` enum.
+///
+/// Accepts the Spark/Iceberg codec names; `none`/`uncompressed` disable compression.
+fn resolve_compression_codec(codec: &str) -> Result<parquet::basic::Compression> {
+    use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
+    match codec.to_ascii_lowercase().as_str() {
+        "zstd" => Ok(Compression::ZSTD(ZstdLevel::default())),
+        "snappy" => Ok(Compression::SNAPPY),
+        "gzip" => Ok(Compression::GZIP(GzipLevel::default())),
+        "lz4" => Ok(Compression::LZ4_RAW),
+        "brotli" => Ok(Compression::BROTLI(BrotliLevel::default())),
+        "none" | "uncompressed" => Ok(Compression::UNCOMPRESSED),
+        other => Err(DataFusionError::Plan(format!(
+            "unsupported parquet compression codec '{other}' (expected one of: \
+             zstd, snappy, gzip, lz4, brotli, none, uncompressed)"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use parquet::basic::Compression;
+
+    use super::*;
+
+    #[test]
+    fn resolve_compression_codec_maps_codecs() {
+        assert_eq!(
+            resolve_compression_codec("zstd").unwrap(),
+            Compression::ZSTD(Default::default())
+        );
+        assert_eq!(
+            resolve_compression_codec("snappy").unwrap(),
+            Compression::SNAPPY
+        );
+        assert_eq!(
+            resolve_compression_codec("gzip").unwrap(),
+            Compression::GZIP(Default::default())
+        );
+        assert_eq!(
+            resolve_compression_codec("lz4").unwrap(),
+            Compression::LZ4_RAW
+        );
+        assert_eq!(
+            resolve_compression_codec("brotli").unwrap(),
+            Compression::BROTLI(Default::default())
+        );
+        assert_eq!(
+            resolve_compression_codec("none").unwrap(),
+            Compression::UNCOMPRESSED
+        );
+        assert_eq!(
+            resolve_compression_codec("UNCOMPRESSED").unwrap(),
+            Compression::UNCOMPRESSED
+        );
+        assert!(resolve_compression_codec("lzo").is_err());
+    }
+
+    #[test]
+    fn default_writer_properties_use_zstd() {
+        let properties = WriterProperties::builder()
+            .set_compression(
+                resolve_compression_codec(&IcebergWriterExecOptions::default().compression_codec)
+                    .unwrap(),
+            )
+            .build();
+        assert_eq!(
+            properties.compression(&parquet::schema::types::ColumnPath::new(Vec::new())),
+            Compression::ZSTD(Default::default())
+        );
     }
 }

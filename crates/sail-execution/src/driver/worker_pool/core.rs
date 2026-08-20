@@ -430,6 +430,7 @@ impl WorkerPool {
                         enable_tls: options.enable_tls,
                         host: host.clone(),
                         port: *port,
+                        peer: format!("worker {worker_id} at {host}:{port}"),
                     };
                     WorkerClientSet::new(options)
                 });

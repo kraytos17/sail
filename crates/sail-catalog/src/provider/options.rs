@@ -137,6 +137,16 @@ pub struct DropTemporaryViewOptions {
 /// Options for altering a table in a catalog.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Serialize, Deserialize)]
 pub enum AlterTableOptions {
+    RenameTable {
+        new_name: Vec<String>,
+    },
+    AddColumns {
+        columns: Vec<AddColumn>,
+    },
+    DropColumns {
+        names: Vec<String>,
+        if_exists: bool,
+    },
     SetTableProperties {
         properties: Vec<(String, String)>,
     },
@@ -152,8 +162,49 @@ pub enum AlterTableOptions {
         name: Vec<String>,
         default: Option<String>,
     },
+    AlterColumnComment {
+        name: Vec<String>,
+        comment: Option<String>,
+    },
+    AlterColumnNullability {
+        name: Vec<String>,
+        nullable: bool,
+    },
+    AlterColumnPosition {
+        name: Vec<String>,
+        position: sail_common::spec::ColumnPosition,
+    },
     AddCheckConstraint {
         name: String,
         expression: String,
+    },
+}
+
+/// Definition of a column to add via ALTER TABLE ADD COLUMNS.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Serialize, Deserialize)]
+pub struct AddColumn {
+    pub name: Vec<String>,
+    pub data_type: DataType,
+    pub nullable: bool,
+    pub default: Option<String>,
+    pub comment: Option<String>,
+}
+
+/// A procedure executed via `CALL <catalog>.system.<procedure>`.
+///
+/// The target table is carried separately by [`CatalogCommand::CallProcedure`]; these
+/// options hold only the procedure name-specific arguments.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Serialize, Deserialize)]
+pub enum CallProcedureOptions {
+    RollbackToSnapshot {
+        snapshot_id: i64,
+    },
+    SetCurrentSnapshot {
+        snapshot_id: Option<i64>,
+        r#ref: Option<String>,
+    },
+    ExpireSnapshots {
+        older_than_ms: Option<i64>,
+        retain_last: Option<i32>,
     },
 }

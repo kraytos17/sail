@@ -1,10 +1,13 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{JoinType, Result, plan_datafusion_err};
+use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder, ParquetSource};
 use datafusion::logical_expr::execution_props::ScalarSubqueryResults;
 use datafusion::physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion::physical_expr::{Partitioning, PhysicalExpr};
+use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::coop::CooperativeExec;
@@ -23,6 +26,7 @@ use datafusion::physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, PlanProperties, with_new_children_if_necessary,
 };
 use sail_catalog_system::physical_plan::SystemTableExec;
+use sail_common_datafusion::schema_evolution::SchemaEvolutionPhysicalExprAdapterFactory;
 use sail_common_datafusion::utils::items::ItemTaker;
 use sail_data_source::listing::delete::FileDeleteExec;
 use sail_delta_lake::physical_plan::DeltaCommitExec;
@@ -53,15 +57,13 @@ impl JobGraph {
             options,
         };
         let last = build_job_graph(plan, PartitionUsage::Once, &mut graph)?.plan;
-        let (last, inputs) = rewrite_inputs(last)?;
-        graph.stages.push(Stage {
-            inputs,
-            plan: last,
-            group: String::new(),
-            mode: OutputMode::Pipelined,
-            distribution: OutputDistribution::RoundRobin { channels: 1 },
-            placement: TaskPlacement::Worker,
-        });
+        push_stage(
+            last,
+            &mut graph,
+            OutputDistribution::RoundRobin { channels: 1 },
+            TaskPlacement::Worker,
+            OutputMode::Pipelined,
+        )?;
         Ok(graph)
     }
 }
@@ -903,9 +905,11 @@ fn push_stage(
     mode: OutputMode,
 ) -> ExecutionResult<usize> {
     let (plan, inputs) = rewrite_inputs(plan)?;
+    let plan = rewrite_file_scans(plan)?;
     let stage = Stage {
         inputs,
         plan,
+        encoded_plan: OnceLock::new(),
         group: String::new(),
         mode,
         distribution,
@@ -914,6 +918,35 @@ fn push_stage(
     let index = graph.stages.len();
     graph.stages.push(stage);
     Ok(index)
+}
+
+/// Rewrites file scans once per stage so that every task of the stage shares the
+/// same plan. DataFusion file scans can use process-local sibling state to let
+/// partitions steal work from a shared queue of all file groups. In Sail cluster
+/// mode each partition runs as an isolated task with its own deserialized plan,
+/// so that queue would be recreated in every task and every task would scan every
+/// file. Preserve-order disables sibling work sharing and keeps each task on its
+/// own file group.
+fn rewrite_file_scans(plan: Arc<dyn ExecutionPlan>) -> ExecutionResult<Arc<dyn ExecutionPlan>> {
+    let result = plan.transform(|node| {
+        if let Some(ds) = node.downcast_ref::<DataSourceExec>()
+            && let Some(base_config) = ds.data_source().downcast_ref::<FileScanConfig>()
+        {
+            let mut builder =
+                FileScanConfigBuilder::from(base_config.clone()).with_preserve_order(true);
+            if ds.downcast_to_file_source::<ParquetSource>().is_some()
+                && base_config.expr_adapter_factory.is_none()
+            {
+                let adapter_factory: Arc<dyn PhysicalExprAdapterFactory> =
+                    Arc::new(SchemaEvolutionPhysicalExprAdapterFactory {});
+                builder = builder.with_expr_adapter(Some(adapter_factory));
+            }
+            let new_exec = DataSourceExec::from_data_source(builder.build());
+            return Ok(Transformed::yes(new_exec as Arc<dyn ExecutionPlan>));
+        }
+        Ok(Transformed::no(node))
+    });
+    Ok(result.data()?)
 }
 
 fn stage_input_exec(

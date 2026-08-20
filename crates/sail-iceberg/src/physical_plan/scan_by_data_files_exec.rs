@@ -3,12 +3,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, StringArray, UInt64Array};
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::memory::DataSourceExec;
+use datafusion::common::ScalarValue;
 use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::table_schema::TableSchema;
 use datafusion::execution::context::TaskContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::physical_expr::{Distribution, EquivalenceProperties};
@@ -41,6 +43,8 @@ struct ScanByDataFilesState {
     table_url: Url,
     /// The Arrow schema of the actual user data.
     output_schema: SchemaRef,
+    /// When set, materializes each row's source file path in a column of this name.
+    file_path_column: Option<String>,
     /// Pending file entries (path, size_in_bytes) accumulated from the metadata stream.
     pending_files: Vec<(String, u64)>,
     /// Currently active scan stream (draining Parquet data).
@@ -57,12 +61,14 @@ impl ScanByDataFilesState {
         context: Arc<TaskContext>,
         table_url: Url,
         output_schema: SchemaRef,
+        file_path_column: Option<String>,
     ) -> Self {
         Self {
             input,
             context,
             table_url,
             output_schema,
+            file_path_column,
             pending_files: Vec::new(),
             current_scan: None,
             input_done: false,
@@ -127,6 +133,15 @@ impl ScanByDataFilesState {
         let mut partitioned_files = Vec::with_capacity(files.len());
         for (raw_path, file_size) in &files {
             let file_path = store_ctx.resolve_to_absolute_path(raw_path)?;
+            // The file path column must carry the EXACT string stored in the manifest
+            // (`data_file.file_path()`), not a re-resolved object path. Row-level
+            // operations compare this value against manifest paths when deciding which
+            // files to rewrite, so the two must be identical.
+            let partition_values = if self.file_path_column.is_some() {
+                vec![ScalarValue::Utf8(Some(raw_path.clone()))]
+            } else {
+                vec![]
+            };
             partitioned_files.push(PartitionedFile {
                 object_meta: ObjectMeta {
                     location: file_path,
@@ -135,7 +150,7 @@ impl ScanByDataFilesState {
                     e_tag: None,
                     version: None,
                 },
-                partition_values: vec![],
+                partition_values,
                 range: None,
                 statistics: None,
                 ordering: None,
@@ -161,10 +176,34 @@ impl ScanByDataFilesState {
                 .clone(),
             ..Default::default()
         };
-        let parquet_source = ParquetSource::new(Arc::clone(&self.output_schema))
-            .with_table_parquet_options(parquet_options);
+        // When a file path column is requested, materialize it through the Parquet
+        // scan's partition columns: the file schema is the user data schema and the
+        // file path is appended as a synthetic partition column.
+        let parquet_source = if let Some(file_path_column) = &self.file_path_column {
+            let file_schema = Arc::new(datafusion::arrow::datatypes::Schema::new(
+                self.output_schema
+                    .fields()
+                    .iter()
+                    .filter(|f| f.name() != file_path_column)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ));
+            let table_schema = TableSchema::new(
+                file_schema,
+                vec![Arc::new(datafusion::arrow::datatypes::Field::new(
+                    file_path_column.clone(),
+                    DataType::Utf8,
+                    true,
+                ))],
+            );
+            Arc::new(ParquetSource::new(table_schema).with_table_parquet_options(parquet_options))
+        } else {
+            let parquet_source = ParquetSource::new(Arc::clone(&self.output_schema))
+                .with_table_parquet_options(parquet_options);
+            Arc::new(parquet_source)
+        };
         let parquet_source: Arc<dyn datafusion::datasource::physical_plan::FileSource> =
-            Arc::new(parquet_source);
+            parquet_source;
 
         let file_scan_config = FileScanConfigBuilder::new(object_store_url, parquet_source)
             .with_file_groups(file_groups)
@@ -207,12 +246,36 @@ pub struct IcebergScanByDataFilesExec {
     table_url: String,
     /// The Arrow schema of the actual user data.
     output_schema: SchemaRef,
+    /// When set, each output row is tagged with its source file path in a column
+    /// of this name (materialized via the Parquet scan partition columns).
+    file_path_column: Option<String>,
     /// Cached plan properties.
     cache: Arc<PlanProperties>,
 }
 
 impl IcebergScanByDataFilesExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, table_url: String, output_schema: SchemaRef) -> Self {
+        Self::new_with_file_path_column(input, table_url, output_schema, None)
+    }
+
+    pub fn new_with_file_path_column(
+        input: Arc<dyn ExecutionPlan>,
+        table_url: String,
+        output_schema: SchemaRef,
+        file_path_column: Option<String>,
+    ) -> Self {
+        let output_schema = if let Some(column) = &file_path_column {
+            let mut builder =
+                datafusion::arrow::datatypes::SchemaBuilder::from(output_schema.as_ref().clone());
+            builder.push(datafusion::arrow::datatypes::Field::new(
+                column.clone(),
+                DataType::Utf8,
+                true,
+            ));
+            Arc::new(builder.finish())
+        } else {
+            output_schema
+        };
         let partition_count = input.output_partitioning().partition_count().max(1);
         let cache = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
@@ -224,6 +287,7 @@ impl IcebergScanByDataFilesExec {
             input,
             table_url: table_url.to_string(),
             output_schema,
+            file_path_column,
             cache,
         }
     }
@@ -238,6 +302,10 @@ impl IcebergScanByDataFilesExec {
 
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
+    }
+
+    pub fn file_path_column(&self) -> &Option<String> {
+        &self.file_path_column
     }
 }
 
@@ -309,8 +377,13 @@ impl ExecutionPlan for IcebergScanByDataFilesExec {
             Url::parse(&self.table_url).map_err(|e| DataFusionError::External(Box::new(e)))?;
         let output_schema = self.output_schema.clone();
 
-        let state =
-            ScanByDataFilesState::new(input_stream, context, table_url, Arc::clone(&output_schema));
+        let state = ScanByDataFilesState::new(
+            input_stream,
+            context,
+            table_url,
+            Arc::clone(&output_schema),
+            self.file_path_column.clone(),
+        );
 
         let s = stream::try_unfold(state, |mut st| async move {
             loop {

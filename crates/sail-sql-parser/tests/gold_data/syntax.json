@@ -2715,6 +2715,19 @@
                   {
                     "sequence": [
                       {
+                        "nonTerminal": "Keyword(View)"
+                      },
+                      {
+                        "nonTerminal": "Option(Keyword(Extended))"
+                      },
+                      {
+                        "nonTerminal": "ObjectName"
+                      }
+                    ]
+                  },
+                  {
+                    "sequence": [
+                      {
                         "nonTerminal": "Option(Keyword(Query))"
                       },
                       {
@@ -4416,6 +4429,14 @@
               "node": {
                 "terminal": {
                   "keyword": "CACHE"
+                }
+              }
+            },
+            {
+              "name": "Keyword(Call)",
+              "node": {
+                "terminal": {
+                  "keyword": "CALL"
                 }
               }
             },
@@ -6276,6 +6297,14 @@
               }
             },
             {
+              "name": "Keyword(Truncate)",
+              "node": {
+                "terminal": {
+                  "keyword": "TRUNCATE"
+                }
+              }
+            },
+            {
               "name": "Keyword(TryCast)",
               "node": {
                 "terminal": {
@@ -8041,6 +8070,14 @@
               "node": {
                 "optional": {
                   "nonTerminal": "Tuple(Operator(LeftParenthesis), Operator(RightParenthesis))"
+                }
+              }
+            },
+            {
+              "name": "Option(Tuple(Operator(LeftParenthesis), StringLiteral, Operator(RightParenthesis)))",
+              "node": {
+                "optional": {
+                  "nonTerminal": "Tuple(Operator(LeftParenthesis), StringLiteral, Operator(RightParenthesis))"
                 }
               }
             },
@@ -9869,6 +9906,22 @@
                         "nonTerminal": "Keyword(Show)"
                       },
                       {
+                        "nonTerminal": "Keyword(Tblproperties)"
+                      },
+                      {
+                        "nonTerminal": "ObjectName"
+                      },
+                      {
+                        "nonTerminal": "Option(Tuple(Operator(LeftParenthesis), StringLiteral, Operator(RightParenthesis)))"
+                      }
+                    ]
+                  },
+                  {
+                    "sequence": [
+                      {
+                        "nonTerminal": "Keyword(Show)"
+                      },
+                      {
                         "nonTerminal": "Keyword(Create)"
                       },
                       {
@@ -10183,6 +10236,32 @@
                       },
                       {
                         "nonTerminal": "Option(PartitionClause)"
+                      }
+                    ]
+                  },
+                  {
+                    "sequence": [
+                      {
+                        "nonTerminal": "Keyword(Truncate)"
+                      },
+                      {
+                        "nonTerminal": "Keyword(Table)"
+                      },
+                      {
+                        "nonTerminal": "ObjectName"
+                      }
+                    ]
+                  },
+                  {
+                    "sequence": [
+                      {
+                        "nonTerminal": "Keyword(Call)"
+                      },
+                      {
+                        "nonTerminal": "ObjectName"
+                      },
+                      {
+                        "nonTerminal": "FunctionArgumentList"
                       }
                     ]
                   },
@@ -11708,6 +11787,22 @@
                 "sequence": [
                   {
                     "nonTerminal": "Operator(LeftParenthesis)"
+                  },
+                  {
+                    "nonTerminal": "Operator(RightParenthesis)"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "Tuple(Operator(LeftParenthesis), StringLiteral, Operator(RightParenthesis))",
+              "node": {
+                "sequence": [
+                  {
+                    "nonTerminal": "Operator(LeftParenthesis)"
+                  },
+                  {
+                    "nonTerminal": "StringLiteral"
                   },
                   {
                     "nonTerminal": "Operator(RightParenthesis)"

@@ -23,7 +23,7 @@ use crate::id::{JobId, TaskKey, TaskKeyDisplay, TaskStreamKey};
 use crate::job_graph::{
     InputMode, JobGraph, OutputDistribution, OutputMode, Stage, StageInput, TaskPlacement,
 };
-use crate::proto::{encode_remote_physical_expr, encode_remote_physical_plan};
+use crate::proto::encode_remote_physical_expr;
 use crate::task::definition::{
     TaskDefinition, TaskInput, TaskInputKey, TaskInputLocator, TaskOutput, TaskOutputDistribution,
     TaskOutputLocator,
@@ -525,7 +525,7 @@ impl JobScheduler {
             )));
         };
 
-        let plan = encode_remote_physical_plan(self.codec.as_ref(), stage.plan.clone())?;
+        let plan = stage.encoded_plan(self.codec.as_ref())?;
         let inputs = stage
             .inputs
             .iter()
@@ -533,7 +533,7 @@ impl JobScheduler {
             .collect::<ExecutionResult<Vec<_>>>()?;
         let output = self.get_task_output(job, key, stage)?;
         let definition = TaskDefinition {
-            plan: Arc::from(plan),
+            plan,
             inputs,
             output,
         };

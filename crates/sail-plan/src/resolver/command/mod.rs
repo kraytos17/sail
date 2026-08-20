@@ -12,6 +12,7 @@ use crate::function::list_built_in_function_statuses;
 use crate::resolver::PlanResolver;
 use crate::resolver::state::PlanResolverState;
 
+mod call;
 mod catalog;
 mod checkpoint;
 mod delete;
@@ -19,8 +20,10 @@ mod delta;
 mod explain;
 mod function;
 mod insert;
+mod load;
 mod merge;
 mod show;
+mod update;
 mod variable;
 mod with_relations;
 mod write;
@@ -71,6 +74,13 @@ impl PlanResolver<'_> {
                     pattern,
                 })
             }
+            CommandNode::ShowTblProperties {
+                table,
+                property_key,
+            } => self.resolve_catalog_command(CatalogCommand::ShowTblProperties {
+                table: table.into(),
+                property_key,
+            }),
             CommandNode::ShowFunctions {
                 database,
                 pattern,
@@ -283,7 +293,15 @@ impl PlanResolver<'_> {
             CommandNode::SetVariable { variable, value } => {
                 self.resolve_command_set_variable(variable, value).await
             }
-            CommandNode::Update { .. } => Err(PlanError::todo("CommandNode::Update")),
+            CommandNode::Update {
+                table,
+                table_alias,
+                assignments,
+                condition,
+            } => {
+                self.resolve_command_update(table, table_alias, assignments, condition, state)
+                    .await
+            }
             CommandNode::Delete {
                 table,
                 table_alias,
@@ -305,7 +323,20 @@ impl PlanResolver<'_> {
                     .await
             }
             CommandNode::AlterView { .. } => Err(PlanError::todo("CommandNode::AlterView")),
-            CommandNode::LoadData { .. } => Err(PlanError::todo("CommandNode::LoadData")),
+            CommandNode::LoadData {
+                local,
+                location,
+                table,
+                overwrite,
+                partition,
+            } => {
+                self.resolve_command_load_data(local, location, table, overwrite, partition, state)
+                    .await
+            }
+            CommandNode::CallProcedure { name, arguments } => {
+                self.resolve_command_call_procedure(name, arguments, state)
+                    .await
+            }
             CommandNode::AnalyzeTable { .. } => Err(PlanError::todo("CommandNode::AnalyzeTable")),
             CommandNode::AnalyzeTables { .. } => Err(PlanError::todo("CommandNode::AnalyzeTables")),
             CommandNode::DescribeQuery { .. } => Err(PlanError::todo("CommandNode::DescribeQuery")),
@@ -334,12 +365,10 @@ impl PlanResolver<'_> {
                 if !partition.is_empty() {
                     return Err(PlanError::todo("DESCRIBE TABLE with partition spec"));
                 }
-                if column.is_some() {
-                    return Err(PlanError::todo("DESCRIBE TABLE with column"));
-                }
                 self.resolve_catalog_command(CatalogCommand::DescribeTable {
                     table: table.into(),
                     extended,
+                    column: column.map(|c| Vec::<String>::from(c).join(".")),
                 })
             }
             CommandNode::CommentOnCatalog { .. } => {

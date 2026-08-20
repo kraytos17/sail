@@ -169,4 +169,35 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn test_parse_truncate_table() -> SqlResult<()> {
+        let sql = "TRUNCATE TABLE landing.customers";
+        let tree = parse_one_statement(sql)?;
+        assert!(matches!(
+            tree,
+            Statement::TruncateTable { name, .. }
+                if name.0.items().map(|x| x.value.as_str()).collect::<Vec<_>>()
+                    == vec!["landing", "customers"]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_call_positional() -> SqlResult<()> {
+        let sql = "CALL test.system.rollback_to_snapshot('db.tbl', 1)";
+        let tree = parse_one_statement(sql)?;
+        assert!(matches!(tree, Statement::Call { name, .. }
+            if name.0.items().map(|x| x.value.as_str()).collect::<Vec<_>>()
+                == vec!["test", "system", "rollback_to_snapshot"]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_call_named() -> SqlResult<()> {
+        let sql = "CALL test.system.expire_snapshots(table => 'db.tbl', older_than => TIMESTAMP '2021-01-01 00:00:00')";
+        let tree = parse_one_statement(sql)?;
+        assert!(matches!(tree, Statement::Call { .. }));
+        Ok(())
+    }
 }

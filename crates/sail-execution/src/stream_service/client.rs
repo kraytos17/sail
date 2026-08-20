@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use datafusion::arrow::datatypes::SchemaRef;
 use futures::TryStreamExt;
@@ -9,7 +10,7 @@ use sail_common_datafusion::array::record_batch::cast_record_batch_positionally;
 
 use crate::error::ExecutionResult;
 use crate::id::{DriverId, TaskStreamKey};
-use crate::rpc::{ClientHandle, ClientOptions, ClientService};
+use crate::rpc::{ClientHandle, ClientOptions, ClientService, rpc_error};
 use crate::stream::error::TaskStreamError;
 use crate::stream::r#gen::{DriverTaskStreamTicket, TaskStreamTicket};
 use crate::stream::reader::TaskStreamSource;
@@ -60,8 +61,30 @@ impl TaskStreamFlightClient {
         let request = arrow_flight::Ticket {
             ticket: ticket.into(),
         };
-        let response = self.inner.get().await?.do_get(request).await?;
-        let stream = response.into_inner().map_err(|e| e.into());
+        let peer = self.inner.peer().to_string();
+        let response = self
+            .inner
+            .get()
+            .await
+            .map_err(|e| rpc_error(&peer, e))?
+            .do_get(request)
+            .await
+            .map_err(|e| rpc_error(&peer, e))?;
+        let stream = response.into_inner().map_err(move |e| {
+            let error = FlightError::from(e);
+            match error {
+                FlightError::Tonic(status) => {
+                    let error: TaskStreamError = (*status).into();
+                    match error {
+                        TaskStreamError::Unknown(message) => FlightError::Tonic(Box::new(
+                            tonic::Status::unknown(format!("{peer}: {message}")),
+                        )),
+                        x => FlightError::ExternalError(Box::new(x)),
+                    }
+                }
+                x => x,
+            }
+        });
         let stream = FlightRecordBatchStream::new_from_flight_data(stream).map_err(|e| e.into());
         // The Flight data encoder may have issue with the `LargeList` data type, causing
         // schema mismatch. As a workaround, here we cast the record batch to the expected schema.

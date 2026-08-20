@@ -7464,6 +7464,7 @@ dependencies = [
  "async-trait",
  "dashmap",
  "sail-catalog",
+ "sail-common",
  "sail-common-datafusion",
 ]
 
@@ -7835,6 +7836,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "datafusion-common",
+ "datafusion-datasource",
  "datafusion-expr",
  "educe",
  "flate2",
@@ -7853,10 +7855,12 @@ dependencies = [
  "sail-common",
  "sail-common-datafusion",
  "sail-data-source",
+ "sail-logical-plan",
  "sail-sql-analyzer",
  "serde",
  "serde_arrow",
  "serde_json",
+ "tokio",
  "url",
  "uuid",
 ]
@@ -7884,6 +7888,7 @@ dependencies = [
  "sail-common",
  "sail-common-datafusion",
  "sail-function",
+ "serde",
 ]
 
 [[package]]

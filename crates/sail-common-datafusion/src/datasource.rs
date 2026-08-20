@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datafusion::arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::plan_datafusion_err;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -15,7 +16,7 @@ use datafusion_common::{Constraints, DFSchema, DFSchemaRef, Result, not_impl_err
 use datafusion_expr::expr::Sort;
 use datafusion_expr::{Expr, TableSource};
 
-use crate::catalog::{CatalogPartitionField, LakehouseExecutionContext};
+use crate::catalog::{CatalogPartitionField, IcebergMetadataTableType, LakehouseExecutionContext};
 use crate::extension::SessionExtension;
 use crate::logical_expr::ExprWithSource;
 
@@ -199,6 +200,10 @@ pub struct SourceInfo {
     /// The layers of options for the data source.
     /// A later layer can override earlier ones.
     pub options: Vec<OptionLayer>,
+    /// When set, this `SourceInfo` describes a read of an Iceberg *metadata table*
+    /// (e.g. `db.table.refs` / `db.table.snapshots`) instead of the table's data.
+    /// The base table is described by `paths` / `lakehouse_table` / `options`.
+    pub metadata_table: Option<IcebergMetadataTableType>,
     /// Whether reads match the requested columns case-sensitively against the
     /// physical file schema. Spark defaults to case-insensitive matching
     /// (`spark.sql.caseSensitive=false`). This only affects formats that
@@ -305,6 +310,26 @@ pub struct MergeInfo {
     pub source: Arc<LogicalPlan>,
     pub options: MergeIntoOptions,
     pub input_schema: DFSchemaRef,
+}
+
+/// Information required to create a logical UPDATE plan for a table format.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct UpdateInfo {
+    pub table_name: Vec<String>,
+    pub path: String,
+    /// The resolved logical target scan for the table being updated.
+    pub target: Arc<LogicalPlan>,
+    pub condition: Option<ExprWithSource>,
+    pub assignments: Vec<UpdateAssignment>,
+    pub lakehouse_table: Option<LakehouseExecutionContext>,
+    pub options: Vec<OptionLayer>,
+}
+
+/// An UPDATE SET assignment (`column_path = expression`).
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct UpdateAssignment {
+    pub column_path: Vec<String>,
+    pub expression: Expr,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -449,6 +474,15 @@ pub enum RowLevelCommand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableFormatAlterTableOperation {
+    /// Rename the table. For Iceberg, this is a no-op at the storage level
+    /// (metadata path stays the same); the catalog handles the name change.
+    RenameTable,
+    /// Add columns to the table.
+    AddColumns {
+        columns: Vec<TableFormatCreateTableColumn>,
+    },
+    /// Drop columns from the table.
+    DropColumns { names: Vec<String>, if_exists: bool },
     /// Alters table properties (SET/UNSET TBLPROPERTIES).
     ///
     /// `changes` is a list of `(key, value)` pairs where `value` is `Some(v)` to set a property,
@@ -470,8 +504,42 @@ pub enum TableFormatAlterTableOperation {
         column_path: Vec<String>,
         default: Option<String>,
     },
+    /// Alters the comment of a table column.
+    AlterColumnComment {
+        column_path: Vec<String>,
+        comment: Option<String>,
+    },
+    /// Sets or drops NOT NULL on a table column.
+    AlterColumnNullability {
+        column_path: Vec<String>,
+        nullable: bool,
+    },
+    /// Reorders a table column to a new position.
+    AlterColumnPosition {
+        column_path: Vec<String>,
+        position: sail_common::spec::ColumnPosition,
+    },
     /// Adds a CHECK constraint after the caller has validated existing rows.
     AddCheckConstraint { name: String, expression: String },
+}
+
+/// The kind of table-format procedure executed via `CALL <catalog>.system.<procedure>`.
+///
+/// The target table is passed separately as the `path` argument of
+/// [`TableFormat::call_procedure`], mirroring [`TableFormat::alter_table`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TableFormatProcedureOperation {
+    RollbackToSnapshot {
+        snapshot_id: i64,
+    },
+    SetCurrentSnapshot {
+        snapshot_id: Option<i64>,
+        r#ref: Option<String>,
+    },
+    ExpireSnapshots {
+        older_than_ms: Option<i64>,
+        retain_last: Option<i32>,
+    },
 }
 
 /// A trait for preparing physical execution for a specific format.
@@ -531,6 +599,28 @@ pub trait TableFormat: Send + Sync {
         not_impl_err!("MERGE is not yet implemented for {} format", self.name())
     }
 
+    /// Creates a logical plan for UPDATE.
+    async fn create_updater(&self, ctx: &dyn Session, info: UpdateInfo) -> Result<LogicalPlan> {
+        let _ = (ctx, info);
+        not_impl_err!("UPDATE is not yet implemented for {} format", self.name())
+    }
+
+    /// Executes a table-format procedure (e.g. `CALL <catalog>.system.<procedure>`) and
+    /// returns the result rows as a single Arrow record batch.
+    async fn call_procedure(
+        &self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+        path: &str,
+        operation: TableFormatProcedureOperation,
+        lakehouse_table: Option<LakehouseExecutionContext>,
+    ) -> Result<RecordBatch> {
+        let _ = (runtime_env, path, operation, lakehouse_table);
+        not_impl_err!(
+            "CALL procedures are not yet implemented for {} format",
+            self.name()
+        )
+    }
+
     /// Alters table-format storage metadata for an existing table.
     async fn alter_table(
         &self,
@@ -541,6 +631,16 @@ pub trait TableFormat: Send + Sync {
     ) -> Result<()> {
         let _ = lakehouse_table;
         match operation {
+            TableFormatAlterTableOperation::RenameTable => Ok(()),
+            TableFormatAlterTableOperation::AddColumns { .. } => {
+                not_impl_err!("ADD COLUMNS not yet implemented for {} format", self.name())
+            }
+            TableFormatAlterTableOperation::DropColumns { .. } => {
+                not_impl_err!(
+                    "DROP COLUMNS not yet implemented for {} format",
+                    self.name()
+                )
+            }
             TableFormatAlterTableOperation::SetTableProperties { changes, if_exists } => {
                 self.alter_table_properties(runtime_env, path, changes, if_exists)
                     .await
@@ -558,6 +658,24 @@ pub trait TableFormat: Send + Sync {
             } => {
                 self.alter_table_column_default(runtime_env, path, column_path, default)
                     .await
+            }
+            TableFormatAlterTableOperation::AlterColumnComment { .. } => {
+                not_impl_err!(
+                    "ALTER COLUMN COMMENT not yet implemented for {} format",
+                    self.name()
+                )
+            }
+            TableFormatAlterTableOperation::AlterColumnNullability { .. } => {
+                not_impl_err!(
+                    "ALTER COLUMN NULLABILITY not yet implemented for {} format",
+                    self.name()
+                )
+            }
+            TableFormatAlterTableOperation::AlterColumnPosition { .. } => {
+                not_impl_err!(
+                    "ALTER COLUMN POSITION not yet implemented for {} format",
+                    self.name()
+                )
             }
             TableFormatAlterTableOperation::AddCheckConstraint { .. } => {
                 not_impl_err!(

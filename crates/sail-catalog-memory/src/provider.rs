@@ -398,6 +398,35 @@ impl CatalogProvider for MemoryCatalogProvider {
                         ))
                     })
                 }
+                AlterTableOptions::RenameTable { new_name } => {
+                    let new_table_name = new_name.last().cloned().ok_or_else(|| {
+                        CatalogError::InvalidArgument(
+                            "RENAME TO requires a valid table name".to_string(),
+                        )
+                    })?;
+                    let old_entry = db.tables.remove(table).ok_or_else(|| {
+                        CatalogError::NotFound(CatalogObject::Table, table.to_string())
+                    })?;
+                    db.tables.insert(new_table_name.clone(), old_entry);
+                    Ok(())
+                }
+                AlterTableOptions::AddColumns { .. } => Err(CatalogError::NotSupported(
+                    "ADD COLUMNS is not supported for memory tables".to_string(),
+                )),
+                AlterTableOptions::DropColumns { .. } => Err(CatalogError::NotSupported(
+                    "DROP COLUMNS is not supported for memory tables".to_string(),
+                )),
+                AlterTableOptions::AlterColumnComment { .. } => Err(CatalogError::NotSupported(
+                    "ALTER COLUMN COMMENT is not supported for memory tables".to_string(),
+                )),
+                AlterTableOptions::AlterColumnNullability { .. } => {
+                    Err(CatalogError::NotSupported(
+                        "ALTER COLUMN NULLABILITY is not supported for memory tables".to_string(),
+                    ))
+                }
+                AlterTableOptions::AlterColumnPosition { .. } => Err(CatalogError::NotSupported(
+                    "ALTER COLUMN POSITION is not supported for memory tables".to_string(),
+                )),
                 AlterTableOptions::AddCheckConstraint { .. } => Err(CatalogError::NotSupported(
                     "CHECK constraints are handled by lakehouse table formats".to_string(),
                 )),

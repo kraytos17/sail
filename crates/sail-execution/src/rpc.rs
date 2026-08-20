@@ -75,6 +75,9 @@ pub struct ClientOptions {
     pub enable_tls: bool,
     pub host: String,
     pub port: u16,
+    /// A human-readable label of the remote peer for error messages,
+    /// e.g. "worker 5 at 10.0.0.3:33771".
+    pub peer: String,
 }
 
 impl ClientOptions {
@@ -97,6 +100,16 @@ pub trait ClientBuilder: Sized {
 /// dropped silently.
 const CLIENT_MAX_HEADER_LIST_SIZE: u32 = 1024 * 1024;
 
+const CLIENT_HTTP2_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const CLIENT_HTTP2_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const CLIENT_TCP_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Wraps an RPC error with the peer context, so that it is clear from the error message
+/// which remote peer failed.
+pub fn rpc_error(peer: &str, e: impl std::fmt::Display) -> ExecutionError {
+    ExecutionError::InternalError(format!("{peer}: {e}"))
+}
+
 macro_rules! impl_client_builder {
     ($client_type:ty) => {
         #[tonic::async_trait]
@@ -104,8 +117,13 @@ macro_rules! impl_client_builder {
             async fn connect(options: &ClientOptions) -> ExecutionResult<Self> {
                 let channel = tonic::transport::Endpoint::new(options.to_url_string())?
                     .http2_max_header_list_size(CLIENT_MAX_HEADER_LIST_SIZE)
+                    .http2_keep_alive_interval(CLIENT_HTTP2_KEEPALIVE_INTERVAL)
+                    .keep_alive_timeout(CLIENT_HTTP2_KEEPALIVE_TIMEOUT)
+                    .keep_alive_while_idle(true)
+                    .tcp_keepalive(Some(CLIENT_TCP_KEEPALIVE))
                     .connect()
-                    .await?;
+                    .await
+                    .map_err(|e| rpc_error(&options.peer, e))?;
                 let channel = ServiceBuilder::new()
                     .layer(TracingClientLayer)
                     .service(channel);
@@ -156,6 +174,12 @@ impl<T: ClientBuilder + Clone> ClientHandle<T> {
         self.inner
             .get_or_try_init(|| T::connect(&options))
             .await
+            .map_err(|e| rpc_error(&self.options.peer, e))
             .cloned()
+    }
+
+    /// The human-readable label of the remote peer.
+    pub fn peer(&self) -> &str {
+        &self.options.peer
     }
 }

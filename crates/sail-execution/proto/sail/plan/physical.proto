@@ -68,6 +68,7 @@ message ExtendedPhysicalPlanNode {
     ParquetExecNode parquet = 53;
     RemoteCheckpointWriteExecNode remote_checkpoint_write = 54;
     RemoteCheckpointCommitExecNode remote_checkpoint_commit = 55;
+    IcebergLoadDataFastExecNode iceberg_load_data_fast = 56;
   }
 }
 
@@ -915,6 +916,20 @@ message ColumnIndex{
   string side = 2;
 }
 
+message IcebergLoadDataFastExecNode {
+  // Pre-built Iceberg data files (from parquet footers), serialized as JSON.
+  string data_files_json = 1;
+  string table_url = 2;
+  // Iceberg snapshot operation (append/overwrite), serialized as JSON.
+  string operation = 3;
+  // Iceberg table requirements, serialized as JSON.
+  string requirements_json = 4;
+  // Table properties as JSON array of [key, value] pairs.
+  string table_properties_json = 5;
+  // Iceberg lakehouse execution context, serialized as JSON (empty = None).
+  string lakehouse_table_json = 6;
+}
+
 message SortOptions {
   bool descending = 1;
   bool nulls_first = 2;
@@ -983,6 +998,7 @@ message IcebergScanByDataFilesExecNode {
   bytes input = 1;
   string table_url = 2;
   bytes output_schema = 3;
+  optional string file_path_column = 4;
 }
 
 message IcebergDeleteApplyExecNode {

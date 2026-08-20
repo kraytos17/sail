@@ -156,6 +156,36 @@ pub(crate) fn apply_alter_table_options(
         AlterTableOptions::AlterColumnDefault { name, default } => {
             alter_spark_column_default(hms_table, &name, default)?;
         }
+        AlterTableOptions::RenameTable { .. } => {
+            return Err(CatalogError::NotSupported(
+                "Hive Metastore catalog does not support ALTER TABLE RENAME TO".to_string(),
+            ));
+        }
+        AlterTableOptions::AddColumns { .. } => {
+            return Err(CatalogError::NotSupported(
+                "Hive Metastore catalog does not support ALTER TABLE ADD COLUMNS".to_string(),
+            ));
+        }
+        AlterTableOptions::DropColumns { .. } => {
+            return Err(CatalogError::NotSupported(
+                "Hive Metastore catalog does not support ALTER TABLE DROP COLUMNS".to_string(),
+            ));
+        }
+        AlterTableOptions::AlterColumnComment { .. } => {
+            return Err(CatalogError::NotSupported(
+                "Hive Metastore catalog does not support ALTER COLUMN COMMENT".to_string(),
+            ));
+        }
+        AlterTableOptions::AlterColumnNullability { .. } => {
+            return Err(CatalogError::NotSupported(
+                "Hive Metastore catalog does not support ALTER COLUMN NULLABILITY".to_string(),
+            ));
+        }
+        AlterTableOptions::AlterColumnPosition { .. } => {
+            return Err(CatalogError::NotSupported(
+                "Hive Metastore catalog does not support ALTER COLUMN POSITION".to_string(),
+            ));
+        }
         AlterTableOptions::AddCheckConstraint { .. } => {
             return Err(CatalogError::NotSupported(
                 "CHECK constraints are handled by lakehouse table formats".to_string(),

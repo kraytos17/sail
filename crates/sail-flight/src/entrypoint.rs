@@ -19,14 +19,22 @@ pub async fn serve<F>(
 where
     F: Future<Output = ()>,
 {
+    let http2_keepalive_timeout =
+        std::time::Duration::from_secs(config.server.http2_keepalive_timeout_secs);
     let session_manager = create_flight_session_manager(config, runtime).await?;
     let result = {
         let service = SailFlightSqlService::new(session_manager.clone());
         let flight_service = FlightServiceServer::new(service);
 
-        let builder = ServerBuilder::new("flight_sql", ServerBuilderOptions::default())
-            .add_service(flight_service, None)
-            .await;
+        let builder = ServerBuilder::new(
+            "flight_sql",
+            ServerBuilderOptions {
+                http2_keepalive_timeout: Some(http2_keepalive_timeout),
+                ..Default::default()
+            },
+        )
+        .add_service(flight_service, None)
+        .await;
 
         builder
             .serve(listener, signal)

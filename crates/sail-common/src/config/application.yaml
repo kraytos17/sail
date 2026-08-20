@@ -838,6 +838,17 @@
     Sessions that have been inactive for longer than this duration will be cleaned up.
   experimental: true
 
+- key: server.http2_keepalive_timeout_secs
+  type: number
+  default: "60"
+  description: |
+    The timeout in seconds for HTTP/2 keepalive pings on gRPC servers.
+    If a connected peer does not acknowledge a keepalive ping within this duration,
+    the server closes the connection.
+    A timeout that is too short may cause the server to close connections with
+    temporarily stalled peers (e.g. busy workers), which surfaces as
+    "h2 protocol error: error reading a body from connection" on the client side.
+
 - key: telemetry.export_traces
   type: boolean
   default: "false"

@@ -33,4 +33,17 @@ pub struct IcebergCommitInfo {
     pub schema: Option<Schema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition_spec: Option<PartitionSpec>,
+    /// File paths rewritten by row-level operations. Used to determine which parent
+    /// manifests to keep vs replace when committing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub touched_file_paths: Vec<String>,
+    /// JSON-encoded `Vec<(String, String)>` partition column equality pairs from
+    /// `INSERT ... REPLACE WHERE`. Used to keep only non-matching parent manifests
+    /// when committing a predicate overwrite.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overwrite_predicate: Option<String>,
+    /// JSON-encoded partition-value tuples rewritten by an `OverwritePartitions`
+    /// write. Used to keep only non-matching parent manifests at commit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overwrite_partition_values: Option<String>,
 }

@@ -43,6 +43,7 @@ impl TableFormat for RateTableFormat {
             bucket_by,
             sort_order,
             options,
+            metadata_table: _,
             read_case_sensitive: _,
         } = info;
         if !constraints.deref().is_empty() {

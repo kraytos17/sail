@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use sail_common::config::{AppConfig, GRPC_MAX_MESSAGE_LENGTH_DEFAULT};
 use sail_common::runtime::RuntimeHandle;
-use sail_server::ServerBuilder;
+use sail_server::{ServerBuilder, ServerBuilderOptions};
 pub use sail_session::session_manager::SessionManagerOptions;
 use tokio::net::TcpListener;
 use tonic::codec::CompressionEncoding;
@@ -22,6 +22,8 @@ pub async fn serve<F>(
 where
     F: Future<Output = ()>,
 {
+    let http2_keepalive_timeout =
+        std::time::Duration::from_secs(config.server.http2_keepalive_timeout_secs);
     let session_manager = create_spark_session_manager(config, runtime).await?;
     let result = {
         let server = SparkConnectServer::new(session_manager.clone());
@@ -33,12 +35,18 @@ where
             .accept_compressed(CompressionEncoding::Zstd)
             .send_compressed(CompressionEncoding::Gzip)
             .send_compressed(CompressionEncoding::Zstd);
-        ServerBuilder::new("sail_spark_connect", Default::default())
-            .add_service(service, Some(crate::spark::connect::FILE_DESCRIPTOR_SET))
-            .await
-            .serve(listener, signal)
-            .await
-            .map_err(|e| std::io::Error::other(e.to_string()))
+        ServerBuilder::new(
+            "sail_spark_connect",
+            ServerBuilderOptions {
+                http2_keepalive_timeout: Some(http2_keepalive_timeout),
+                ..Default::default()
+            },
+        )
+        .add_service(service, Some(crate::spark::connect::FILE_DESCRIPTOR_SET))
+        .await
+        .serve(listener, signal)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))
     };
     session_manager.shutdown().await?;
     result.map_err(Into::into)

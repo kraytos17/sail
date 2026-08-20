@@ -51,6 +51,18 @@ pub struct IcebergWriterExecOptions {
     pub shred_variants_explicit: bool,
     pub variant_inference_buffer_size: usize,
     pub variant_inference_buffer_size_explicit: bool,
+    /// Override compression codec for data file writes.
+    pub compression_codec: String,
+    /// When set, overrides the operation derived from `PhysicalSinkMode`.
+    /// Used by row-level operations (DELETE → Delete, MERGE → Overwrite, COMPACT → Replace).
+    pub commit_operation: Option<crate::spec::Operation>,
+    /// File paths rewritten by row-level operations. Used to determine which parent
+    /// manifests to keep vs replace when committing.
+    pub touched_file_paths: Vec<String>,
+    /// JSON-encoded `Vec<(String, String)>` partition column equality pairs from
+    /// `INSERT ... REPLACE WHERE`. Used to keep only non-matching parent manifests
+    /// when committing a predicate overwrite.
+    pub overwrite_predicate: Option<String>,
 }
 
 impl Default for IcebergWriterExecOptions {
@@ -66,6 +78,10 @@ impl Default for IcebergWriterExecOptions {
             shred_variants_explicit: false,
             variant_inference_buffer_size: 100,
             variant_inference_buffer_size_explicit: false,
+            compression_codec: "zstd".to_string(),
+            commit_operation: None,
+            touched_file_paths: vec![],
+            overwrite_predicate: None,
         }
     }
 }
@@ -83,6 +99,10 @@ impl From<IcebergWriteOptions> for IcebergWriterExecOptions {
             shred_variants_explicit: false,
             variant_inference_buffer_size: options.variant_inference_buffer_size,
             variant_inference_buffer_size_explicit: false,
+            compression_codec: options.compression_codec,
+            commit_operation: None,
+            touched_file_paths: vec![],
+            overwrite_predicate: None,
         }
     }
 }

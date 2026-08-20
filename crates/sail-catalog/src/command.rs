@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use sail_common_datafusion::array::serde::ArrowSerializer;
 use sail_common_datafusion::catalog::{FunctionStatus, LakehouseOperation};
 use sail_common_datafusion::datasource::{
     TableFormatAlterTableOperation, TableFormatCreateTableColumn, TableFormatCreateTableInfo,
-    TableFormatRegistry, is_lakehouse_format,
+    TableFormatProcedureOperation, TableFormatRegistry, is_lakehouse_format,
 };
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::session::plan::PlanService;
@@ -17,9 +19,9 @@ use crate::lakehouse::{
 use crate::manager::CatalogManager;
 use crate::manager::tracker::{CatalogFunctionId, CatalogLogicalPlanId};
 use crate::provider::{
-    AlterTableOptions, CreateDatabaseOptions, CreateTableOptions, CreateTemporaryViewOptions,
-    CreateViewOptions, DropDatabaseOptions, DropTableOptions, DropTemporaryViewOptions,
-    DropViewOptions,
+    AlterTableOptions, CallProcedureOptions, CreateDatabaseOptions, CreateTableOptions,
+    CreateTemporaryViewOptions, CreateViewOptions, DropDatabaseOptions, DropTableOptions,
+    DropTemporaryViewOptions, DropViewOptions,
 };
 use crate::utils::{quote_names_if_needed, quote_namespace_if_needed};
 
@@ -96,6 +98,10 @@ pub enum CatalogCommand {
         if_exists: bool,
         options: AlterTableOptions,
     },
+    CallProcedure {
+        table: Vec<String>,
+        procedure: CallProcedureOptions,
+    },
     ListColumns {
         table: Vec<String>,
     },
@@ -150,6 +156,11 @@ pub enum CatalogCommand {
     DescribeTable {
         table: Vec<String>,
         extended: bool,
+        column: Option<String>,
+    },
+    ShowTblProperties {
+        table: Vec<String>,
+        property_key: Option<String>,
     },
     DescribeDatabase {
         database: Vec<String>,
@@ -186,6 +197,7 @@ impl CatalogCommand {
             CatalogCommand::ListViews { .. } => "ListViews",
             CatalogCommand::DropTable { .. } => "DropTable",
             CatalogCommand::AlterTable { .. } => "AlterTable",
+            CatalogCommand::CallProcedure { .. } => "CallProcedure",
             CatalogCommand::ListColumns { .. } => "ListColumns",
             CatalogCommand::FunctionExists { .. } => "FunctionExists",
             CatalogCommand::GetFunction { .. } => "GetFunction",
@@ -199,6 +211,7 @@ impl CatalogCommand {
             CatalogCommand::CreateTemporaryView { .. } => "CreateTemporaryView",
             CatalogCommand::CreateView { .. } => "CreateView",
             CatalogCommand::DescribeTable { .. } => "DescribeTable",
+            CatalogCommand::ShowTblProperties { .. } => "ShowTblProperties",
             CatalogCommand::DescribeDatabase { .. } => "DescribeDatabase",
         }
     }
@@ -240,9 +253,16 @@ impl CatalogCommand {
             CatalogCommand::DescribeTable { .. } => {
                 ArrowSerializer::default().schema::<DescribeTableRow>()?
             }
+            CatalogCommand::ShowTblProperties { .. } => {
+                ArrowSerializer::default().schema::<ShowTblPropertiesRow>()?
+            }
             CatalogCommand::DescribeDatabase { .. } => {
                 ArrowSerializer::default().schema::<DescribeDatabaseRow>()?
             }
+            CatalogCommand::CallProcedure {
+                table: _,
+                procedure,
+            } => call_procedure_schema(procedure),
             CatalogCommand::DatabaseExists { .. }
             | CatalogCommand::TableExists { .. }
             | CatalogCommand::FunctionExists { .. }
@@ -517,18 +537,79 @@ impl CatalogCommand {
                 manager.alter_table(&table, options).await?;
                 display.bools().to_record_batch(vec![true])?
             }
+            CatalogCommand::CallProcedure { table, procedure } => {
+                let table_status = manager.get_table_or_view(&table).await?;
+                let (location, format) = match &table_status.kind {
+                    sail_common_datafusion::catalog::TableKind::Table {
+                        location: Some(loc),
+                        format,
+                        ..
+                    } => (Some(loc.clone()), Some(format.clone())),
+                    _ => (None, None),
+                };
+                let location = location.ok_or_else(|| {
+                    CatalogError::NotSupported(
+                        "CALL procedures are only supported for tables with a location".to_string(),
+                    )
+                })?;
+                let format = format.ok_or_else(|| {
+                    CatalogError::NotSupported(
+                        "CALL procedures are only supported on tables".to_string(),
+                    )
+                })?;
+                if !format.eq_ignore_ascii_case("iceberg") {
+                    return Err(CatalogError::NotSupported(format!(
+                        "CALL procedures are only supported for Iceberg tables, got '{format}'"
+                    )));
+                }
+                let registry = ctx.extension::<TableFormatRegistry>().map_err(|e| {
+                    CatalogError::External(format!(
+                        "missing TableFormatRegistry for CALL procedure on format '{format}': {e}"
+                    ))
+                })?;
+                let table_format = registry.get(&format).map_err(|e| {
+                    CatalogError::External(format!(
+                        "unknown table format '{format}' for CALL procedure: {e}"
+                    ))
+                })?;
+                let runtime = ctx.runtime_env();
+                let lakehouse_table = manager
+                    .resolve_lakehouse_table_status(
+                        &table,
+                        &table_status,
+                        LakehouseOperation::Maintenance,
+                    )
+                    .await?
+                    .execution;
+                let operation = table_format_procedure_operation(&procedure);
+                table_format
+                    .call_procedure(runtime, &location, operation, Some(lakehouse_table))
+                    .await
+                    .map_err(|e| CatalogError::External(e.to_string()))?
+            }
             CatalogCommand::ListColumns { table } => {
                 let rows = manager.get_table_or_view(&table).await?.kind.columns();
                 display.table_columns().to_record_batch(rows)?
             }
-            CatalogCommand::DescribeTable { table, extended } => {
+            CatalogCommand::DescribeTable {
+                table,
+                extended,
+                column,
+            } => {
                 let table_status = manager.get_table_or_view(&table).await?;
                 let formatter = service.plan_formatter();
                 let serializer = ArrowSerializer::default();
 
                 let mut rows: Vec<DescribeTableRow> = Vec::new();
 
-                for col in &table_status.kind.columns() {
+                if let Some(column_name) = column {
+                    let columns = table_status.kind.columns();
+                    let col = columns
+                        .iter()
+                        .find(|col| col.name == column_name)
+                        .ok_or_else(|| {
+                            CatalogError::NotFound(CatalogObject::Column, column_name)
+                        })?;
                     rows.push(DescribeTableRow {
                         col_name: col.name.clone(),
                         data_type: formatter
@@ -536,53 +617,99 @@ impl CatalogCommand {
                             .unwrap_or_else(|_| "invalid".to_string()),
                         comment: col.comment.clone(),
                     });
-                }
-
-                if extended {
-                    let partition_cols = table_status.kind.partition_columns();
-                    if !partition_cols.is_empty() {
+                } else {
+                    for col in &table_status.kind.columns() {
                         rows.push(DescribeTableRow {
-                            col_name: "# Partition Information".to_string(),
+                            col_name: col.name.clone(),
+                            data_type: formatter
+                                .data_type_to_simple_string(&col.data_type)
+                                .unwrap_or_else(|_| "invalid".to_string()),
+                            comment: col.comment.clone(),
+                        });
+                    }
+
+                    if extended {
+                        let partition_cols = table_status.kind.partition_columns();
+                        if !partition_cols.is_empty() {
+                            rows.push(DescribeTableRow {
+                                col_name: "# Partition Information".to_string(),
+                                data_type: String::new(),
+                                comment: None,
+                            });
+                            rows.push(DescribeTableRow {
+                                col_name: "# col_name".to_string(),
+                                data_type: "data_type".to_string(),
+                                comment: Some("comment".to_string()),
+                            });
+                            for col in &partition_cols {
+                                rows.push(DescribeTableRow {
+                                    col_name: col.name.clone(),
+                                    data_type: formatter
+                                        .data_type_to_simple_string(&col.data_type)
+                                        .unwrap_or_else(|_| "invalid".to_string()),
+                                    comment: col.comment.clone(),
+                                });
+                            }
+                        }
+
+                        rows.push(DescribeTableRow {
+                            col_name: String::new(),
                             data_type: String::new(),
                             comment: None,
                         });
                         rows.push(DescribeTableRow {
-                            col_name: "# col_name".to_string(),
-                            data_type: "data_type".to_string(),
-                            comment: Some("comment".to_string()),
-                        });
-                        for col in &partition_cols {
-                            rows.push(DescribeTableRow {
-                                col_name: col.name.clone(),
-                                data_type: formatter
-                                    .data_type_to_simple_string(&col.data_type)
-                                    .unwrap_or_else(|_| "invalid".to_string()),
-                                comment: col.comment.clone(),
-                            });
-                        }
-                    }
-
-                    rows.push(DescribeTableRow {
-                        col_name: String::new(),
-                        data_type: String::new(),
-                        comment: None,
-                    });
-                    rows.push(DescribeTableRow {
-                        col_name: "# Detailed Table Information".to_string(),
-                        data_type: String::new(),
-                        comment: None,
-                    });
-
-                    for (key, value) in table_status.describe_extended_metadata() {
-                        rows.push(DescribeTableRow {
-                            col_name: key,
-                            data_type: value,
+                            col_name: "# Detailed Table Information".to_string(),
+                            data_type: String::new(),
                             comment: None,
                         });
+
+                        for (key, value) in table_status.describe_extended_metadata() {
+                            rows.push(DescribeTableRow {
+                                col_name: key,
+                                data_type: value,
+                                comment: None,
+                            });
+                        }
                     }
                 }
 
                 serializer.build_record_batch(&rows)?
+            }
+            CatalogCommand::ShowTblProperties {
+                table,
+                property_key,
+            } => {
+                let status = manager.get_table_or_view(&table).await?;
+                let properties = match &status.kind {
+                    sail_common_datafusion::catalog::TableKind::Table { properties, .. } => {
+                        properties
+                    }
+                    _ => {
+                        return Err(CatalogError::NotSupported(
+                            "SHOW TBLPROPERTIES is not supported for views".to_string(),
+                        ));
+                    }
+                };
+                let mut rows: Vec<ShowTblPropertiesRow> = match property_key {
+                    Some(key) => properties
+                        .iter()
+                        .find(|(k, _)| k == &key)
+                        .map(|(k, v)| ShowTblPropertiesRow {
+                            key: k.clone(),
+                            value: v.clone(),
+                        })
+                        .into_iter()
+                        .collect(),
+                    None => properties
+                        .iter()
+                        .map(|(k, v)| ShowTblPropertiesRow {
+                            key: k.clone(),
+                            value: v.clone(),
+                        })
+                        .collect(),
+                };
+                rows.sort_by(|a, b| a.key.cmp(&b.key));
+                ArrowSerializer::default().build_record_batch(&rows)?
             }
             CatalogCommand::FunctionExists { .. } => {
                 return Err(CatalogError::NotSupported("function exists".to_string()));
@@ -978,6 +1105,30 @@ impl CreateTableColumnView for sail_common_datafusion::catalog::TableColumnStatu
 
 fn table_format_alter_operation(options: &AlterTableOptions) -> TableFormatAlterTableOperation {
     match options {
+        AlterTableOptions::RenameTable { .. } => TableFormatAlterTableOperation::RenameTable,
+        AlterTableOptions::AddColumns { columns } => {
+            let format_columns: Vec<TableFormatCreateTableColumn> = columns
+                .iter()
+                .map(|c| TableFormatCreateTableColumn {
+                    name: c.name.join("."),
+                    data_type: c.data_type.clone(),
+                    nullable: c.nullable,
+                    comment: c.comment.clone(),
+                    default: c.default.clone(),
+                    generated_always_as: None,
+                    identity: None,
+                })
+                .collect();
+            TableFormatAlterTableOperation::AddColumns {
+                columns: format_columns,
+            }
+        }
+        AlterTableOptions::DropColumns { names, if_exists } => {
+            TableFormatAlterTableOperation::DropColumns {
+                names: names.clone(),
+                if_exists: *if_exists,
+            }
+        }
         AlterTableOptions::SetTableProperties { properties } => {
             TableFormatAlterTableOperation::SetTableProperties {
                 changes: properties
@@ -1005,6 +1156,24 @@ fn table_format_alter_operation(options: &AlterTableOptions) -> TableFormatAlter
                 default: default.clone(),
             }
         }
+        AlterTableOptions::AlterColumnComment { name, comment } => {
+            TableFormatAlterTableOperation::AlterColumnComment {
+                column_path: name.clone(),
+                comment: comment.clone(),
+            }
+        }
+        AlterTableOptions::AlterColumnNullability { name, nullable } => {
+            TableFormatAlterTableOperation::AlterColumnNullability {
+                column_path: name.clone(),
+                nullable: *nullable,
+            }
+        }
+        AlterTableOptions::AlterColumnPosition { name, position } => {
+            TableFormatAlterTableOperation::AlterColumnPosition {
+                column_path: name.clone(),
+                position: position.clone(),
+            }
+        }
         AlterTableOptions::AddCheckConstraint { name, expression } => {
             TableFormatAlterTableOperation::AddCheckConstraint {
                 name: name.clone(),
@@ -1012,6 +1181,55 @@ fn table_format_alter_operation(options: &AlterTableOptions) -> TableFormatAlter
             }
         }
     }
+}
+
+/// Converts `CallProcedureOptions` into the format-level procedure operation.
+///
+/// Mirrors `table_format_alter_operation` for the catalog → storage layer bridge.
+fn table_format_procedure_operation(
+    options: &CallProcedureOptions,
+) -> TableFormatProcedureOperation {
+    match options {
+        CallProcedureOptions::RollbackToSnapshot { snapshot_id } => {
+            TableFormatProcedureOperation::RollbackToSnapshot {
+                snapshot_id: *snapshot_id,
+            }
+        }
+        CallProcedureOptions::SetCurrentSnapshot { snapshot_id, r#ref } => {
+            TableFormatProcedureOperation::SetCurrentSnapshot {
+                snapshot_id: *snapshot_id,
+                r#ref: r#ref.clone(),
+            }
+        }
+        CallProcedureOptions::ExpireSnapshots {
+            older_than_ms,
+            retain_last,
+        } => TableFormatProcedureOperation::ExpireSnapshots {
+            older_than_ms: *older_than_ms,
+            retain_last: *retain_last,
+        },
+    }
+}
+
+/// The fixed output schema for a CALL procedure, matching the batch returned by the
+/// format's `call_procedure` implementation (see `CallProcedureOutput`).
+fn call_procedure_schema(procedure: &CallProcedureOptions) -> SchemaRef {
+    let fields = match procedure {
+        CallProcedureOptions::RollbackToSnapshot { .. }
+        | CallProcedureOptions::SetCurrentSnapshot { .. } => vec![
+            Field::new("previous_snapshot_id", DataType::Int64, true),
+            Field::new("current_snapshot_id", DataType::Int64, true),
+        ],
+        CallProcedureOptions::ExpireSnapshots { .. } => vec![
+            Field::new("deleted_data_files_count", DataType::Int64, true),
+            Field::new("deleted_position_delete_files_count", DataType::Int64, true),
+            Field::new("deleted_equality_delete_files_count", DataType::Int64, true),
+            Field::new("deleted_manifest_files_count", DataType::Int64, true),
+            Field::new("deleted_manifest_lists_count", DataType::Int64, true),
+            Field::new("deleted_statistics_files_count", DataType::Int64, true),
+        ],
+    };
+    Arc::new(Schema::new(fields))
 }
 
 fn catalog_sync_alter_options(
@@ -1038,6 +1256,12 @@ struct DescribeTableRow {
     col_name: String,
     data_type: String,
     comment: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ShowTblPropertiesRow {
+    key: String,
+    value: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1481,5 +1705,45 @@ mod tests {
         assert!(
             matches!(error, CatalogError::External(message) if message.contains("catalog sync failed"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_describe_table_with_column() {
+        let ctx = test_session_context();
+        let manager = test_manager(None);
+        let command = CatalogCommand::DescribeTable {
+            table: vec!["items".to_string()],
+            extended: false,
+            column: Some("id".to_string()),
+        };
+
+        let result = command.execute(&ctx, &manager).await;
+        let Ok(batch) = result else {
+            panic!("describe table with column failed: {result:?}");
+        };
+        assert_eq!(batch.num_rows(), 1);
+        let col_name = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::LargeStringArray>()
+            .expect("col_name should be a string array");
+        assert_eq!(col_name.value(0), "id");
+    }
+
+    #[tokio::test]
+    async fn test_describe_table_with_missing_column() {
+        let ctx = test_session_context();
+        let manager = test_manager(None);
+        let command = CatalogCommand::DescribeTable {
+            table: vec!["items".to_string()],
+            extended: false,
+            column: Some("nope".to_string()),
+        };
+
+        let result = command.execute(&ctx, &manager).await;
+        assert!(matches!(
+            result,
+            Err(CatalogError::NotFound(CatalogObject::Column, _))
+        ));
     }
 }

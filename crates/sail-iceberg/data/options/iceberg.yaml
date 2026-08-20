@@ -566,14 +566,24 @@
       parser: crate::options::parsers::parse_optional_string
 
 - key: compression_codec
-  description: Override compression codec.
-  supported: false
-  rust_type: "Option<String>"
+  description: |
+    Override the Parquet compression codec for data file writes
+    (zstd | snappy | gzip | lz4 | brotli | uncompressed | none). Defaults to zstd,
+    matching the Iceberg spec's `write.parquet.compression-codec` default.
+  default:
+    value: "zstd"
+    parser: crate::options::parsers::parse_string
+  supported: true
+  rust_type: String
   scopes: [write]
   origins:
     - type: option
       keys: [compression-codec]
-      parser: crate::options::parsers::parse_optional_string
+      parser: crate::options::parsers::parse_string
+    - type: table_property
+      keys: [write.parquet.compression-codec]
+      case_sensitive: true
+      parser: crate::options::parsers::parse_string
 
 - key: compression_level
   description: Override compression level.

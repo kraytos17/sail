@@ -6,7 +6,7 @@ use crate::ast::data_type::DataType;
 use crate::ast::expression::{BooleanLiteral, Expr, OrderDirection};
 use crate::ast::identifier::{Ident, ObjectName, table_ident};
 use crate::ast::keywords::{
-    Add, After, All, Alter, Always, Analyze, And, As, Buckets, By, Cache, Cascade, Catalog,
+    Add, After, All, Alter, Always, Analyze, And, As, Buckets, By, Cache, Call, Cascade, Catalog,
     Catalogs, Change, Check, Clear, Cluster, Clustered, Codegen, Collection, Column, Columns,
     Comment, Compute, Constraint, Cost, Create, Data, Database, Databases, Dbproperties, Default,
     Defined, Delete, Delimited, Desc, Describe, Directory, Distributed, Drop, Escaped, Evolution,
@@ -17,8 +17,8 @@ use crate::ast::keywords::{
     Partition, Partitioned, Partitions, Properties, Purge, Recover, Refresh, Rename, Replace,
     Restrict, Row, Schema, Schemas, Serde, Serdeproperties, Set, Show, Sorted, Source, Start,
     Statistics, Stored, System, Table, Tables, Target, Tblproperties, Temp, Temporary, Terminated,
-    Then, Time, To, Type, Uncache, Unset, Update, Use, User, Using, Values, Verbose, View, Views,
-    When, With, Zone,
+    Then, Time, To, Truncate, Type, Uncache, Unset, Update, Use, User, Using, Values, Verbose,
+    View, Views, When, With, Zone,
 };
 use crate::ast::literal::{IntegerLiteral, NumberLiteral, StringLiteral};
 use crate::ast::operator::{
@@ -143,6 +143,12 @@ pub enum Statement {
         extended: Extended,
         from: Option<(Either<From, In>, ObjectName)>,
         like: (Like, StringLiteral),
+    },
+    ShowTblProperties {
+        show: Show,
+        tblproperties: Tblproperties,
+        table: ObjectName,
+        property_key: Option<(LeftParenthesis, StringLiteral, RightParenthesis)>,
     },
     ShowCreateTable {
         show: Show,
@@ -277,6 +283,17 @@ pub enum Statement {
         name: ObjectName,
         #[parser(function = |(_, _, e, _), o| compose(e, o))]
         partition: Option<PartitionClause>,
+    },
+    TruncateTable {
+        truncate: Truncate,
+        table: Table,
+        name: ObjectName,
+    },
+    Call {
+        call: Call,
+        name: ObjectName,
+        #[parser(function = |(_, _, e, _), o| compose(e, o))]
+        arguments: ast::expression::FunctionArgumentList,
     },
     CacheTable {
         cache: Cache,
@@ -1108,6 +1125,11 @@ pub enum DescribeItem {
         #[parser(function = |(_, e), o| compose(e, o))]
         partition: Option<PartitionClause>,
         column: Option<ObjectName>,
+    },
+    View {
+        view: View,
+        extended: Option<Extended>,
+        name: ObjectName,
     },
     // We try `DESCRIBE QUERY` last since the `QUERY` keyword is optional.
     Query {

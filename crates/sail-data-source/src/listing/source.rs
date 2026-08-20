@@ -160,6 +160,7 @@ impl<T: FormatFactory> TableFormat for ListingTableFormat<T> {
             bucket_by: _,
             sort_order,
             options,
+            metadata_table: _,
             read_case_sensitive,
         } = info;
 

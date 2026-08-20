@@ -9,7 +9,7 @@ use crate::driver::r#gen::{
 };
 use crate::error::{ExecutionError, ExecutionResult};
 use crate::id::{DriverId, TaskKey, WorkerId};
-use crate::rpc::{ClientHandle, ClientOptions, ClientService};
+use crate::rpc::{ClientHandle, ClientOptions, ClientService, rpc_error};
 use crate::stream_service::{TaskStreamFlightClient, TaskStreamOwner};
 
 #[derive(Clone)]
@@ -53,7 +53,14 @@ impl DriverClient {
             host,
             port: port as u32,
         });
-        let response = self.inner.get().await?.register_worker(request).await?;
+        let response = self
+            .inner
+            .get()
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?
+            .register_worker(request)
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?;
         let RegisterWorkerResponse {} = response.into_inner();
         Ok(())
     }
@@ -66,9 +73,11 @@ impl DriverClient {
         let response = self
             .inner
             .get()
-            .await?
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?
             .report_worker_heartbeat(request)
-            .await?;
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?;
         let r#gen::ReportWorkerHeartbeatResponse {} = response.into_inner();
         Ok(())
     }
@@ -86,9 +95,11 @@ impl DriverClient {
         let response = self
             .inner
             .get()
-            .await?
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?
             .report_worker_known_peers(request)
-            .await?;
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?;
         let r#gen::ReportWorkerKnownPeersResponse {} = response.into_inner();
         Ok(())
     }
@@ -119,7 +130,14 @@ impl DriverClient {
             cause,
             sequence,
         });
-        let response = self.inner.get().await?.report_task_status(request).await?;
+        let response = self
+            .inner
+            .get()
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?
+            .report_task_status(request)
+            .await
+            .map_err(|e| rpc_error(self.inner.peer(), e))?;
         let ReportTaskStatusResponse {} = response.into_inner();
         Ok(())
     }
