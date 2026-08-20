@@ -53,6 +53,9 @@ pub struct IcebergWriterExecOptions {
     pub variant_inference_buffer_size_explicit: bool,
     /// Override compression codec for data file writes.
     pub compression_codec: String,
+    /// Target encoded size (bytes) for rolling data files. Defaults to 128MB,
+    /// matching the Iceberg `write.target-file-size-bytes` default.
+    pub target_file_size: u64,
     /// When set, overrides the operation derived from `PhysicalSinkMode`.
     /// Used by row-level operations (DELETE → Delete, MERGE → Overwrite, COMPACT → Replace).
     pub commit_operation: Option<crate::spec::Operation>,
@@ -79,6 +82,7 @@ impl Default for IcebergWriterExecOptions {
             variant_inference_buffer_size: 100,
             variant_inference_buffer_size_explicit: false,
             compression_codec: "zstd".to_string(),
+            target_file_size: 134_217_728,
             commit_operation: None,
             touched_file_paths: vec![],
             overwrite_predicate: None,
@@ -100,6 +104,7 @@ impl From<IcebergWriteOptions> for IcebergWriterExecOptions {
             variant_inference_buffer_size: options.variant_inference_buffer_size,
             variant_inference_buffer_size_explicit: false,
             compression_codec: options.compression_codec,
+            target_file_size: options.target_file_size_bytes.unwrap_or(134_217_728),
             commit_operation: None,
             touched_file_paths: vec![],
             overwrite_predicate: None,
@@ -205,4 +210,56 @@ fn parse_usize_property(key: &str, value: &str) -> Result<usize> {
             "invalid Iceberg table property {key} value: {value}"
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::options::r#gen::IcebergWriteOptions;
+
+    const DEFAULT_TARGET_FILE_SIZE: u64 = 134_217_728; // 128MB, Iceberg default
+
+    fn write_options(
+        compression_codec: &str,
+        target_file_size_bytes: Option<u64>,
+    ) -> IcebergWriteOptions {
+        IcebergWriteOptions {
+            overwrite_schema: false,
+            merge_schema: false,
+            shred_variants: false,
+            variant_inference_buffer_size: 100,
+            compression_codec: compression_codec.to_string(),
+            write_data_path: None,
+            write_folder_storage_path: None,
+            target_file_size_bytes,
+        }
+    }
+
+    #[test]
+    fn from_preserves_compression_codec() {
+        // Regression: the LOAD fallback writer used `..Default::default()` and silently dropped
+        // a user-supplied `compression-codec`. Building from `From<IcebergWriteOptions>` keeps it.
+        let exec_opts = IcebergWriterExecOptions::from(write_options("snappy", None));
+        assert_eq!(exec_opts.compression_codec, "snappy");
+    }
+
+    #[test]
+    fn from_maps_target_file_size() {
+        // Explicit override is honored...
+        let exec_opts =
+            IcebergWriterExecOptions::from(write_options("zstd", Some(64 * 1024 * 1024)));
+        assert_eq!(exec_opts.target_file_size, 64 * 1024 * 1024);
+
+        // ...and the Iceberg `write.target-file-size-bytes` default applies when unset.
+        let exec_opts = IcebergWriterExecOptions::from(write_options("zstd", None));
+        assert_eq!(exec_opts.target_file_size, DEFAULT_TARGET_FILE_SIZE);
+    }
+
+    #[test]
+    fn default_target_file_size_is_iceberg_default() {
+        assert_eq!(
+            IcebergWriterExecOptions::default().target_file_size,
+            DEFAULT_TARGET_FILE_SIZE
+        );
+    }
 }

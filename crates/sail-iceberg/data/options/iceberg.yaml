@@ -416,13 +416,24 @@
       parser: crate::options::parsers::parse_optional_string
 
 - key: target_file_size_bytes
-  description: Override data file target size.
-  supported: false
+  description: |
+    Override data file target size. When unset, defaults to 128MB
+    (the Iceberg `write.target-file-size-bytes` default). Row groups/data files are rolled
+    once this encoded size is reached, so a single partition no longer accumulates one
+    unbounded parquet file.
+  default:
+    value: ""
+    parser: crate::options::parsers::parse_optional_u64
+  supported: true
   rust_type: "Option<u64>"
   scopes: [write]
   origins:
     - type: option
       keys: [target-file-size-bytes]
+      parser: crate::options::parsers::parse_optional_u64
+    - type: table_property
+      keys: [write.target-file-size-bytes]
+      case_sensitive: true
       parser: crate::options::parsers::parse_optional_u64
 
 - key: delete_format

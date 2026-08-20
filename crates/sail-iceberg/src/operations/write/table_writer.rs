@@ -108,16 +108,19 @@ impl IcebergTableWriter {
                 unshred_shredded_variants_for_write(&padded, &self.config.table_schema)?;
             let aligned = cast_record_batch_relaxed_tz(&normalized, &self.config.table_schema)
                 .map_err(|e| e.to_string())?;
-            self.write_aligned_batch(partition_dir, aligned).await?;
+            // Unpartitioned data files carry an empty partition tuple.
+            self.write_aligned_batch(partition_dir, Vec::new(), aligned)
+                .await?;
             return Ok(());
         }
 
         let parts = split_record_batch_by_partition(batch, spec, iceberg_schema)?;
         for p in parts.into_iter() {
             let partition_dir = p.partition_dir;
+            let partition_values = p.partition_values.clone();
             self.partition_values_map
                 .entry(partition_dir.clone())
-                .or_insert(p.partition_values);
+                .or_insert(partition_values.clone());
             let padded = Self::align_batch_with_table_schema(
                 &p.record_batch,
                 &self.config.table_schema,
@@ -128,7 +131,8 @@ impl IcebergTableWriter {
                 unshred_shredded_variants_for_write(&padded, &self.config.table_schema)?;
             let aligned = cast_record_batch_relaxed_tz(&normalized, &self.config.table_schema)
                 .map_err(|e| e.to_string())?;
-            self.write_aligned_batch(partition_dir, aligned).await?;
+            self.write_aligned_batch(partition_dir, partition_values, aligned)
+                .await?;
         }
 
         Ok(())
@@ -137,6 +141,7 @@ impl IcebergTableWriter {
     async fn write_aligned_batch(
         &mut self,
         partition_dir: String,
+        partition_values: Vec<Option<Literal>>,
         batch: RecordBatch,
     ) -> Result<(), String> {
         let state = self
@@ -145,6 +150,25 @@ impl IcebergTableWriter {
             .map(Ok)
             .unwrap_or_else(|| self.new_partition_writer_state())?;
         let state = self.write_partition_state(state, batch).await?;
+
+        // Roll a new data file once the total bytes buffered (flushed + in-progress row group)
+        // reach the target file size. This bounds how large any single parquet file grows
+        // (previously a partition kept one unbounded writer until close), mirroring
+        // DataFusion's ArrowWriter convention that the DeltaLake writer also follows.
+        // A `target_file_size` of 0 disables rolling (single file per partition until close).
+        let needs_roll = matches!(
+            &state,
+            PartitionWriterState::Open { writer, .. }
+                if self.config.target_file_size > 0
+                    && writer.buffered_size() >= self.config.target_file_size
+        );
+        if needs_roll {
+            let writer = self.finish_partition_state(state).await?;
+            self.record_finished_writer(partition_dir, partition_values, writer)
+                .await?;
+            return Ok(());
+        }
+
         self.writers.insert(partition_dir, state);
         Ok(())
     }
@@ -272,30 +296,47 @@ impl IcebergTableWriter {
     ) -> Result<(), String> {
         if let Some(state) = self.writers.remove(partition_dir) {
             let writer = self.finish_partition_state(state).await?;
-            let (bytes, meta) = writer.close().await?;
-            let (rel, full) = self.generator.with_partition_dir(Some(partition_dir));
-            log::trace!("iceberg.table_writer.flush_partition.writing: {}", full);
-            self.store
-                .put(&full, object_store::PutPayload::from(bytes))
-                .await
-                .map_err(|e| e.to_string())?;
-            log::trace!(
-                "iceberg.table_writer.flush_partition.written: rel={} full={}",
-                rel,
-                full
-            );
-            // Prevent a leading partition segment containing ':' from being parsed as a URI scheme.
-            let file_path = match self.data_url.join(&format!("./{rel}")) {
-                Ok(u) => u.to_string(),
-                Err(_) => {
-                    format!("{}{}", self.data_url.as_str(), rel)
-                }
-            };
-            let df = DataFileWriter::new(self.partition_spec_id, file_path, partition_values)
-                .finish(meta)?
-                .data_file;
-            self.written.push(df);
+            self.record_finished_writer(partition_dir.to_string(), partition_values, writer)
+                .await?;
         }
+        Ok(())
+    }
+
+    /// Close an `ArrowParquetWriter`, write it to the store, and record its `DataFile`.
+    ///
+    /// Shared by both anomalous flushes (`flush_partition` at close) and size-based rolling
+    /// (`write_aligned_batch`) so every produced file follows the same put + manifest path.
+    async fn record_finished_writer(
+        &mut self,
+        partition_dir: String,
+        partition_values: Vec<Option<Literal>>,
+        writer: ArrowParquetWriter,
+    ) -> Result<(), String> {
+        let (bytes, meta) = writer.close().await?;
+        let (rel, full) = self
+            .generator
+            .with_partition_dir(Some(partition_dir.as_str()));
+        log::trace!("iceberg.table_writer.flush_partition.writing: {}", full);
+        self.store
+            .put(&full, object_store::PutPayload::from(bytes))
+            .await
+            .map_err(|e| e.to_string())?;
+        log::trace!(
+            "iceberg.table_writer.flush_partition.written: rel={} full={}",
+            rel,
+            full
+        );
+        // Prevent a leading partition segment containing ':' from being parsed as a URI scheme.
+        let file_path = match self.data_url.join(&format!("./{rel}")) {
+            Ok(u) => u.to_string(),
+            Err(_) => {
+                format!("{}{}", self.data_url.as_str(), rel)
+            }
+        };
+        let df = DataFileWriter::new(self.partition_spec_id, file_path, partition_values)
+            .finish(meta)?
+            .data_file;
+        self.written.push(df);
         Ok(())
     }
 
@@ -382,5 +423,118 @@ impl IcebergTableWriter {
             return Ok(Some(array));
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::array::{Int32Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use object_store::ObjectStore;
+    use object_store::memory::InMemory;
+    use parquet::file::properties::WriterProperties;
+
+    use super::*;
+    use crate::operations::write::config::VariantShreddingConfig;
+    use crate::spec::NestedField;
+    use crate::spec::partition::UnboundPartitionSpec;
+    use crate::spec::types::{PrimitiveType, Type};
+
+    fn test_arrow_schema() -> ArrowSchema {
+        ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ])
+    }
+
+    fn test_iceberg_schema() -> IcebergSchema {
+        IcebergSchema::builder()
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::required(
+                    2,
+                    "name",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .with_schema_id(0)
+            .build()
+            .unwrap()
+    }
+
+    fn sample_batch(rows: i32) -> RecordBatch {
+        let id: Vec<i32> = (0..rows).collect();
+        let name: Vec<String> = (0..rows).map(|i| format!("row-{i}")).collect();
+        RecordBatch::try_new(
+            Arc::new(test_arrow_schema()),
+            vec![
+                Arc::new(Int32Array::from(id)),
+                Arc::new(StringArray::from(name)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn table_writer(target_file_size: u64) -> (IcebergTableWriter, Arc<dyn ObjectStore>) {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let config = WriterConfig {
+            table_schema: Arc::new(test_arrow_schema()),
+            partition_columns: Vec::new(),
+            writer_properties: WriterProperties::default(),
+            target_file_size,
+            write_batch_size: 8192,
+            num_indexed_cols: 0,
+            stats_columns: None,
+            iceberg_schema: Arc::new(test_iceberg_schema()),
+            partition_spec: UnboundPartitionSpec { fields: vec![] },
+            variant_shredding: VariantShreddingConfig::default(),
+        };
+        let writer = IcebergTableWriter::new(
+            store.clone(),
+            ObjectPath::from("table"),
+            config,
+            0,
+            Url::parse("memory://bucket/table").unwrap(),
+        );
+        (writer, store)
+    }
+
+    #[tokio::test]
+    async fn rolls_multiple_data_files_at_target_size() {
+        let (mut writer, _store) = table_writer(1024); // tiny target forces rolling
+        let mut expected_rows = 0u64;
+        for _ in 0..20 {
+            let batch = sample_batch(5000);
+            expected_rows += batch.num_rows() as u64;
+            writer.write(&batch).await.unwrap();
+        }
+
+        let data_files = writer.close().await.unwrap();
+        assert!(
+            data_files.len() > 1,
+            "expected multiple rolled data files, got {}",
+            data_files.len()
+        );
+        let actual_rows: u64 = data_files.iter().map(|df| df.record_count).sum();
+        assert_eq!(actual_rows, expected_rows);
+        // Unpartitioned files carry an empty partition tuple.
+        assert!(data_files.iter().all(|df| df.partition.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn zero_target_file_size_keeps_single_file() {
+        let (mut writer, _store) = table_writer(0); // 0 disables rolling
+        for _ in 0..20 {
+            let batch = sample_batch(5000);
+            writer.write(&batch).await.unwrap();
+        }
+
+        let data_files = writer.close().await.unwrap();
+        assert_eq!(data_files.len(), 1);
     }
 }

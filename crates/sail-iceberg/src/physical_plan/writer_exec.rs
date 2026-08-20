@@ -29,12 +29,12 @@ use datafusion::physical_plan::{
 use datafusion_common::{DataFusionError, Result, internal_err};
 use futures::StreamExt;
 use futures::stream::once;
-use parquet::file::properties::WriterProperties;
 use sail_common_datafusion::catalog::{CatalogPartitionField, LakehouseExecutionContext};
 use sail_common_datafusion::datasource::PhysicalSinkMode;
 use url::Url;
 
 use crate::datasource::type_converter::{arrow_schema_to_iceberg, iceberg_schema_to_arrow};
+use crate::operations::write::arrow_parquet::build_writer_properties;
 use crate::operations::write::config::WriterConfig;
 use crate::operations::write::table_writer::IcebergTableWriter;
 use crate::physical_plan::action_schema::{
@@ -593,14 +593,13 @@ impl ExecutionPlan for IcebergWriterExec {
             };
 
             let compression = resolve_compression_codec(&options.compression_codec)?;
-            let writer_properties = WriterProperties::builder()
-                .set_compression(compression)
-                .build();
+            let writer_properties = build_writer_properties(&options.table_properties, compression)
+                .map_err(DataFusionError::Execution)?;
             let writer_config = WriterConfig {
                 table_schema: table_schema.clone(),
                 partition_columns: partition_columns.clone(),
                 writer_properties,
-                target_file_size: 134_217_728,
+                target_file_size: options.target_file_size,
                 write_batch_size: 32 * 1024,
                 num_indexed_cols: 32,
                 stats_columns: None,
@@ -784,12 +783,12 @@ mod tests {
 
     #[test]
     fn default_writer_properties_use_zstd() {
-        let properties = WriterProperties::builder()
-            .set_compression(
-                resolve_compression_codec(&IcebergWriterExecOptions::default().compression_codec)
-                    .unwrap(),
-            )
-            .build();
+        let properties = build_writer_properties(
+            &[],
+            resolve_compression_codec(&IcebergWriterExecOptions::default().compression_codec)
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             properties.compression(&parquet::schema::types::ColumnPath::new(Vec::new())),
             Compression::ZSTD(Default::default())

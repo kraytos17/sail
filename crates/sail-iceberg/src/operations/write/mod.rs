@@ -11,6 +11,7 @@
 // limitations under the License.
 
 pub mod arrow_parquet;
+mod async_buffer;
 pub mod base_writer;
 pub mod config;
 pub mod file_writer;

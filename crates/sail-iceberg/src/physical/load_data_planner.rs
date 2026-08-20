@@ -182,12 +182,15 @@ pub async fn plan_load_data(
     for (format, files) in group_by_format(&fallback_files) {
         let scan =
             build_fallback_scan(session_state, &files, format.as_str(), &table_arrow_schema)?;
-        let writer_options = IcebergWriterExecOptions {
-            commit_operation: Some(operation.clone()),
-            lakehouse_table: ctx.lakehouse_table().cloned(),
-            table_properties: table_properties.clone(),
-            ..Default::default()
-        };
+        // Carry resolved write options (compression_codec, write_data_path, etc.) through to
+        // the writer. The `From<IcebergWriteOptions>` impl preserves those, while we override
+        // only the LOAD-specific fields below. Using `..Default::default()` here would silently
+        // drop a user-supplied `compression-codec` / `write.data.path`, so build from the
+        // resolved options instead.
+        let mut writer_options = IcebergWriterExecOptions::from(ctx.options().clone());
+        writer_options.commit_operation = Some(operation.clone());
+        writer_options.lakehouse_table = ctx.lakehouse_table().cloned();
+        writer_options.table_properties = table_properties.clone();
 
         let writer: Arc<dyn ExecutionPlan> = Arc::new(IcebergWriterExec::new(
             scan,
@@ -281,6 +284,13 @@ fn build_fallback_scan(
     let config = FileScanConfigBuilder::new(object_store_url, source)
         .with_file_groups(file_groups.into_iter().map(FileGroup::new).collect())
         .with_file_compression_type(FileCompressionType::from(compression))
+        // Disable DataFusion's sibling-stream work stealing for this scan. Work stealing
+        // relies on all sibling partitions executing through a SINGLE DataSourceExec instance
+        // (one shared file queue). Sail's distributed engine decodes a fresh physical plan per
+        // partition task, so each task would otherwise drain the ENTIRE shared queue of all
+        // byte-range files and re-read the whole source `target_partitions` times (Nx rows).
+        // `preserve_order` forces each partition to use only its own file group (byte range).
+        .with_preserve_order(true)
         .build();
 
     // Byte-range repartition large files across the session's target partitions so the
@@ -323,7 +333,8 @@ fn infer_source_compression(path: &str) -> CompressionTypeVariant {
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::datasource::physical_plan::FileGroupPartitioner;
+    use datafusion::catalog::memory::DataSourceExec;
+    use datafusion::datasource::physical_plan::{FileGroupPartitioner, FileScanConfig};
     use datafusion::execution::context::SessionContext;
     use datafusion::physical_plan::ExecutionPlanProperties;
     use datafusion::prelude::SessionConfig;
@@ -381,6 +392,38 @@ mod tests {
         ]);
         let plan = build_fallback_scan(&state, &files, "csv", &string_schema()).unwrap();
         assert_eq!(plan.output_partitioning().partition_count(), 4);
+    }
+
+    #[test]
+    fn fallback_scan_disables_work_stealing() {
+        // Regression: the fallback CSV scan must NOT share a work queue across partitions.
+        // DataFusion's file-stream work stealing (`enable_file_stream_work_stealing`, default
+        // true) builds a SharedWorkSource over ALL byte-range file groups. Sail's distributed
+        // engine executes each partition as a separate decoded plan instance, so every partition
+        // would otherwise drain the whole queue and re-read the full source Nx (N =
+        // target_partitions). `preserve_order` forces each partition to use only its own byte
+        // range, which also keeps byte-range repartitioning intact.
+        let state = session_with_parallelism(4);
+        let files = fallback_files(&[
+            ("s3a://bucket/landing/gl_balances/a.csv", 400 * MB),
+            ("s3a://bucket/landing/gl_balances/b.csv", 400 * MB),
+        ]);
+        let plan = build_fallback_scan(&state, &files, "csv", &string_schema()).unwrap();
+
+        // Byte-range splitting still applies (4 partitions), but work stealing is disabled.
+        assert_eq!(plan.output_partitioning().partition_count(), 4);
+
+        let exec = plan
+            .downcast_ref::<DataSourceExec>()
+            .expect("fallback scan should be a DataSourceExec");
+        let scan = exec
+            .data_source()
+            .downcast_ref::<FileScanConfig>()
+            .expect("fallback scan should wrap a FileScanConfig");
+        assert!(
+            scan.preserve_order,
+            "fallback scan must set preserve_order to prevent cross-partition work stealing"
+        );
     }
 
     #[test]
