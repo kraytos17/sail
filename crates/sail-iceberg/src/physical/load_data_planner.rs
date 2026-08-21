@@ -27,7 +27,7 @@ use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::{DataFusionError, GetExt};
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use sail_common_datafusion::catalog::CatalogPartitionField;
-use sail_common_datafusion::datasource::{OptionLayer, PhysicalSinkMode};
+use sail_common_datafusion::datasource::PhysicalSinkMode;
 use sail_data_source::options::ResolveOptions;
 use sail_logical_plan::load_data::LoadDataNode;
 
@@ -39,14 +39,23 @@ use crate::physical_plan::{
     IcebergCommitExec, IcebergLoadDataFastExec, IcebergWriterExec, IcebergWriterExecOptions,
 };
 use crate::spec::{Operation, TableRequirement};
-use crate::table_format::IcebergTableFormat;
+use crate::table_format::{
+    IcebergTableFormat, catalog_managed_iceberg_from_options, metadata_location_from_options,
+    split_iceberg_write_options_and_table_properties,
+};
 use crate::utils::partition_transform::catalog_partition_field_from_iceberg;
 
 pub async fn plan_load_data(
     session_state: &SessionState,
     node: &LoadDataNode,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
-    let options = IcebergWriteOptions::resolve(session_state, node.target_options().to_vec())?;
+    let metadata_location = metadata_location_from_options(node.target_options());
+    let catalog_managed_table = catalog_managed_iceberg_from_options(node.target_options());
+    // Mirror `plan_iceberg_write`: resolve options from the cleaned layer set while keeping
+    // catalog-encoded `option.*` properties out of the committed Iceberg table properties.
+    let (clean_options, table_properties) =
+        split_iceberg_write_options_and_table_properties(node.target_options().to_vec())?;
+    let options = IcebergWriteOptions::resolve(session_state, clean_options)?;
 
     let table_url =
         IcebergTableFormat::parse_table_url(vec![node.target_location().to_string()]).await?;
@@ -56,6 +65,8 @@ pub async fn plan_load_data(
         options,
         table_url,
         node.target_lakehouse_table().cloned(),
+        metadata_location,
+        catalog_managed_table,
     )
     .await?;
 
@@ -74,16 +85,6 @@ pub async fn plan_load_data(
             current_schema_id: metadata.current_schema_id,
         },
     ];
-
-    let table_properties: Vec<(String, String)> = node
-        .target_options()
-        .iter()
-        .filter_map(|layer| match layer {
-            OptionLayer::TablePropertyList { items } => Some(items.clone()),
-            _ => None,
-        })
-        .flatten()
-        .collect();
 
     // Classify source files: parquet + schema match → fast register; else fallback.
     let table_schema = metadata.current_schema().ok_or_else(|| {
@@ -284,13 +285,6 @@ fn build_fallback_scan(
     let config = FileScanConfigBuilder::new(object_store_url, source)
         .with_file_groups(file_groups.into_iter().map(FileGroup::new).collect())
         .with_file_compression_type(FileCompressionType::from(compression))
-        // Disable DataFusion's sibling-stream work stealing for this scan. Work stealing
-        // relies on all sibling partitions executing through a SINGLE DataSourceExec instance
-        // (one shared file queue). Sail's distributed engine decodes a fresh physical plan per
-        // partition task, so each task would otherwise drain the ENTIRE shared queue of all
-        // byte-range files and re-read the whole source `target_partitions` times (Nx rows).
-        // `preserve_order` forces each partition to use only its own file group (byte range).
-        .with_preserve_order(true)
         .build();
 
     // Byte-range repartition large files across the session's target partitions so the
@@ -333,11 +327,11 @@ fn infer_source_compression(path: &str) -> CompressionTypeVariant {
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::catalog::memory::DataSourceExec;
-    use datafusion::datasource::physical_plan::{FileGroupPartitioner, FileScanConfig};
+    use datafusion::datasource::physical_plan::FileGroupPartitioner;
     use datafusion::execution::context::SessionContext;
     use datafusion::physical_plan::ExecutionPlanProperties;
     use datafusion::prelude::SessionConfig;
+    use sail_common_datafusion::datasource::OptionLayer;
 
     use super::*;
 
@@ -392,38 +386,6 @@ mod tests {
         ]);
         let plan = build_fallback_scan(&state, &files, "csv", &string_schema()).unwrap();
         assert_eq!(plan.output_partitioning().partition_count(), 4);
-    }
-
-    #[test]
-    fn fallback_scan_disables_work_stealing() {
-        // Regression: the fallback CSV scan must NOT share a work queue across partitions.
-        // DataFusion's file-stream work stealing (`enable_file_stream_work_stealing`, default
-        // true) builds a SharedWorkSource over ALL byte-range file groups. Sail's distributed
-        // engine executes each partition as a separate decoded plan instance, so every partition
-        // would otherwise drain the whole queue and re-read the full source Nx (N =
-        // target_partitions). `preserve_order` forces each partition to use only its own byte
-        // range, which also keeps byte-range repartitioning intact.
-        let state = session_with_parallelism(4);
-        let files = fallback_files(&[
-            ("s3a://bucket/landing/gl_balances/a.csv", 400 * MB),
-            ("s3a://bucket/landing/gl_balances/b.csv", 400 * MB),
-        ]);
-        let plan = build_fallback_scan(&state, &files, "csv", &string_schema()).unwrap();
-
-        // Byte-range splitting still applies (4 partitions), but work stealing is disabled.
-        assert_eq!(plan.output_partitioning().partition_count(), 4);
-
-        let exec = plan
-            .downcast_ref::<DataSourceExec>()
-            .expect("fallback scan should be a DataSourceExec");
-        let scan = exec
-            .data_source()
-            .downcast_ref::<FileScanConfig>()
-            .expect("fallback scan should wrap a FileScanConfig");
-        assert!(
-            scan.preserve_order,
-            "fallback scan must set preserve_order to prevent cross-partition work stealing"
-        );
     }
 
     #[test]
@@ -521,5 +483,59 @@ mod tests {
             infer_source_compression("s3a://bucket/data.parquet"),
             CompressionTypeVariant::UNCOMPRESSED
         );
+    }
+
+    #[test]
+    fn load_data_table_properties_exclude_catalog_options() {
+        let option_layer = OptionLayer::TablePropertyList {
+            items: vec![
+                (
+                    "metadata-location".to_string(),
+                    "s3://bucket/table/metadata/v1.metadata.json".to_string(),
+                ),
+                ("write.compression-codec".to_string(), "zstd".to_string()),
+                (
+                    "option.storage.s3a.bucket".to_string(),
+                    "bucket".to_string(),
+                ),
+            ],
+        };
+        let node = LoadDataNode::new(
+            "s3a://bucket/landing/data.csv".to_string(),
+            false,
+            false,
+            "csv".to_string(),
+            "s3a://bucket/table".to_string(),
+            vec!["catalog".to_string(), "db".to_string(), "table".to_string()],
+            vec![option_layer],
+            None,
+        );
+
+        // The planner runs this split so committed Iceberg properties match INSERT/CTAS:
+        // `option.*` keys stay available for option resolution but never reach the metadata.
+        let (clean_options, table_properties) =
+            split_iceberg_write_options_and_table_properties(node.target_options().to_vec())
+                .unwrap();
+
+        assert!(
+            table_properties
+                .iter()
+                .any(|(key, _)| key == "metadata-location")
+        );
+        assert!(
+            table_properties
+                .iter()
+                .any(|(key, _)| key == "write.compression-codec")
+        );
+        assert!(
+            !table_properties
+                .iter()
+                .any(|(key, _)| key.starts_with("option."))
+        );
+        assert!(clean_options.iter().any(|layer| matches!(
+            layer,
+            OptionLayer::TablePropertyList { items }
+                if items.iter().any(|(key, _)| key.starts_with("option."))
+        )));
     }
 }

@@ -18,13 +18,16 @@ default = ["mimalloc"]
 sail-common = { path = "../sail-common" }
 sail-execution = { path = "../sail-execution" }
 sail-flight = { path = "../sail-flight" }
+sail-server = { path = "../sail-server" }
 sail-telemetry = { path = "../sail-telemetry" }
 sail-spark-connect = { path = "../sail-spark-connect" }
 sail-session = { path = "../sail-session" }
 
 mimalloc = { workspace = true, optional = true }
+arrow-flight = { workspace = true }
 clap = { workspace = true }
-tokio = { workspace = true }
 log = { workspace = true }
 pyo3 = { workspace = true }
 rustls = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }

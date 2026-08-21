@@ -22,7 +22,9 @@ use sail_logical_plan::merge::RowLevelWriteNode;
 
 use crate::options::r#gen::IcebergWriteOptions;
 use crate::physical_plan::planner::{self, PlannerContext};
-use crate::table_format::IcebergTableFormat;
+use crate::table_format::{
+    IcebergTableFormat, catalog_managed_iceberg_from_options, metadata_location_from_options,
+};
 
 pub async fn plan_iceberg_row_level_write(
     session_state: &SessionState,
@@ -34,11 +36,16 @@ pub async fn plan_iceberg_row_level_write(
     let table_url =
         IcebergTableFormat::parse_table_url(vec![node.target_location().to_string()]).await?;
 
+    let metadata_location = metadata_location_from_options(node.target_options());
+    let catalog_managed_table = catalog_managed_iceberg_from_options(node.target_options());
+
     let ctx = PlannerContext::new(
         session_state,
         options,
         table_url,
         node.target_lakehouse_table().cloned(),
+        metadata_location,
+        catalog_managed_table,
     )
     .await?;
 

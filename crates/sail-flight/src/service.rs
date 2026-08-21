@@ -56,6 +56,9 @@ impl SailFlightSqlService {
     const DEFAULT_USER_ID: &'static str = "flight-user";
 
     async fn get_session_context(&self) -> Result<SessionContext, Status> {
+        // The session id is server-owned: `SessionManagerActor` normalizes every client to
+        // its single `server_session_id`, so both Flight and Spark Connect clients share ONE
+        // session -> ONE driver + worker fleet. The id passed here is effectively ignored.
         self.session_manager
             .get_or_create_session_context(
                 Self::DEFAULT_SESSION_ID.to_string(),

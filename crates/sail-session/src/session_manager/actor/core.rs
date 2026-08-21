@@ -50,6 +50,10 @@ impl Actor for SessionManagerActor {
             options,
             session_factory,
             job_runner_factory,
+            // A fresh UUID per server process: Sail is the sole authority for the session
+            // id (a client cannot pin or forge it), and a restart naturally orphans old
+            // fleets and mints a new shared one.
+            server_session_id: uuid::Uuid::new_v4().to_string(),
             sessions: IndexMap::new(),
             drivers: Default::default(),
             driver_gateway,
@@ -94,6 +98,9 @@ impl Actor for SessionManagerActor {
             }
             SessionManagerEvent::GetDriver { driver_id, result } => {
                 self.handle_get_driver(driver_id, result)
+            }
+            SessionManagerEvent::GetServerSessionId { result } => {
+                self.handle_get_server_session_id(result)
             }
             SessionManagerEvent::Shutdown { result } => {
                 self.shutdown_notifier = Some(result);

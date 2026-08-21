@@ -697,6 +697,19 @@ impl ExecutionPlan for IcebergCommitExec {
                 }
                 let row_lineage_start_row_id = table_meta.row_lineage_start_row_id();
 
+                // A DELETE (incl. TRUNCATE) against metadata with no current snapshot has
+                // nothing to delete. Return count=0 instead of failing, so an empty
+                // created-but-never-written table truncates cleanly even when the planner
+                // and the commit exec resolved different metadata files (e.g. catalog
+                // `metadata-location` vs a storage scan).
+                if maybe_snapshot.is_none()
+                    && matches!(commit_info.operation, crate::spec::Operation::Delete)
+                {
+                    let array = Arc::new(UInt64Array::from(vec![0u64]));
+                    let batch = RecordBatch::try_new(schema, vec![array])?;
+                    return Ok(batch);
+                }
+
                 // If metadata exists but there is no current snapshot (e.g. from a CREATE TABLE),
                 // bootstrap the first snapshot as a normal metadata version.
                 if maybe_snapshot.is_none()

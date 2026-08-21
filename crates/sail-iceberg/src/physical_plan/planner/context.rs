@@ -34,8 +34,19 @@ impl<'a> PlannerContext<'a> {
         options: IcebergWriteOptions,
         table_url: Url,
         lakehouse_table: Option<LakehouseExecutionContext>,
+        metadata_location: Option<String>,
+        catalog_managed_table: bool,
     ) -> Result<Self> {
-        let table = Table::load(session, table_url.clone()).await?;
+        // Mirror the table-loading idiom in `plan_iceberg_write` /
+        // `create_iceberg_provider_concrete`: a catalog-managed table is loaded via the
+        // catalog's authoritative `metadata-location`; only path tables fall back to the
+        // storage scan (`find_latest_metadata_file`). Loading from storage while committing
+        // via the catalog location would let the planner and the commit exec disagree on the
+        // table's current state (e.g. a DELETE/TRUNCATE planned against a stale snapshot).
+        let metadata_location = catalog_managed_table.then_some(metadata_location).flatten();
+        let table =
+            Table::load_with_metadata_location(session, table_url.clone(), metadata_location)
+                .await?;
         Ok(Self {
             session,
             options,

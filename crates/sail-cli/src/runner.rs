@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use sail_common::error::CommonError;
 
+use crate::combo::run_combo_server;
 use crate::flight::run_flight_server;
 use crate::spark::run::run_pyspark_script;
 use crate::spark::{
@@ -23,6 +24,27 @@ enum Command {
     Flight(FlightCommand),
     #[command(about = "Start the Sail worker (internal use only)")]
     Worker,
+    #[command(about = "Start both the Spark Connect and Flight SQL servers in one process")]
+    Server {
+        #[arg(
+            long,
+            default_value = "127.0.0.1",
+            help = "The IP address that the servers bind to"
+        )]
+        ip: String,
+        #[arg(
+            long,
+            default_value_t = 50051,
+            help = "The port for the Spark Connect server"
+        )]
+        spark_port: u16,
+        #[arg(
+            long,
+            default_value_t = 32010,
+            help = "The port for the Flight SQL server"
+        )]
+        flight_port: u16,
+    },
 }
 
 #[derive(Subcommand)]
@@ -192,5 +214,10 @@ pub fn main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 run_flight_server(ip.parse()?, port)
             }
         },
+        Command::Server {
+            ip,
+            spark_port,
+            flight_port,
+        } => run_combo_server(ip.parse()?, spark_port, flight_port),
     }
 }

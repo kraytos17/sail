@@ -7523,6 +7523,7 @@ dependencies = [
 name = "sail-cli"
 version = "0.7.0"
 dependencies = [
+ "arrow-flight",
  "clap",
  "log",
  "mimalloc",
@@ -7531,10 +7532,12 @@ dependencies = [
  "sail-common",
  "sail-execution",
  "sail-flight",
+ "sail-server",
  "sail-session",
  "sail-spark-connect",
  "sail-telemetry",
  "tokio",
+ "tonic",
 ]
 
 [[package]]

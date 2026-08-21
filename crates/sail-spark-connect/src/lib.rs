@@ -13,6 +13,9 @@ mod streaming;
 
 pub use proto::data_type_json::JsonDataType;
 
+pub use crate::error::SparkError;
+pub use crate::session_manager::create_spark_session_manager;
+
 pub mod spark {
     #[expect(clippy::all, clippy::allow_attributes)]
     pub mod connect {
