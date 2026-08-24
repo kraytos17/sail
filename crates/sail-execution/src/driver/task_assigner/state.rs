@@ -92,6 +92,10 @@ pub enum WorkerResource {
         /// active remote task streams stored in object storage.
         local_streams: IndexSet<TaskKey>,
     },
+    /// A tombstone state that is no longer produced since workers are removed
+    /// from the assigner map when they are deactivated. Kept for the explicit
+    /// two-state vocabulary and defensive matches.
+    #[allow(dead_code)]
     Inactive,
 }
 

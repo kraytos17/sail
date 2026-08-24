@@ -101,7 +101,7 @@ pub trait ClientBuilder: Sized {
 const CLIENT_MAX_HEADER_LIST_SIZE: u32 = 1024 * 1024;
 
 const CLIENT_HTTP2_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-const CLIENT_HTTP2_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const CLIENT_HTTP2_KEEPALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const CLIENT_TCP_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Wraps an RPC error with the peer context, so that it is clear from the error message

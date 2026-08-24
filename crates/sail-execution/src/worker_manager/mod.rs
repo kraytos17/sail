@@ -25,6 +25,13 @@ pub trait WorkerManager: Send + Sync + 'static {
     /// In such cases, the external systems should be responsible for cleaning up the workers
     /// (e.g. via the cascading deletion mechanism in Kubernetes).
     async fn stop(&self) -> ExecutionResult<()>;
+
+    /// Delete a single worker's resources on a best-effort basis.
+    /// Used when a worker cannot be reached for a graceful shutdown,
+    /// or when it failed to launch and may still materialize later.
+    async fn delete_worker(&self, _id: WorkerId) -> ExecutionResult<()> {
+        Ok(())
+    }
 }
 
 pub use kubernetes::{KubernetesWorkerManager, KubernetesWorkerManagerOptions};

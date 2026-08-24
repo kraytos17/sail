@@ -80,7 +80,7 @@ impl DriverActor {
         ctx: &mut ActorContext<Self>,
         worker_id: WorkerId,
     ) -> ActorAction {
-        if self.worker_pool.fail_worker_if_pending(worker_id) {
+        if self.worker_pool.fail_worker_if_pending(ctx, worker_id) {
             self.task_assigner.track_worker_failed_to_start();
             self.scale_up_workers(ctx);
         }
@@ -98,6 +98,7 @@ impl DriverActor {
                 .worker_pool
                 .get_worker_last_update(worker_id)
                 .is_some_and(|x| x <= instant)
+            && self.worker_pool.running_worker_count() > self.options.worker_initial_count
         {
             self.worker_pool.stop_worker(
                 ctx,

@@ -349,6 +349,23 @@ impl WorkerManager for KubernetesWorkerManager {
             .await?;
         Ok(())
     }
+
+    async fn delete_worker(&self, id: WorkerId) -> ExecutionResult<()> {
+        let name = format!(
+            "{}{}-{}",
+            self.options.worker_pod_name_prefix, self.name, id
+        );
+        match self
+            .pods()
+            .await?
+            .delete(&name, &DeleteParams::default())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(status)) if status.code == 404 => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 #[cfg(test)]

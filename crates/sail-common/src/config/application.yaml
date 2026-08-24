@@ -189,7 +189,7 @@
 
 - key: cluster.task_stream_creation_timeout_secs
   type: number
-  default: "60"
+  default: "120"
   description: |
     The timeout in seconds for creating the task stream.
     This gives a grace period when a task is launched simultaneously with its dependency tasks
@@ -197,7 +197,7 @@
 
 - key: cluster.task_max_attempts
   type: number
-  default: "3"
+  default: "5"
   description: The maximum number of attempts for a task.
 
 - key: cluster.rpc_retry_strategy.type
@@ -840,7 +840,7 @@
 
 - key: server.http2_keepalive_timeout_secs
   type: number
-  default: "60"
+  default: "120"
   description: |
     The timeout in seconds for HTTP/2 keepalive pings on gRPC servers.
     If a connected peer does not acknowledge a keepalive ping within this duration,

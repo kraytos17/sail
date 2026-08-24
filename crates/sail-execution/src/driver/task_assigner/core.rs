@@ -75,17 +75,8 @@ impl TaskAssigner {
     }
 
     pub fn deactivate_worker(&mut self, worker_id: WorkerId) {
-        let Some(worker) = self.workers.get_mut(&worker_id) else {
+        if self.workers.shift_remove(&worker_id).is_none() {
             warn!("worker {worker_id} not found");
-            return;
-        };
-        match worker {
-            WorkerResource::Active { .. } => {
-                *worker = WorkerResource::Inactive;
-            }
-            WorkerResource::Inactive => {
-                warn!("worker {worker_id} is already inactive");
-            }
         }
     }
 

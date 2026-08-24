@@ -25,6 +25,8 @@ use crate::task::definition::TaskDefinition;
 use crate::worker::{WorkerClientSet, WorkerLocation};
 use crate::worker_manager::WorkerLaunchOptions;
 
+const MAX_TERMINAL_WORKERS_RETAINED: usize = 100;
+
 impl WorkerPool {
     pub async fn close(&mut self, ctx: &mut ActorContext<DriverActor>) -> ExecutionResult<()> {
         let worker_ids = self.workers.keys().cloned().collect::<Vec<_>>();
@@ -38,6 +40,7 @@ impl WorkerPool {
     }
 
     pub fn start_worker(&mut self, ctx: &mut ActorContext<DriverActor>) {
+        self.prune_terminal_workers();
         let Ok(worker_id) = self.worker_id_generator.generate() else {
             error!("failed to generate worker ID");
             ctx.send(DriverEvent::Shutdown { result: None });
@@ -143,6 +146,12 @@ impl WorkerPool {
                 worker.state = WorkerState::Completed;
                 worker.stopped_at = Some(Utc::now());
                 worker.messages.extend(reason);
+                let worker_manager = Arc::clone(&self.worker_manager);
+                ctx.spawn(async move {
+                    if let Err(e) = worker_manager.delete_worker(worker_id).await {
+                        warn!("failed to delete pending worker {worker_id}: {e}");
+                    }
+                });
             }
             WorkerState::Running { .. } => {
                 info!("stopping worker {worker_id}");
@@ -152,12 +161,23 @@ impl WorkerPool {
                         error!("failed to stop worker {worker_id}: {e}");
                         worker.state = WorkerState::Failed;
                         worker.stopped_at = Some(Utc::now());
+                        worker.messages.extend(reason);
+                        let worker_manager = Arc::clone(&self.worker_manager);
+                        ctx.spawn(async move {
+                            if let Err(e) = worker_manager.delete_worker(worker_id).await {
+                                warn!("failed to delete worker {worker_id}: {e}");
+                            }
+                        });
                         return;
                     }
                 };
+                let worker_manager = Arc::clone(&self.worker_manager);
                 ctx.spawn(async move {
                     if let Err(e) = client.stop_worker().await {
                         error!("failed to stop worker {worker_id}: {e}");
+                        if let Err(e) = worker_manager.delete_worker(worker_id).await {
+                            warn!("failed to delete worker {worker_id} after failed stop: {e}");
+                        }
                     }
                 });
                 worker.state = WorkerState::Completed;
@@ -180,6 +200,31 @@ impl WorkerPool {
         self.workers
             .values()
             .any(|worker| matches!(worker.state, WorkerState::Pending))
+    }
+
+    pub fn running_worker_count(&self) -> usize {
+        self.workers
+            .values()
+            .filter(|worker| matches!(worker.state, WorkerState::Running { .. }))
+            .count()
+    }
+
+    fn prune_terminal_workers(&mut self) {
+        let terminal_ids = self
+            .workers
+            .iter()
+            .filter(|(_, worker)| {
+                matches!(worker.state, WorkerState::Completed | WorkerState::Failed)
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        if terminal_ids.len() <= MAX_TERMINAL_WORKERS_RETAINED {
+            return;
+        }
+        let excess = terminal_ids.len() - MAX_TERMINAL_WORKERS_RETAINED;
+        for worker_id in terminal_ids.into_iter().take(excess) {
+            self.workers.shift_remove(&worker_id);
+        }
     }
 
     fn list_running_workers(&self) -> Vec<WorkerLocation> {
@@ -226,7 +271,11 @@ impl WorkerPool {
         worker.peers.extend(peer_worker_ids);
     }
 
-    pub fn fail_worker_if_pending(&mut self, worker_id: WorkerId) -> bool {
+    pub fn fail_worker_if_pending(
+        &mut self,
+        ctx: &mut ActorContext<DriverActor>,
+        worker_id: WorkerId,
+    ) -> bool {
         let Some(worker) = self.workers.get_mut(&worker_id) else {
             warn!("worker {worker_id} not found");
             return false;
@@ -236,6 +285,12 @@ impl WorkerPool {
             let message = "worker registration timeout".to_string();
             worker.state = WorkerState::Failed;
             worker.messages.push(message);
+            let worker_manager = Arc::clone(&self.worker_manager);
+            ctx.spawn(async move {
+                if let Err(e) = worker_manager.delete_worker(worker_id).await {
+                    warn!("failed to delete timed-out worker {worker_id}: {e}");
+                }
+            });
             true
         } else {
             false
@@ -512,5 +567,145 @@ impl WorkerPool {
             *updated_at = Instant::now();
             Self::schedule_idle_worker_probe(ctx, worker_id, worker, options);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use chrono::Utc;
+    use sail_server::RetryStrategy;
+    use tonic::async_trait;
+
+    use crate::driver::task_assigner::{TaskAssigner, TaskAssignerOptions};
+    use crate::driver::worker_pool::state::{WorkerDescriptor, WorkerState};
+    use crate::driver::worker_pool::{WorkerPool, WorkerPoolOptions};
+    use crate::error::ExecutionResult;
+    use crate::id::{DriverId, WorkerId};
+    use crate::shuffle::ShuffleBackendKind;
+    use crate::worker_manager::{WorkerLaunchOptions, WorkerManager};
+
+    struct StubWorkerManager;
+
+    #[async_trait]
+    impl WorkerManager for StubWorkerManager {
+        async fn launch_worker(
+            &self,
+            _id: WorkerId,
+            _options: WorkerLaunchOptions,
+        ) -> ExecutionResult<()> {
+            Ok(())
+        }
+
+        async fn stop(&self) -> ExecutionResult<()> {
+            Ok(())
+        }
+    }
+
+    fn make_pool() -> WorkerPool {
+        let options = WorkerPoolOptions {
+            enable_tls: false,
+            session_id: "test-session".to_string(),
+            driver_id: DriverId::from(1u64),
+            driver_server_port: 0,
+            driver_external_host: "localhost".to_string(),
+            driver_external_port: 0,
+            worker_max_idle_time: Duration::from_secs(60),
+            worker_heartbeat_interval: Duration::from_secs(15),
+            worker_heartbeat_timeout: Duration::from_secs(120),
+            worker_launch_timeout: Duration::from_secs(120),
+            task_stream_buffer: 16,
+            task_stream_creation_timeout: Duration::from_secs(60),
+            rpc_retry_strategy: RetryStrategy::Fixed {
+                max_count: 1,
+                delay: Duration::from_secs(1),
+            },
+            shuffle_backend: ShuffleBackendKind::Flight,
+        };
+        WorkerPool::new(Box::new(StubWorkerManager), options)
+    }
+
+    fn descriptor(state: WorkerState) -> WorkerDescriptor {
+        WorkerDescriptor {
+            state,
+            messages: vec![],
+            peers: Default::default(),
+            created_at: Utc::now(),
+            stopped_at: None,
+        }
+    }
+
+    fn running() -> WorkerState {
+        WorkerState::Running {
+            host: "10.0.0.1".to_string(),
+            port: 8080,
+            updated_at: tokio::time::Instant::now(),
+            heartbeat_at: tokio::time::Instant::now(),
+            client: None,
+        }
+    }
+
+    fn insert(pool: &mut WorkerPool, id: u64, state: WorkerState) {
+        pool.workers.insert(id.into(), descriptor(state));
+    }
+
+    #[test]
+    fn test_running_worker_counts_only_running() {
+        let mut pool = make_pool();
+        insert(&mut pool, 1, running());
+        insert(&mut pool, 2, running());
+        insert(&mut pool, 3, WorkerState::Pending);
+        insert(&mut pool, 4, WorkerState::Completed);
+        insert(&mut pool, 5, WorkerState::Failed);
+        assert_eq!(pool.running_worker_count(), 2);
+    }
+
+    #[test]
+    fn test_prune_keeps_cap_and_drops_oldest_terminal() {
+        let mut pool = make_pool();
+        for id in 0..(super::MAX_TERMINAL_WORKERS_RETAINED + 5) as u64 {
+            insert(&mut pool, id, WorkerState::Completed);
+        }
+        insert(&mut pool, 10000, running());
+        insert(&mut pool, 10001, WorkerState::Pending);
+        pool.prune_terminal_workers();
+        assert_eq!(pool.workers.len(), super::MAX_TERMINAL_WORKERS_RETAINED + 2);
+        assert!(!pool.workers.contains_key(&0u64.into()));
+        assert!(!pool.workers.contains_key(&4u64.into()));
+        assert!(pool.workers.contains_key(&5u64.into()));
+        assert!(
+            pool.workers
+                .contains_key(&(super::MAX_TERMINAL_WORKERS_RETAINED + 4).into())
+        );
+        assert!(pool.workers.contains_key(&10000u64.into()));
+        assert!(pool.workers.contains_key(&10001u64.into()));
+    }
+
+    #[test]
+    fn test_prune_noop_under_cap() {
+        let mut pool = make_pool();
+        insert(&mut pool, 1, WorkerState::Failed);
+        insert(&mut pool, 2, running());
+        pool.prune_terminal_workers();
+        assert_eq!(pool.workers.len(), 2);
+    }
+
+    #[test]
+    fn test_deactivate_worker_removes_entry() {
+        let mut assigner = TaskAssigner::new(TaskAssignerOptions {
+            worker_task_slots: 8,
+            worker_max_count: 4,
+        });
+        let worker_id = WorkerId::from(1u64);
+        assigner.activate_worker(worker_id);
+        assert!(assigner.is_worker_idle(worker_id));
+        assigner.deactivate_worker(worker_id);
+        assert!(!assigner.is_worker_idle(worker_id));
+        assigner.activate_worker(worker_id);
+        assert!(
+            assigner.is_worker_idle(worker_id),
+            "re-activation must insert a fresh active entry, proving the tombstone was removed"
+        );
     }
 }
