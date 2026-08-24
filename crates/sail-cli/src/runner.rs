@@ -44,6 +44,17 @@ enum Command {
             help = "The port for the Flight SQL server"
         )]
         flight_port: u16,
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "The port for the session multiplexing proxy (0 disables it)"
+        )]
+        mux_port: u16,
+        #[arg(
+            long,
+            help = "The canonical session id shared by all multiplexed clients (a random UUID is generated when omitted)"
+        )]
+        canonical_session_id: Option<String>,
     },
 }
 
@@ -218,6 +229,14 @@ pub fn main(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             ip,
             spark_port,
             flight_port,
-        } => run_combo_server(ip.parse()?, spark_port, flight_port),
+            mux_port,
+            canonical_session_id,
+        } => run_combo_server(
+            ip.parse()?,
+            spark_port,
+            flight_port,
+            mux_port,
+            canonical_session_id,
+        ),
     }
 }

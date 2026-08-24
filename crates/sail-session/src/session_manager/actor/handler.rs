@@ -57,25 +57,13 @@ impl SessionManagerActor {
         ActorAction::Continue
     }
 
-    pub(super) fn handle_get_server_session_id(
-        &self,
-        result: oneshot::Sender<String>,
-    ) -> ActorAction {
-        let _ = result.send(self.server_session_id.clone());
-        ActorAction::Continue
-    }
-
     pub(super) fn handle_get_or_create_session(
         &mut self,
         ctx: &mut ActorContext<Self>,
-        _session_id: String,
+        session_id: String,
         user_id: String,
         result: oneshot::Sender<SessionResult<SessionContext>>,
     ) -> ActorAction {
-        // Sail is the sole authority for the session id: the client-supplied id is ignored and
-        // replaced by the server-owned UUID, so every client (Spark Connect and Flight) shares
-        // ONE session -> ONE driver + worker fleet.
-        let session_id = self.server_session_id.clone();
         let context = if let Some(session) = self.sessions.get(&session_id) {
             if let ServerSessionState::Running { context, .. } = &session.state {
                 Ok(context.clone())
@@ -87,8 +75,9 @@ impl SessionManagerActor {
         } else {
             // TODO: The session ID is used in various storage paths, so it is assumed to be unique
             //   across all session managers, and it should contain only valid characters for a
-            //   path segment. The server-owned session id is generated as a UUID, so this is true
-            //   in practice, but we may still want some validation here.
+            //   path segment. Right now the session ID is generated as a UUID by the Spark client,
+            //   so this is true in practice, but we may still want some validation here.
+            let session_id = session_id.clone();
             info!("creating session {session_id}");
             let span = Span::root(
                 "SessionManagerActor::create_session_context",
@@ -229,12 +218,9 @@ impl SessionManagerActor {
     pub(super) fn handle_delete_session(
         &mut self,
         ctx: &mut ActorContext<Self>,
-        _session_id: String,
+        session_id: String,
         result: oneshot::Sender<SessionResult<()>>,
     ) -> ActorAction {
-        // Sessions are keyed by the server-owned id, so teardown (which delivers a client id)
-        // must resolve to that shared key.
-        let session_id = self.server_session_id.clone();
         let session = self.sessions.get_mut(&session_id);
         let output = if let Some(session) = session {
             if let ServerSessionState::Running { context, driver_id } = &mut session.state {

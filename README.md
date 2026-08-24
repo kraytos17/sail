@@ -57,7 +57,7 @@ Please refer to the [Kubernetes Deployment Guide](https://docs.lakesail.com/sail
 
 ```bash
 kubectl apply -f sail.yaml
-kubectl -n sail port-forward service/sail-spark-server 50051:50051
+kubectl -n sail port-forward service/sail 15002:15002
 ```
 
 ### Connecting to the Sail Server

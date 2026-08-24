@@ -75,20 +75,6 @@ impl SessionManager {
             .map_err(|e| SessionError::internal(format!("failed to delete session: {e}")))?
     }
 
-    /// Returns the server-owned session identifier.
-    ///
-    /// Sail is the sole authority for the session id: it is a fresh UUID minted once per
-    /// server process, and both Spark Connect and Flight clients are normalized to it so
-    /// they all share ONE driver + worker fleet.
-    pub async fn server_session_id(&self) -> SessionResult<String> {
-        let (tx, rx) = oneshot::channel();
-        self.handle
-            .send(SessionManagerEvent::GetServerSessionId { result: tx })
-            .await?;
-        rx.await
-            .map_err(|e| SessionError::internal(format!("failed to get server session id: {e}")))
-    }
-
     /// Shut down the session manager and all resources it owns.
     pub async fn shutdown(&self) -> SessionResult<()> {
         let (tx, rx) = oneshot::channel();

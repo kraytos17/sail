@@ -6,101 +6,39 @@ metadata:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: sail-spark-server
+  name: sail-server
   namespace: sail
   labels:
     app.kubernetes.io/name: sail
-    app.kubernetes.io/component: spark-server
+    app.kubernetes.io/component: server
 spec:
   # We cannot have more than one replica because each Spark session is tied to a single pod.
   replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: sail
-      app.kubernetes.io/component: spark-server
+      app.kubernetes.io/component: server
   template:
     metadata:
       labels:
         app.kubernetes.io/name: sail
-        app.kubernetes.io/component: spark-server
+        app.kubernetes.io/component: server
     spec:
       serviceAccountName: sail-user
       containers:
         - name: server
           image: sail:latest
           command: [ "sail" ]
-          args: [ "spark", "server", "--ip", "0.0.0.0", "--port", "50051" ]
+          # One process serves both protocols off ONE shared session manager.
+          # Port 15002 multiplexes every Spark Connect client onto a single
+          # auto-generated canonical session, so heterogeneous clients share
+          # one driver + worker fleet without coordinating on session ids.
+          args: [ "server", "--ip", "0.0.0.0", "--spark-port", "50051", "--flight-port", "32010", "--mux-port", "15002" ]
           ports:
-            - containerPort: 50051
-          imagePullPolicy: IfNotPresent
-          env:
-            - name: RUST_LOG
-              value: info
-            - name: SAIL_MODE
-              value: "kubernetes-cluster"
-            - name: SAIL_CLUSTER__DRIVER_LISTEN_HOST
-              value: "0.0.0.0"
-            - name: SAIL_CLUSTER__DRIVER_EXTERNAL_HOST
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
-            - name: SAIL_KUBERNETES__IMAGE
-              value: sail:latest
-            - name: SAIL_KUBERNETES__NAMESPACE
-              value: sail
-            - name: SAIL_KUBERNETES__DRIVER_POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: SAIL_KUBERNETES__WORKER_SERVICE_ACCOUNT_NAME
-              value: sail-user
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: sail-spark-server
-  namespace: sail
-  labels:
-    app.kubernetes.io/name: sail
-    app.kubernetes.io/component: spark-server
-spec:
-  selector:
-    app.kubernetes.io/name: sail
-    app.kubernetes.io/component: spark-server
-  ports:
-    - protocol: TCP
-      port: 50051
-      targetPort: 50051
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: sail-flight-server
-  namespace: sail
-  labels:
-    app.kubernetes.io/name: sail
-    app.kubernetes.io/component: flight-server
-spec:
-  # We cannot have more than one replica because each session is tied to a single pod.
-  replicas: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: sail
-      app.kubernetes.io/component: flight-server
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: sail
-        app.kubernetes.io/component: flight-server
-    spec:
-      serviceAccountName: sail-user
-      containers:
-        - name: server
-          image: sail:latest
-          command: [ "sail" ]
-          args: [ "flight", "server", "--ip", "0.0.0.0", "--port", "32010" ]
-          ports:
+            - containerPort: 15002
+              name: spark-connect-mux
             - containerPort: 32010
+              name: flight-sql
           imagePullPolicy: IfNotPresent
           env:
             - name: RUST_LOG
@@ -123,28 +61,45 @@ spec:
                   fieldPath: metadata.name
             - name: SAIL_KUBERNETES__WORKER_SERVICE_ACCOUNT_NAME
               value: sail-user
+            # Worker pool sizing for the shared canonical session: one pool
+            # serves every client through the multiplexer, so these bound the
+            # total fleet. Capacity rule: MAX_COUNT * TASK_SLOTS >= peak
+            # concurrent tasks.
+            - name: SAIL_CLUSTER__WORKER_INITIAL_COUNT
+              value: "4"
+            - name: SAIL_CLUSTER__WORKER_MAX_COUNT
+              value: "4"
+            - name: SAIL_CLUSTER__WORKER_TASK_SLOTS
+              value: "4"
+            - name: SAIL_CLUSTER__WORKER_MAX_IDLE_TIME_SECS
+              value: "3600"
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: sail-flight-service
+  name: sail
   namespace: sail
   labels:
     app.kubernetes.io/name: sail
-    app.kubernetes.io/component: flight-server
+    app.kubernetes.io/component: server
 spec:
   selector:
     app.kubernetes.io/name: sail
-    app.kubernetes.io/component: flight-server
+    app.kubernetes.io/component: server
   ports:
-    - protocol: TCP
+    - name: spark-connect-mux
+      protocol: TCP
+      port: 15002
+      targetPort: 15002
+    - name: flight-sql
+      protocol: TCP
       port: 32010
       targetPort: 32010
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: sail-spark-server
+  name: sail-server
   namespace: sail
 rules:
   - apiGroups: [ "" ]
@@ -160,7 +115,7 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: sail-spark-server
+  name: sail-server
   namespace: sail
 subjects:
   - kind: ServiceAccount
@@ -168,5 +123,5 @@ subjects:
     namespace: sail
 roleRef:
   kind: Role
-  name: sail-spark-server
+  name: sail-server
   apiGroup: rbac.authorization.k8s.io

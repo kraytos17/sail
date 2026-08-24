@@ -233,14 +233,9 @@ impl SparkConnectService for SparkConnectServer {
                 Some(analyze_plan_response::Result::JsonToDdl(json))
             }
         };
-        let server_side_session_id = self
-            .session_manager
-            .server_session_id()
-            .await
-            .map_err(SparkError::from)?;
         let response = AnalyzePlanResponse {
             session_id: request.session_id.clone(),
-            server_side_session_id,
+            server_side_session_id: request.session_id,
             result,
         };
         debug!("{response:?}");
@@ -328,14 +323,9 @@ impl SparkConnectService for SparkConnectServer {
             }
         };
         let artifacts = service::handle_add_artifacts(&ctx, stream).await?;
-        let server_side_session_id = self
-            .session_manager
-            .server_session_id()
-            .await
-            .map_err(SparkError::from)?;
         let response = AddArtifactsResponse {
             session_id: first.session_id.clone(),
-            server_side_session_id,
+            server_side_session_id: first.session_id,
             artifacts,
         };
         debug!("{response:?}");
@@ -356,14 +346,9 @@ impl SparkConnectService for SparkConnectServer {
             .await
             .map_err(SparkError::from)?;
         let statuses = service::handle_artifact_statuses(&ctx, request.names).await?;
-        let server_side_session_id = self
-            .session_manager
-            .server_session_id()
-            .await
-            .map_err(SparkError::from)?;
         let response = ArtifactStatusesResponse {
             session_id: request.session_id.clone(),
-            server_side_session_id,
+            server_side_session_id: request.session_id,
             statuses,
         };
         debug!("{response:?}");
@@ -403,14 +388,9 @@ impl SparkConnectService for SparkConnectServer {
                 "a valid interrupt type is required",
             )),
         };
-        let server_side_session_id = self
-            .session_manager
-            .server_session_id()
-            .await
-            .map_err(SparkError::from)?;
         let response = InterruptResponse {
             session_id: request.session_id.clone(),
-            server_side_session_id,
+            server_side_session_id: request.session_id,
             interrupted_ids: ids?,
         };
         debug!("{response:?}");
@@ -456,14 +436,9 @@ impl SparkConnectService for SparkConnectServer {
             Release::ReleaseUntil(ReleaseUntil { response_id }) => Some(response_id),
         };
         service::handle_release_execute(&ctx, request.operation_id.clone(), response_id).await?;
-        let server_side_session_id = self
-            .session_manager
-            .server_session_id()
-            .await
-            .map_err(SparkError::from)?;
         let response = ReleaseExecuteResponse {
             session_id: request.session_id.clone(),
-            server_side_session_id,
+            server_side_session_id: request.session_id,
             operation_id: Some(request.operation_id),
         };
         debug!("{response:?}");
@@ -485,14 +460,9 @@ impl SparkConnectService for SparkConnectServer {
             .delete_session(session_id)
             .await
             .map_err(SparkError::from)?;
-        let server_side_session_id = self
-            .session_manager
-            .server_session_id()
-            .await
-            .map_err(SparkError::from)?;
         let response = ReleaseSessionResponse {
             session_id: request.session_id.clone(),
-            server_side_session_id,
+            server_side_session_id: request.session_id,
         };
         debug!("{response:?}");
         Ok(Response::new(response))

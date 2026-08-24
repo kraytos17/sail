@@ -36,6 +36,9 @@ use sail_common::runtime::RuntimeManager;
 use sail_flight::service::SailFlightSqlService;
 use sail_server::{ServerBuilder, ServerBuilderOptions};
 use sail_spark_connect::create_spark_session_manager;
+use sail_spark_connect::multiplexer::{
+    MultiplexedSparkConnectServer, resolve_canonical_session_id,
+};
 use sail_spark_connect::server::SparkConnectServer;
 use sail_spark_connect::spark::connect::spark_connect_service_server::SparkConnectServiceServer;
 use sail_telemetry::telemetry::{ResourceOptions, init_telemetry, shutdown_telemetry};
@@ -49,10 +52,19 @@ async fn shutdown() {
 
 /// Starts a single process hosting both the Spark Connect and Flight SQL servers
 /// off one shared session manager, keeping a single warm worker fleet.
+///
+/// When `mux_port` is non-zero, an additional Spark Connect listener is hosted
+/// on it that multiplexes every client onto ONE canonical backend session
+/// (clients keep their own ids; responses echo them back), so heterogeneous
+/// clients share a single fleet without coordinating on a session id. The
+/// Flight SQL service then uses that same canonical session as its default,
+/// so Spark Connect and Flight SQL clients share ONE driver + worker fleet.
 pub fn run_combo_server(
     ip: IpAddr,
     spark_port: u16,
     flight_port: u16,
+    mux_port: u16,
+    canonical_session_id: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(AppConfig::load()?);
 
@@ -82,8 +94,50 @@ pub fn run_combo_server(
             .send_compressed(CompressionEncoding::Gzip)
             .send_compressed(CompressionEncoding::Zstd);
 
-        let flight_service =
-            FlightServiceServer::new(SailFlightSqlService::new(session_manager.clone()));
+        // Resolve the canonical session id ONCE so the multiplexer and the
+        // Flight SQL service share it: when the mux is enabled, Spark Connect
+        // and Flight SQL clients then land on ONE driver + worker fleet.
+        let canonical_session_id = resolve_canonical_session_id(canonical_session_id);
+
+        let flight_service = FlightServiceServer::new(SailFlightSqlService::with_default_session(
+            session_manager.clone(),
+            (mux_port > 0).then(|| canonical_session_id.clone()),
+        ));
+
+        let mux_task = if mux_port > 0 {
+            let mux_listener = TcpListener::bind(SocketAddr::new(ip, mux_port)).await?;
+            let mux_server = MultiplexedSparkConnectServer::new(
+                session_manager.clone(),
+                Some(canonical_session_id),
+            );
+            info!(
+                "Sail session multiplexer listening on port {mux_port} (canonical session: {})",
+                mux_server.canonical_session_id()
+            );
+            let mux_service = SparkConnectServiceServer::new(mux_server)
+                .max_decoding_message_size(GRPC_MAX_MESSAGE_LENGTH_DEFAULT)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd)
+                .send_compressed(CompressionEncoding::Gzip)
+                .send_compressed(CompressionEncoding::Zstd);
+            Some(
+                ServerBuilder::new(
+                    "sail_spark_connect_mux",
+                    ServerBuilderOptions {
+                        http2_keepalive_timeout: Some(http2_keepalive_timeout),
+                        ..Default::default()
+                    },
+                )
+                .add_service(
+                    mux_service,
+                    Some(sail_spark_connect::spark::connect::FILE_DESCRIPTOR_SET),
+                )
+                .await
+                .serve(mux_listener, shutdown()),
+            )
+        } else {
+            None
+        };
 
         let spark_task = ServerBuilder::new(
             "sail_spark_connect",
@@ -109,16 +163,22 @@ pub fn run_combo_server(
         .await
         .serve(flight_listener, shutdown());
 
-        let (spark_result, flight_result) = tokio::join!(spark_task, flight_task);
+        let mux_result = async {
+            match mux_task {
+                Some(task) => task.await,
+                None => Ok(()),
+            }
+        };
+        let (spark_result, flight_result, mux_result) =
+            tokio::join!(spark_task, flight_task, mux_result);
 
         session_manager
             .shutdown()
             .await
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        match (spark_result, flight_result) {
-            (Err(e), _) => Err(e),
-            (_, Err(e)) => Err(e),
+        match (spark_result, flight_result, mux_result) {
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
             _ => Ok(()),
         }
     });

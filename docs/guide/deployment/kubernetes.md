@@ -142,7 +142,7 @@ kubectl apply -k k8s/
 To connect to the Sail Spark Connect server, you can forward the service port to your local machine.
 
 ```bash
-kubectl -n sail port-forward service/sail-spark-server 50051:50051
+kubectl -n sail port-forward service/sail 15002:15002
 ```
 
 Now you can run Spark jobs using the standalone Spark client.
@@ -151,7 +151,7 @@ Sail worker pods are launched on-demand to execute Spark jobs.
 The worker pods are terminated after a certain period of inactivity.
 
 ```bash
-env SPARK_CONNECT_MODE_ENABLED=1 SPARK_REMOTE="sc://localhost:50051" pyspark
+env SPARK_CONNECT_MODE_ENABLED=1 SPARK_REMOTE="sc://localhost:15002" pyspark
 ```
 
 ## Running Python Tests
@@ -162,7 +162,7 @@ custom pod template (such as the `k8s/test-volume-patch.yaml` file shown above) 
 Once the pod template is in place, you can run pytest locally against the cluster with the following command.
 
 ```bash
-env SPARK_REMOTE="sc://localhost:50051" PYTEST_DEBUG_TEMPROOT="/tmp/sail" pytest --pyargs pysail
+env SPARK_REMOTE="sc://localhost:15002" PYTEST_DEBUG_TEMPROOT="/tmp/sail" pytest --pyargs pysail
 ```
 
 ## Cleaning Up

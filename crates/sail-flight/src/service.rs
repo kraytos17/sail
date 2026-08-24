@@ -35,10 +35,25 @@ pub struct SailFlightSqlService {
     config: Arc<PlanConfig>,
     metrics: Option<Arc<MetricRegistry>>,
     state: Arc<Mutex<SailFlightSqlState>>,
+    default_session_id: String,
 }
 
 impl SailFlightSqlService {
     pub fn new(session_manager: SessionManager) -> Self {
+        Self::with_default_session(session_manager, None)
+    }
+
+    /// Creates a service whose clients share the given backend session id.
+    ///
+    /// All Flight SQL clients of one service instance always share a single
+    /// session; this chooses WHICH one. When `None` (standalone mode), they
+    /// share [`Self::DEFAULT_SESSION_ID`]. The combined server injects the
+    /// multiplexer's canonical session so Spark Connect and Flight SQL
+    /// clients share ONE driver + worker fleet.
+    pub fn with_default_session(
+        session_manager: SessionManager,
+        default_session_id: Option<String>,
+    ) -> Self {
         let config = Arc::new(PlanConfig::default());
         let metrics = global_metrics().map(|m| m.registry);
         if metrics.is_some() {
@@ -49,6 +64,9 @@ impl SailFlightSqlService {
             config,
             metrics,
             state: Arc::new(Mutex::new(SailFlightSqlState::new())),
+            default_session_id: default_session_id
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| Self::DEFAULT_SESSION_ID.to_string()),
         }
     }
 
@@ -56,12 +74,9 @@ impl SailFlightSqlService {
     const DEFAULT_USER_ID: &'static str = "flight-user";
 
     async fn get_session_context(&self) -> Result<SessionContext, Status> {
-        // The session id is server-owned: `SessionManagerActor` normalizes every client to
-        // its single `server_session_id`, so both Flight and Spark Connect clients share ONE
-        // session -> ONE driver + worker fleet. The id passed here is effectively ignored.
         self.session_manager
             .get_or_create_session_context(
-                Self::DEFAULT_SESSION_ID.to_string(),
+                self.default_session_id.clone(),
                 Self::DEFAULT_USER_ID.to_string(),
             )
             .await
