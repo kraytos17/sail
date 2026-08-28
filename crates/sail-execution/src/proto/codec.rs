@@ -35,6 +35,7 @@ use datafusion::logical_expr::{
 use datafusion::parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use datafusion::physical_expr::equivalence::{EquivalenceClass, EquivalenceGroup};
 use datafusion::physical_expr::expressions::{Column, LambdaExpr, LambdaVariable};
+use datafusion::physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion::physical_expr::{
     AcrossPartitions, ConstExpr, EquivalenceProperties, LexOrdering, LexRequirement, Partitioning,
     PhysicalExpr, PhysicalSortExpr,
@@ -306,6 +307,24 @@ use crate::proto::encode::{
     physical_expr_to_proto, try_encode_field_ref, try_encode_message, try_encode_physical_expr,
     try_encode_physical_plan, try_encode_schema,
 };
+
+/// Returns whether the expression tree contains a `ScalarSubqueryExpr`.
+///
+/// `ScalarSubqueryExpr` requires `ScalarSubqueryResults` context to be
+/// deserialized, which is only available when decoding inside a
+/// `ScalarSubqueryExec` via DataFusion-proto's own codec. Sail's extension
+/// codec (`RemoteExecutionCodec`) only receives a `TaskContext`, so it cannot
+/// provide that context. Predicates carrying a `ScalarSubqueryExpr` (e.g. a
+/// Parquet page-pruning predicate) must therefore be dropped before encoding,
+/// otherwise the worker fails to deserialize the stage plan.
+fn contains_scalar_subquery_expr(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    if expr.downcast_ref::<ScalarSubqueryExpr>().is_some() {
+        return true;
+    }
+    expr.children()
+        .into_iter()
+        .any(contains_scalar_subquery_expr)
+}
 
 pub struct RemoteExecutionCodec;
 
@@ -1824,6 +1843,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     let options = try_encode_message(options)?;
                     let predicate = parquet_source
                         .filter()
+                        .filter(|predicate| !contains_scalar_subquery_expr(predicate))
                         .map(|predicate| try_encode_physical_expr(self, &predicate))
                         .transpose()?;
                     let (struct_field_matching, timezone_mode) =

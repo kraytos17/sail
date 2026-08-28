@@ -4,9 +4,7 @@ use std::sync::{Arc, OnceLock};
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{JoinType, Result, plan_datafusion_err};
-use datafusion::datasource::physical_plan::{
-    FileScanConfig, FileScanConfigBuilder, FileSource, ParquetSource,
-};
+use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder, ParquetSource};
 use datafusion::logical_expr::execution_props::{ScalarSubqueryResults, SubqueryIndex};
 use datafusion::physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion::physical_expr::{Partitioning, PhysicalExpr};
@@ -656,14 +654,6 @@ fn wrap_pending_scalar_subqueries(
 
 fn plan_scalar_subquery_indices(plan: &Arc<dyn ExecutionPlan>) -> HashSet<SubqueryIndex> {
     let mut indices = HashSet::new();
-    if let Some(data_source) = plan.downcast_ref::<DataSourceExec>() {
-        if let Some((_config, parquet)) = data_source.downcast_to_file_source::<ParquetSource>() {
-            if let Some(filter) = parquet.filter() {
-                collect_scalar_subquery_indices(&filter, &mut indices);
-            }
-        }
-        return indices;
-    }
     if let Some(filter) = plan.downcast_ref::<FilterExec>() {
         collect_scalar_subquery_indices(filter.predicate(), &mut indices);
         return indices;
