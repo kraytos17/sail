@@ -81,7 +81,7 @@ pub fn run_combo_server(
         // Build ONE shared session manager backing both protocols so a pinned
         // `session_id` resolves to a single driver + worker fleet.
         let session_manager =
-            create_spark_session_manager(config, runtime_manager.handle().clone()).await?;
+            create_spark_session_manager(config.clone(), runtime_manager.handle().clone()).await?;
 
         let spark_listener = TcpListener::bind(SocketAddr::new(ip, spark_port)).await?;
         let flight_listener = TcpListener::bind(SocketAddr::new(ip, flight_port)).await?;
@@ -97,7 +97,10 @@ pub fn run_combo_server(
         // Resolve the canonical session id ONCE so the multiplexer and the
         // Flight SQL service share it: when the mux is enabled, Spark Connect
         // and Flight SQL clients then land on ONE driver + worker fleet.
-        let canonical_session_id = resolve_canonical_session_id(canonical_session_id);
+        // Precedence: explicit CLI flag > server.session_id config > random UUID.
+        let canonical_session_id = resolve_canonical_session_id(
+            canonical_session_id.or_else(|| config.server.session_id.clone()),
+        );
 
         let flight_service = FlightServiceServer::new(SailFlightSqlService::with_default_session(
             session_manager.clone(),

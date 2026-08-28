@@ -75,6 +75,27 @@ impl SessionManager {
             .map_err(|e| SessionError::internal(format!("failed to delete session: {e}")))?
     }
 
+    /// How long the session has been idle, per its [`ActivityTracker`] (updated
+    /// by every protocol that touches the session via `get_or_create`).
+    ///
+    /// `None` means the session does not exist, is not running, or its activity
+    /// cannot be determined — treat that as "unknown" and avoid destructive
+    /// actions.
+    pub async fn session_idle_duration(
+        &self,
+        session_id: String,
+    ) -> SessionResult<Option<Duration>> {
+        let (tx, rx) = oneshot::channel();
+        let event = SessionManagerEvent::SessionIdleDuration {
+            session_id,
+            result: tx,
+        };
+        self.handle.send(event).await?;
+        rx.await.map_err(|e| {
+            SessionError::internal(format!("failed to get session idle duration: {e}"))
+        })?
+    }
+
     /// Shut down the session manager and all resources it owns.
     pub async fn shutdown(&self) -> SessionResult<()> {
         let (tx, rx) = oneshot::channel();

@@ -82,6 +82,9 @@ impl Actor for SessionManagerActor {
             SessionManagerEvent::DeleteSession { session_id, result } => {
                 self.handle_delete_session(ctx, session_id, result)
             }
+            SessionManagerEvent::SessionIdleDuration { session_id, result } => {
+                self.handle_session_idle_duration(session_id, result)
+            }
             SessionManagerEvent::SetSessionHistory {
                 session_id,
                 history,

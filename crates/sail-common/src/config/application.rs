@@ -741,6 +741,12 @@ pub struct FlightConfig {
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub http2_keepalive_timeout_secs: u64,
+    #[serde(
+        default,
+        serialize_with = "serialize_non_empty_string",
+        deserialize_with = "deserialize_non_empty_string"
+    )]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

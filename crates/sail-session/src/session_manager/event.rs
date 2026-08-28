@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::time::Duration;
 
 use datafusion::prelude::SessionContext;
 use sail_common_datafusion::session::job::JobRunnerHistory;
@@ -26,6 +27,10 @@ pub enum SessionManagerEvent {
     DeleteSession {
         session_id: String,
         result: oneshot::Sender<SessionResult<()>>,
+    },
+    SessionIdleDuration {
+        session_id: String,
+        result: oneshot::Sender<SessionResult<Option<Duration>>>,
     },
     SetSessionHistory {
         session_id: String,
@@ -56,6 +61,7 @@ impl SpanAssociation for SessionManagerEvent {
             SessionManagerEvent::GetOrCreateSession { .. } => "GetOrCreateSession",
             SessionManagerEvent::ProbeIdleSession { .. } => "ProbeIdleSession",
             SessionManagerEvent::DeleteSession { .. } => "DeleteSession",
+            SessionManagerEvent::SessionIdleDuration { .. } => "SessionIdleDuration",
             SessionManagerEvent::SetSessionHistory { .. } => "SetSessionHistory",
             SessionManagerEvent::SetSessionFailure { .. } => "SetSessionFailure",
             SessionManagerEvent::ObserveState { .. } => "ObserveState",
@@ -78,6 +84,10 @@ impl SpanAssociation for SessionManagerEvent {
                 instant: _,
             }
             | SessionManagerEvent::DeleteSession {
+                session_id,
+                result: _,
+            }
+            | SessionManagerEvent::SessionIdleDuration {
                 session_id,
                 result: _,
             }

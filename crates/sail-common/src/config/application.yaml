@@ -849,6 +849,16 @@
     temporarily stalled peers (e.g. busy workers), which surfaces as
     "h2 protocol error: error reading a body from connection" on the client side.
 
+- key: server.session_id
+  type: string
+  default: ""
+  description: |
+    Stable canonical session id for the Spark Connect session multiplexer.
+    When non-empty, every multiplexed client is routed to this session id and
+    it stays stable across pod restarts. When empty, a random UUID is minted
+    per process.
+  experimental: true
+
 - key: telemetry.export_traces
   type: boolean
   default: "false"

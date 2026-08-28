@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use datafusion::prelude::SessionContext;
@@ -242,6 +243,32 @@ impl SessionManagerActor {
             )))
         };
         let _ = result.send(output);
+        ActorAction::Continue
+    }
+
+    /// Reports how long the session has been idle, based on the session's
+    /// [`ActivityTracker`] (updated by every protocol that touches the
+    /// session via `get_or_create`). `None` means the session does not exist
+    /// or is not running, or its activity cannot be determined — callers
+    /// should treat that as "unknown" and avoid destructive actions.
+    pub(super) fn handle_session_idle_duration(
+        &mut self,
+        session_id: String,
+        result: oneshot::Sender<SessionResult<Option<Duration>>>,
+    ) -> ActorAction {
+        let idle = match self.sessions.get(&session_id) {
+            Some(session) => match &session.state {
+                ServerSessionState::Running { context, .. } => {
+                    match context.extension::<ActivityTracker>() {
+                        Ok(tracker) => Ok(tracker.active_at().ok().map(|at| at.elapsed())),
+                        Err(_) => Ok(None),
+                    }
+                }
+                _ => Ok(None),
+            },
+            None => Ok(None),
+        };
+        let _ = result.send(idle);
         ActorAction::Continue
     }
 
