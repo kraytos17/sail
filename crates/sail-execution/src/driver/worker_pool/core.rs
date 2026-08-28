@@ -604,25 +604,25 @@ mod tests {
     }
 
     fn make_pool() -> WorkerPool {
-        let options = WorkerPoolOptions {
-            enable_tls: false,
-            session_id: "test-session".to_string(),
-            driver_id: DriverId::from(1u64),
-            driver_server_port: 0,
-            driver_external_host: "localhost".to_string(),
-            driver_external_port: 0,
-            worker_max_idle_time: Duration::from_secs(60),
-            worker_heartbeat_interval: Duration::from_secs(15),
-            worker_heartbeat_timeout: Duration::from_secs(120),
-            worker_launch_timeout: Duration::from_secs(120),
-            task_stream_buffer: 16,
-            task_stream_creation_timeout: Duration::from_secs(60),
-            rpc_retry_strategy: RetryStrategy::Fixed {
+        let options = WorkerPoolOptions::new_for_test(
+            false,
+            "test-session".to_string(),
+            DriverId::from(1u64),
+            0,
+            "localhost".to_string(),
+            0,
+            Duration::from_secs(60),
+            Duration::from_secs(15),
+            Duration::from_secs(120),
+            Duration::from_secs(120),
+            16,
+            Duration::from_secs(60),
+            RetryStrategy::Fixed {
                 max_count: 1,
                 delay: Duration::from_secs(1),
             },
-            shuffle_backend: ShuffleBackendKind::Flight,
-        };
+            ShuffleBackendKind::Flight,
+        );
         WorkerPool::new(Box::new(StubWorkerManager), options)
     }
 
@@ -671,15 +671,14 @@ mod tests {
         insert(&mut pool, 10001, WorkerState::Pending);
         pool.prune_terminal_workers();
         assert_eq!(pool.workers.len(), super::MAX_TERMINAL_WORKERS_RETAINED + 2);
-        assert!(!pool.workers.contains_key(&0u64.into()));
-        assert!(!pool.workers.contains_key(&4u64.into()));
-        assert!(pool.workers.contains_key(&5u64.into()));
-        assert!(
-            pool.workers
-                .contains_key(&(super::MAX_TERMINAL_WORKERS_RETAINED + 4).into())
-        );
-        assert!(pool.workers.contains_key(&10000u64.into()));
-        assert!(pool.workers.contains_key(&10001u64.into()));
+        assert!(!pool.workers.contains_key(&WorkerId::from(0u64)));
+        assert!(!pool.workers.contains_key(&WorkerId::from(4u64)));
+        assert!(pool.workers.contains_key(&WorkerId::from(5u64)));
+        assert!(pool.workers.contains_key(&WorkerId::from(
+            (super::MAX_TERMINAL_WORKERS_RETAINED + 4) as u64
+        )));
+        assert!(pool.workers.contains_key(&WorkerId::from(10000u64)));
+        assert!(pool.workers.contains_key(&WorkerId::from(10001u64)));
     }
 
     #[test]
@@ -693,10 +692,7 @@ mod tests {
 
     #[test]
     fn test_deactivate_worker_removes_entry() {
-        let mut assigner = TaskAssigner::new(TaskAssignerOptions {
-            worker_task_slots: 8,
-            worker_max_count: 4,
-        });
+        let mut assigner = TaskAssigner::new(TaskAssignerOptions::new_for_test(8, 4));
         let worker_id = WorkerId::from(1u64);
         assigner.activate_worker(worker_id);
         assert!(assigner.is_worker_idle(worker_id));

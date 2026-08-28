@@ -25,6 +25,43 @@ pub struct WorkerPoolOptions {
     pub shuffle_backend: ShuffleBackendKind,
 }
 
+#[cfg(test)]
+impl WorkerPoolOptions {
+    pub fn new_for_test(
+        enable_tls: bool,
+        session_id: String,
+        driver_id: DriverId,
+        driver_server_port: u16,
+        driver_external_host: String,
+        driver_external_port: u16,
+        worker_max_idle_time: Duration,
+        worker_heartbeat_interval: Duration,
+        worker_heartbeat_timeout: Duration,
+        worker_launch_timeout: Duration,
+        task_stream_buffer: usize,
+        task_stream_creation_timeout: Duration,
+        rpc_retry_strategy: RetryStrategy,
+        shuffle_backend: ShuffleBackendKind,
+    ) -> Self {
+        Self {
+            enable_tls,
+            session_id,
+            driver_id,
+            driver_server_port,
+            driver_external_host,
+            driver_external_port,
+            worker_max_idle_time,
+            worker_heartbeat_interval,
+            worker_heartbeat_timeout,
+            worker_launch_timeout,
+            task_stream_buffer,
+            task_stream_creation_timeout,
+            rpc_retry_strategy,
+            shuffle_backend,
+        }
+    }
+}
+
 impl From<&DriverOptions> for WorkerPoolOptions {
     fn from(options: &DriverOptions) -> Self {
         Self {

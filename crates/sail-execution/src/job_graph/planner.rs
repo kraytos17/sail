@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::common::{JoinType, Result, plan_datafusion_err};
 use datafusion::datasource::physical_plan::{FileScanConfig, FileScanConfigBuilder, ParquetSource};
-use datafusion::logical_expr::execution_props::ScalarSubqueryResults;
+use datafusion::logical_expr::execution_props::{ScalarSubqueryResults, SubqueryIndex};
 use datafusion::physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion::physical_expr::{Partitioning, PhysicalExpr};
 use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
@@ -202,52 +203,46 @@ struct ScalarSubqueryContext<'a> {
 
 struct PlannedSubtree {
     plan: Arc<dyn ExecutionPlan>,
-    // TODO: Track pending SubqueryIndex values if wrapper placement must
-    // distinguish multiple or nested scalar subqueries.
-    has_pending_scalar_subquery_expr: bool,
+    pending_scalar_subquery_indices: HashSet<SubqueryIndex>,
 }
 
 impl PlannedSubtree {
-    fn new(plan: Arc<dyn ExecutionPlan>, has_pending_scalar_subquery_expr: bool) -> Self {
+    fn new(plan: Arc<dyn ExecutionPlan>, pending: HashSet<SubqueryIndex>) -> Self {
         Self {
             plan,
-            has_pending_scalar_subquery_expr,
+            pending_scalar_subquery_indices: pending,
         }
     }
 
     fn without_pending_scalar_subquery_expr(plan: Arc<dyn ExecutionPlan>) -> Self {
-        Self::new(plan, false)
+        Self::new(plan, HashSet::new())
     }
 }
 
 struct RebuiltSubtree {
     plan: Arc<dyn ExecutionPlan>,
-    // TODO: Extend this with other stage-boundary metadata if materialization
-    // needs to preserve more than pending scalar subquery state.
-    child_has_pending_scalar_subquery_expr: Vec<bool>,
-    node_has_scalar_subquery_expr: bool,
-    subtree_has_pending_scalar_subquery_expr: bool,
+    child_pending_indices: Vec<HashSet<SubqueryIndex>>,
+    node_pending_indices: HashSet<SubqueryIndex>,
+    subtree_pending_indices: HashSet<SubqueryIndex>,
 }
 
 impl RebuiltSubtree {
     fn only_child(&self) -> ExecutionResult<PlannedSubtree> {
-        let [has_pending_scalar_subquery_expr] =
-            self.child_has_pending_scalar_subquery_expr.as_slice()
-        else {
+        let [child_pending_indices] = self.child_pending_indices.as_slice() else {
             return Err(ExecutionError::InternalError(format!(
                 "expected exactly one planned child, got {}",
-                self.child_has_pending_scalar_subquery_expr.len()
+                self.child_pending_indices.len()
             )));
         };
         let child = self.plan.children().one()?;
         Ok(PlannedSubtree::new(
             child.clone(),
-            *has_pending_scalar_subquery_expr,
+            child_pending_indices.clone(),
         ))
     }
 
     fn into_planned_subtree(self) -> PlannedSubtree {
-        PlannedSubtree::new(self.plan, self.subtree_has_pending_scalar_subquery_expr)
+        PlannedSubtree::new(self.plan, self.subtree_pending_indices)
     }
 }
 
@@ -458,7 +453,7 @@ fn plan_job_graph_stages(
             .plan
             .clone()
             .with_new_children(vec![create_merge_input(child, graph, scalar_context)?])?;
-        PlannedSubtree::new(plan, subtree.node_has_scalar_subquery_expr)
+        PlannedSubtree::new(plan, subtree.node_pending_indices)
     } else if let Some(coalesce) = subtree.plan.downcast_ref::<CoalesceExec>() {
         let child = subtree.only_child()?;
         let plan =
@@ -487,23 +482,26 @@ fn rebuild_subtree(
     plan: Arc<dyn ExecutionPlan>,
     children: Vec<PlannedSubtree>,
 ) -> ExecutionResult<RebuiltSubtree> {
-    let child_has_pending_scalar_subquery_expr = children
+    let child_pending_indices = children
         .iter()
-        .map(|child| child.has_pending_scalar_subquery_expr)
+        .map(|child| child.pending_scalar_subquery_indices.clone())
         .collect::<Vec<_>>();
     let children = children
         .into_iter()
         .map(|child| child.plan)
         .collect::<Vec<_>>();
     let plan = with_new_children_if_necessary(plan, children)?;
-    let node_has_scalar_subquery_expr = plan_node_has_scalar_subquery_expr(&plan);
-    let subtree_has_pending_scalar_subquery_expr =
-        node_has_scalar_subquery_expr || child_has_pending_scalar_subquery_expr.iter().any(|x| *x);
+    let node_pending_indices = plan_scalar_subquery_indices(&plan);
+    let subtree_pending_indices = node_pending_indices
+        .iter()
+        .chain(child_pending_indices.iter().flat_map(|s| s.iter()))
+        .cloned()
+        .collect();
     Ok(RebuiltSubtree {
         plan,
-        child_has_pending_scalar_subquery_expr,
-        node_has_scalar_subquery_expr,
-        subtree_has_pending_scalar_subquery_expr,
+        child_pending_indices,
+        node_pending_indices,
+        subtree_pending_indices,
     })
 }
 
@@ -572,9 +570,11 @@ fn build_barrier_job_graph(
             )
         })
         .collect::<ExecutionResult<Vec<_>>>()?;
-    let preconditions_have_pending_scalar_subquery_expr = preconditions
+    let preconditions_pending_indices: HashSet<SubqueryIndex> = preconditions
         .iter()
-        .any(|precondition| precondition.has_pending_scalar_subquery_expr);
+        .flat_map(|p| p.pending_scalar_subquery_indices.iter())
+        .cloned()
+        .collect();
     let preconditions = preconditions
         .into_iter()
         .map(|precondition| precondition.plan)
@@ -597,10 +597,13 @@ fn build_barrier_job_graph(
             scalar_context,
         )?
     };
-    let barrier_has_pending_scalar_subquery_expr =
-        preconditions_have_pending_scalar_subquery_expr || plan.has_pending_scalar_subquery_expr;
+    let barrier_pending_indices: HashSet<SubqueryIndex> = preconditions_pending_indices
+        .iter()
+        .chain(plan.pending_scalar_subquery_indices.iter())
+        .cloned()
+        .collect();
     let barrier = Arc::new(BarrierExec::new(preconditions, plan.plan)) as Arc<dyn ExecutionPlan>;
-    let barrier = PlannedSubtree::new(barrier, barrier_has_pending_scalar_subquery_expr);
+    let barrier = PlannedSubtree::new(barrier, barrier_pending_indices);
     if plan_is_driver_stage {
         Ok(PlannedSubtree::without_pending_scalar_subquery_expr(
             create_driver_stage(barrier, graph, scalar_context)?,
@@ -630,121 +633,144 @@ fn wrap_pending_scalar_subqueries(
     let Some(scalar_context) = scalar_context else {
         return plan.plan;
     };
-    if scalar_context.links.is_empty() || !plan.has_pending_scalar_subquery_expr {
+    if scalar_context.links.is_empty() || plan.pending_scalar_subquery_indices.is_empty() {
+        return plan.plan;
+    }
+    let relevant_links: Vec<ScalarSubqueryLink> = scalar_context
+        .links
+        .iter()
+        .filter(|link| plan.pending_scalar_subquery_indices.contains(&link.index))
+        .cloned()
+        .collect();
+    if relevant_links.is_empty() {
         return plan.plan;
     }
     Arc::new(ScalarSubqueryExec::new(
         plan.plan,
-        scalar_context.links.to_vec(),
+        relevant_links,
         scalar_context.results.clone(),
     ))
 }
 
-fn plan_node_has_scalar_subquery_expr(plan: &Arc<dyn ExecutionPlan>) -> bool {
+fn plan_scalar_subquery_indices(plan: &Arc<dyn ExecutionPlan>) -> HashSet<SubqueryIndex> {
+    let mut indices = HashSet::new();
     if let Some(filter) = plan.downcast_ref::<FilterExec>() {
-        return physical_expr_has_scalar_subquery(filter.predicate());
+        collect_scalar_subquery_indices(filter.predicate(), &mut indices);
+        return indices;
     }
     if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
-        return projection
-            .expr()
-            .iter()
-            .any(|expr| physical_expr_has_scalar_subquery(&expr.expr));
+        for expr in projection.expr() {
+            collect_scalar_subquery_indices(&expr.expr, &mut indices);
+        }
+        return indices;
     }
     if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
-        return aggregate_has_scalar_subquery_expr(aggregate);
+        collect_aggregate_scalar_subquery_indices(aggregate, &mut indices);
+        return indices;
     }
     if let Some(sort) = plan.downcast_ref::<SortExec>() {
-        return sort
-            .expr()
-            .iter()
-            .any(|sort| physical_expr_has_scalar_subquery(&sort.expr));
+        for sort in sort.expr() {
+            collect_scalar_subquery_indices(&sort.expr, &mut indices);
+        }
+        return indices;
     }
     if let Some(sort) = plan.downcast_ref::<SortPreservingMergeExec>() {
-        return sort
-            .expr()
-            .iter()
-            .any(|sort| physical_expr_has_scalar_subquery(&sort.expr));
+        for sort in sort.expr() {
+            collect_scalar_subquery_indices(&sort.expr, &mut indices);
+        }
+        return indices;
     }
     if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
-        return hash_join_has_scalar_subquery_expr(join);
+        collect_hash_join_scalar_subquery_indices(join, &mut indices);
+        return indices;
     }
     if let Some(join) = plan.downcast_ref::<NestedLoopJoinExec>() {
-        return join
-            .filter()
-            .is_some_and(|filter| physical_expr_has_scalar_subquery(filter.expression()));
+        if let Some(filter) = join.filter() {
+            collect_scalar_subquery_indices(filter.expression(), &mut indices);
+        }
+        return indices;
     }
     if let Some(join) = plan.downcast_ref::<PiecewiseMergeJoinExec>() {
-        return physical_expr_has_scalar_subquery(&join.on.0)
-            || physical_expr_has_scalar_subquery(&join.on.1);
+        collect_scalar_subquery_indices(&join.on.0, &mut indices);
+        collect_scalar_subquery_indices(&join.on.1, &mut indices);
+        return indices;
     }
     if let Some(window) = plan.downcast_ref::<WindowAggExec>() {
-        return window
-            .window_expr()
-            .iter()
-            .any(window_expr_has_scalar_subquery);
+        for expr in window.window_expr() {
+            collect_window_expr_scalar_subquery_indices(expr, &mut indices);
+        }
+        return indices;
     }
     if let Some(window) = plan.downcast_ref::<BoundedWindowAggExec>() {
-        return window
-            .window_expr()
-            .iter()
-            .any(window_expr_has_scalar_subquery);
+        for expr in window.window_expr() {
+            collect_window_expr_scalar_subquery_indices(expr, &mut indices);
+        }
+        return indices;
     }
-    false
+    indices
 }
 
-fn aggregate_has_scalar_subquery_expr(aggregate: &AggregateExec) -> bool {
-    aggregate
-        .group_expr()
-        .expr()
-        .iter()
-        .any(|(expr, _)| physical_expr_has_scalar_subquery(expr))
-        || aggregate
-            .group_expr()
-            .null_expr()
-            .iter()
-            .any(|(expr, _)| physical_expr_has_scalar_subquery(expr))
-        || aggregate.aggr_expr().iter().any(|expr| {
-            expr.expressions()
-                .iter()
-                .any(physical_expr_has_scalar_subquery)
-                || expr
-                    .order_bys()
-                    .iter()
-                    .any(|sort| physical_expr_has_scalar_subquery(&sort.expr))
-        })
-        || aggregate
-            .filter_expr()
-            .iter()
-            .flatten()
-            .any(physical_expr_has_scalar_subquery)
+fn collect_aggregate_scalar_subquery_indices(
+    aggregate: &AggregateExec,
+    indices: &mut HashSet<SubqueryIndex>,
+) {
+    for (expr, _) in aggregate.group_expr().expr() {
+        collect_scalar_subquery_indices(expr, indices);
+    }
+    for (expr, _) in aggregate.group_expr().null_expr() {
+        collect_scalar_subquery_indices(expr, indices);
+    }
+    for expr in aggregate.aggr_expr() {
+        for e in expr.expressions() {
+            collect_scalar_subquery_indices(&e, indices);
+        }
+        for sort in expr.order_bys() {
+            collect_scalar_subquery_indices(&sort.expr, indices);
+        }
+    }
+    for filter in aggregate.filter_expr().iter().flatten() {
+        collect_scalar_subquery_indices(filter, indices);
+    }
 }
 
-fn hash_join_has_scalar_subquery_expr(join: &HashJoinExec) -> bool {
-    join.on().iter().any(|(left, right)| {
-        physical_expr_has_scalar_subquery(left) || physical_expr_has_scalar_subquery(right)
-    }) || join
-        .filter()
-        .is_some_and(|filter| physical_expr_has_scalar_subquery(filter.expression()))
+fn collect_hash_join_scalar_subquery_indices(
+    join: &HashJoinExec,
+    indices: &mut HashSet<SubqueryIndex>,
+) {
+    for (left, right) in join.on() {
+        collect_scalar_subquery_indices(left, indices);
+        collect_scalar_subquery_indices(right, indices);
+    }
+    if let Some(filter) = join.filter() {
+        collect_scalar_subquery_indices(filter.expression(), indices);
+    }
 }
 
-fn window_expr_has_scalar_subquery(
+fn collect_window_expr_scalar_subquery_indices(
     expr: &Arc<dyn datafusion::physical_expr::window::WindowExpr>,
-) -> bool {
+    indices: &mut HashSet<SubqueryIndex>,
+) {
     let expressions = expr.all_expressions();
-    expressions
+    for arg in expressions
         .args
         .iter()
         .chain(expressions.partition_by_exprs.iter())
         .chain(expressions.order_by_exprs.iter())
-        .any(physical_expr_has_scalar_subquery)
+    {
+        collect_scalar_subquery_indices(arg, indices);
+    }
 }
 
-fn physical_expr_has_scalar_subquery(expr: &Arc<dyn PhysicalExpr>) -> bool {
-    expr.downcast_ref::<ScalarSubqueryExpr>().is_some()
-        || expr
-            .children()
-            .iter()
-            .any(|child| physical_expr_has_scalar_subquery(child))
+fn collect_scalar_subquery_indices(
+    expr: &Arc<dyn PhysicalExpr>,
+    indices: &mut HashSet<SubqueryIndex>,
+) {
+    if let Some(scalar) = expr.downcast_ref::<ScalarSubqueryExpr>() {
+        indices.insert(scalar.index());
+    }
+    for child in expr.children() {
+        collect_scalar_subquery_indices(child, indices);
+    }
 }
 
 fn create_merge_input(
