@@ -462,9 +462,14 @@ pub async fn plan_delete(
     // ── Step 1: Open table ──
     let table = ctx.open_table().await?;
     let table_url = ctx.table_url().clone();
-    let snapshot = table.metadata().current_snapshot().cloned().ok_or_else(|| {
-        DataFusionError::Plan("Cannot delete from empty Iceberg table".to_string())
-    })?;
+    // A DELETE/TRUNCATE against a created-but-never-written table (metadata only,
+    // no current snapshot) is a successful 0-row no-op (`noop_delete_plan`),
+    // matching Spark/Iceberg. The snapshot is only required to scan the survivors
+    // of a conditional delete below.
+    let snapshot = table.metadata().current_snapshot().cloned();
+    if snapshot.is_none() {
+        return noop_delete_plan(table_url, ctx.lakehouse_table().cloned());
+    }
     let iceberg_schema = table.metadata().current_schema().ok_or_else(|| {
         DataFusionError::Plan("Table has no current schema".to_string())
     })?;

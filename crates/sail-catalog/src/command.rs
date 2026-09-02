@@ -3,7 +3,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use sail_common_datafusion::array::serde::ArrowSerializer;
-use sail_common_datafusion::catalog::{FunctionStatus, LakehouseOperation};
+use sail_common_datafusion::catalog::{CommitAuthority, FunctionStatus, LakehouseOperation};
 use sail_common_datafusion::datasource::{
     TableFormatAlterTableOperation, TableFormatCreateTableColumn, TableFormatCreateTableInfo,
     TableFormatProcedureOperation, TableFormatRegistry, is_lakehouse_format,
@@ -519,6 +519,16 @@ impl CatalogCommand {
                         )
                         .await?
                         .execution;
+                    // Catalog-authority Iceberg (Iceberg REST) treats the catalog as
+                    // the single source of truth for ALTER: delegate to the REST
+                    // provider, which issues one atomic `update_table` commit (rename /
+                    // set+unset properties / add / drop columns). The storage-first +
+                    // catalog-sync flow below would otherwise re-apply the operation
+                    // (e.g. add the column twice) and fail its `Assert*` requirements.
+                    if is_catalog_authority_iceberg_alter(&format, lakehouse_table.commit) {
+                        manager.alter_table(&table, options).await?;
+                        return Ok(display.bools().to_record_batch(vec![true])?);
+                    }
                     table_format
                         .alter_table(runtime, &location, storage_operation, Some(lakehouse_table))
                         .await
@@ -1251,6 +1261,18 @@ fn catalog_sync_alter_options(
     }
 }
 
+/// Whether an ALTER on this table should be delegated to the catalog provider
+/// instead of the storage-first (`TableFormat`) path.
+///
+/// Catalog-authority Iceberg (commit authority `IcebergRestCommit`) treats the
+/// catalog as the single source of truth: the REST provider issues one atomic
+/// `update_table` commit for rename / set+unset properties / add / drop columns.
+/// The storage-first + catalog-sync flow is only correct for filesystem-backed
+/// formats (Delta, filesystem-authority Iceberg) where storage is authoritative.
+fn is_catalog_authority_iceberg_alter(format: &str, commit: CommitAuthority) -> bool {
+    format.eq_ignore_ascii_case("iceberg") && commit == CommitAuthority::IcebergRestCommit
+}
+
 #[derive(Serialize, Deserialize)]
 struct DescribeTableRow {
     col_name: String,
@@ -1744,6 +1766,39 @@ mod tests {
         assert!(matches!(
             result,
             Err(CatalogError::NotFound(CatalogObject::Column, _))
+        ));
+    }
+
+    #[test]
+    fn detects_catalog_authority_iceberg_alter() {
+        use sail_common_datafusion::catalog::CommitAuthority;
+
+        // Iceberg REST commit authority delegates the ALTER to the catalog provider.
+        assert!(is_catalog_authority_iceberg_alter(
+            "iceberg",
+            CommitAuthority::IcebergRestCommit
+        ));
+        assert!(is_catalog_authority_iceberg_alter(
+            "ICEBERG",
+            CommitAuthority::IcebergRestCommit
+        ));
+
+        // Other authorities / formats keep the storage-first path.
+        assert!(!is_catalog_authority_iceberg_alter(
+            "iceberg",
+            CommitAuthority::Filesystem
+        ));
+        assert!(!is_catalog_authority_iceberg_alter(
+            "iceberg",
+            CommitAuthority::IcebergMetadataLocationCas
+        ));
+        assert!(!is_catalog_authority_iceberg_alter(
+            "delta",
+            CommitAuthority::IcebergRestCommit
+        ));
+        assert!(!is_catalog_authority_iceberg_alter(
+            "parquet",
+            CommitAuthority::IcebergRestCommit
         ));
     }
 }

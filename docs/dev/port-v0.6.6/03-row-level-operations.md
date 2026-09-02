@@ -329,13 +329,14 @@ assemble_iceberg_commit_plan(ctx, writer_input, remove_source, output_schema,
     no table-state mutation). Matches Spark/Iceberg.
   - non-empty → full replacement: `EmptyExec` (arrow schema) →
     `assemble_iceberg_commit_plan(..., Operation::Delete, vec![], None)`.
-- **Conditional DELETE**: requires a current snapshot (else
-  `"Cannot delete from empty Iceberg table"`); builds
+- **Conditional DELETE**: empty table (no current snapshot) → `noop_delete_plan`
+  (0-row no-op, same as TRUNCATE; no table-state mutation); otherwise builds
   `IcebergManifestScanExec → IcebergDiscoveryExec → RepartitionExec(RoundRobinBatch,
   target_partitions) → IcebergScanByDataFilesExec`, `physical_condition =
   create_physical_expr(condition, df_schema)`, `survivors = FilterExec(NOT condition)`,
   commits `Operation::Delete`, `touched_file_paths = []`, `reported_row_count = None`.
-- Test: `noop_delete_plan_reports_zero_count`.
+- Tests: `noop_delete_plan_reports_zero_count`,
+  `conditional_delete_on_snapshotless_table_is_noop`.
 
 ### 9.5 `op_update.rs` — `plan_update(ctx, write_plan, touched_files_plan)`
 

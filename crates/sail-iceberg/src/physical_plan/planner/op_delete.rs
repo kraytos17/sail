@@ -57,14 +57,16 @@ pub async fn plan_delete(
     let table = ctx.table();
     let table_url = ctx.table_url().clone();
 
-    // TRUNCATE (no WHERE clause): an empty table has nothing to delete → successful
-    // no-op, matching Iceberg/Spark semantics. Checked before requiring a current
-    // snapshot so a created-but-never-written table (metadata only, no snapshot)
-    // does not error.
+    // A DELETE or TRUNCATE against a created-but-never-written table (metadata only,
+    // no current snapshot) has nothing to delete → report 0 affected rows instead of
+    // failing, matching Iceberg/Spark semantics. The commit exec short-circuits on the
+    // empty input (no commit-meta and no data files), so table state is untouched.
+    if table.metadata().current_snapshot().is_none() {
+        return noop_delete_plan(table_url, ctx.lakehouse_table().cloned());
+    }
+
+    // TRUNCATE (no WHERE clause): commit an empty snapshot that drops all rows.
     if condition.is_none() {
-        if table.metadata().current_snapshot().is_none() {
-            return noop_delete_plan(table_url, ctx.lakehouse_table().cloned());
-        }
         let iceberg_schema = table
             .metadata()
             .current_schema()
@@ -83,12 +85,16 @@ pub async fn plan_delete(
         .await;
     }
 
+    // A conditional DELETE needs the current snapshot to scan the surviving files. It
+    // is guaranteed to exist here because the empty-table guard above already returned.
     let snapshot = table
         .metadata()
         .current_snapshot()
         .cloned()
         .ok_or_else(|| {
-            DataFusionError::Plan("Cannot delete from empty Iceberg table".to_string())
+            DataFusionError::Internal(
+                "plan_delete: snapshot missing after empty-table guard".to_string(),
+            )
         })?;
 
     let iceberg_schema = table
@@ -150,12 +156,19 @@ pub async fn plan_delete(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use datafusion::arrow::array::UInt64Array;
     use datafusion::arrow::datatypes::{DataType, Field};
-    use datafusion::common::Result;
+    use datafusion::common::{DataFusionError, Result};
+    use datafusion::logical_expr::lit;
     use datafusion::physical_plan::common;
+    use datafusion::prelude::SessionContext;
+    use object_store::local::LocalFileSystem;
 
     use super::*;
+    use crate::options::ResolveOptions;
+    use crate::options::r#gen::IcebergWriteOptions;
 
     #[tokio::test]
     async fn noop_delete_plan_reports_zero_count() -> Result<()> {
@@ -174,6 +187,73 @@ mod tests {
 
         let ctx = datafusion::execution::context::SessionContext::new();
         let stream = plan.execute(0, ctx.task_ctx())?;
+        let batches = common::collect(stream).await?;
+        let batch = batches
+            .first()
+            .ok_or_else(|| DataFusionError::Internal("expected one count batch".into()))?;
+        let count = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| DataFusionError::Internal("count column is UInt64".into()))?;
+        assert_eq!(count.value(0), 0u64);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conditional_delete_on_snapshotless_table_is_noop() -> Result<()> {
+        let io_err = |e: std::io::Error| DataFusionError::External(Box::new(e));
+
+        // A created-but-never-written table (metadata only, no current snapshot) is
+        // loaded from a metadata file that lists zero snapshots.
+        let temp_dir = tempfile::TempDir::new().map_err(io_err)?;
+        let table_url = Url::from_directory_path(temp_dir.path())
+            .map_err(|_| DataFusionError::Execution("invalid temp dir URL".to_string()))?;
+
+        std::fs::create_dir_all(temp_dir.path().join("metadata")).map_err(io_err)?;
+        let metadata = serde_json::json!({
+            "format-version": 2,
+            "table-uuid": uuid::Uuid::new_v4(),
+            "location": table_url.to_string(),
+            "last-updated-ms": 0,
+            "last-column-id": 1,
+            "schemas": [{
+                "type": "struct",
+                "schema-id": 0,
+                "fields": [
+                    { "id": 1, "name": "id", "required": false, "type": "long" }
+                ]
+            }],
+            "current-schema-id": 0,
+            "current-snapshot-id": null
+        });
+        let metadata_bytes =
+            serde_json::to_vec(&metadata).map_err(|e| DataFusionError::External(Box::new(e)))?;
+        std::fs::write(
+            temp_dir.path().join("metadata/v1.metadata.json"),
+            metadata_bytes,
+        )
+        .map_err(io_err)?;
+
+        let session_ctx = SessionContext::new();
+        session_ctx.register_object_store(&table_url, Arc::new(LocalFileSystem::new()));
+        let session = session_ctx.state();
+        let options = IcebergWriteOptions::resolve(&session, vec![])?;
+        let ctx = PlannerContext::new(&session, options, table_url, None, None, false).await?;
+
+        // A conditional DELETE against the empty table must plan as a 0-row no-op
+        // rather than fail with a plan error.
+        let plan = plan_delete(&ctx, Some(ExprWithSource::new(lit(true), None))).await?;
+        assert_eq!(
+            plan.schema().fields(),
+            &datafusion::arrow::datatypes::Fields::from(vec![Field::new(
+                "count",
+                DataType::UInt64,
+                true
+            )])
+        );
+
+        let stream = plan.execute(0, session_ctx.task_ctx())?;
         let batches = common::collect(stream).await?;
         let batch = batches
             .first()
