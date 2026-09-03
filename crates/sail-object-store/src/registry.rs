@@ -12,6 +12,7 @@ use object_store::http::{HttpBuilder, HttpStore};
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::{ObjectStore, ObjectStoreScheme};
+use sail_common::config::ObjectStoreConfig;
 use sail_common::runtime::RuntimeHandle;
 use url::Url;
 
@@ -44,10 +45,18 @@ impl ObjectStoreKey {
 pub struct DynamicObjectStoreRegistry {
     stores: DashMap<ObjectStoreKey, Arc<dyn ObjectStore>>,
     runtime: RuntimeHandle,
+    object_store_config: ObjectStoreConfig,
 }
 
 impl DynamicObjectStoreRegistry {
+    /// Legacy constructor for tests / call sites that don't have an `ObjectStoreConfig`.
+    /// Uses `object_store` crate defaults (5s/30s/90s/unlimited/disabled).
     pub fn new(runtime: RuntimeHandle) -> Self {
+        Self::new_with_config(runtime, ObjectStoreConfig::default())
+    }
+
+    /// Idiomatic constructor that threads Sail's `ObjectStoreConfig` (S3 only) explicitly.
+    pub fn new_with_config(runtime: RuntimeHandle, object_store_config: ObjectStoreConfig) -> Self {
         let stores: DashMap<ObjectStoreKey, Arc<dyn ObjectStore>> = DashMap::new();
         stores.insert(
             ObjectStoreKey {
@@ -57,7 +66,11 @@ impl DynamicObjectStoreRegistry {
             },
             Arc::new(LoggingObjectStore::new(Arc::new(LocalFileSystem::new()))),
         );
-        Self { stores, runtime }
+        Self {
+            stores,
+            runtime,
+            object_store_config,
+        }
     }
 
     pub fn register_session_store(
@@ -104,7 +117,7 @@ impl ObjectStoreRegistry for DynamicObjectStoreRegistry {
             .entry(key)
             .or_try_insert_with(|| -> object_store::Result<Arc<dyn ObjectStore>> {
                 Ok(Arc::new(RuntimeAwareObjectStore::try_new(
-                    || get_dynamic_object_store(url),
+                    || self.get_dynamic_object_store(url),
                     self.runtime.io().clone(),
                 )?))
             })?
@@ -114,93 +127,103 @@ impl ObjectStoreRegistry for DynamicObjectStoreRegistry {
     }
 }
 
-fn get_dynamic_object_store(url: &Url) -> object_store::Result<Arc<dyn ObjectStore>> {
-    let key = ObjectStoreKey::new(url, None);
-    let store: Arc<dyn ObjectStore> = match key.scheme.as_str() {
-        #[cfg(feature = "hdfs")]
-        "hdfs" => Arc::new(
-            HdfsObjectStoreBuilder::new()
-                .with_url(url.as_str())
-                .build()?,
-        ),
-        "hf" => {
-            if key.authority != "datasets" {
-                return Err(object_store::Error::Generic {
-                    store: "Hugging Face",
-                    source: Box::new(plan_datafusion_err!(
-                        "unsupported repository type: {}",
-                        key.authority
-                    )),
-                });
-            }
-            Arc::new(HuggingFaceObjectStore::try_new()?)
-        }
-        "oss" => {
-            let url = url.clone();
-            let store = LazyObjectStore::new(move || {
-                let url = url.clone();
-                async move { get_s3_object_store(&url).await }
-            });
-            Arc::new(store)
-        }
-        _ if is_aliyun_oss_url(url) => {
-            let url = url.clone();
-            let store = LazyObjectStore::new(move || {
-                let url = url.clone();
-                async move { get_s3_object_store(&url).await }
-            });
-            Arc::new(store)
-        }
-        _ => {
-            let (scheme, _path) = ObjectStoreScheme::parse(url)?;
-            let store: Arc<dyn ObjectStore> = match scheme {
-                ObjectStoreScheme::Local => Arc::new(LocalFileSystem::new()),
-                ObjectStoreScheme::Memory => Arc::new(InMemory::new()),
-                ObjectStoreScheme::AmazonS3 => {
-                    let url = url.clone();
-                    let store = LazyObjectStore::new(move || {
-                        let url = url.clone();
-                        async move { get_s3_object_store(&url).await }
-                    });
-                    Arc::new(store)
-                }
-                ObjectStoreScheme::MicrosoftAzure => {
-                    let url = url.clone();
-                    let store = LazyObjectStore::new(move || {
-                        let url = url.clone();
-                        async move { get_azure_object_store(&url).await }
-                    });
-                    Arc::new(store)
-                }
-                ObjectStoreScheme::GoogleCloudStorage => {
-                    let url = url.clone();
-                    let store = LazyObjectStore::new(move || {
-                        let url = url.clone();
-                        async move { get_gcs_object_store(&url).await }
-                    });
-                    Arc::new(store)
-                }
-                ObjectStoreScheme::Http => {
-                    let url = url[..url::Position::BeforePath].to_string();
-                    let store = LazyObjectStore::new(move || {
-                        let url = url.to_string();
-                        async move { get_http_object_store(url).await }
-                    });
-                    Arc::new(store)
-                }
-                other => {
+impl DynamicObjectStoreRegistry {
+    fn get_dynamic_object_store(&self, url: &Url) -> object_store::Result<Arc<dyn ObjectStore>> {
+        let key = ObjectStoreKey::new(url, None);
+        // S3-only tuning: clone config once and move into each lazy S3 initializer.
+        let cfg = self.object_store_config.clone();
+        let store: Arc<dyn ObjectStore> = match key.scheme.as_str() {
+            #[cfg(feature = "hdfs")]
+            "hdfs" => Arc::new(
+                HdfsObjectStoreBuilder::new()
+                    .with_url(url.as_str())
+                    .build()?,
+            ),
+            "hf" => {
+                if key.authority != "datasets" {
                     return Err(object_store::Error::Generic {
-                        store: "unknown",
+                        store: "Hugging Face",
                         source: Box::new(plan_datafusion_err!(
-                            "unsupported object store URL: {url} for {other:?}"
+                            "unsupported repository type: {}",
+                            key.authority
                         )),
                     });
                 }
-            };
-            store
-        }
-    };
-    Ok(Arc::new(LoggingObjectStore::new(store)))
+                Arc::new(HuggingFaceObjectStore::try_new()?)
+            }
+            "oss" => {
+                let url = url.clone();
+                let cfg = cfg.clone();
+                let store = LazyObjectStore::new(move || {
+                    let url = url.clone();
+                    let cfg = cfg.clone();
+                    async move { get_s3_object_store(&url, &cfg).await }
+                });
+                Arc::new(store)
+            }
+            _ if is_aliyun_oss_url(url) => {
+                let url = url.clone();
+                let cfg = cfg.clone();
+                let store = LazyObjectStore::new(move || {
+                    let url = url.clone();
+                    let cfg = cfg.clone();
+                    async move { get_s3_object_store(&url, &cfg).await }
+                });
+                Arc::new(store)
+            }
+            _ => {
+                let (scheme, _path) = ObjectStoreScheme::parse(url)?;
+                let store: Arc<dyn ObjectStore> = match scheme {
+                    ObjectStoreScheme::Local => Arc::new(LocalFileSystem::new()),
+                    ObjectStoreScheme::Memory => Arc::new(InMemory::new()),
+                    ObjectStoreScheme::AmazonS3 => {
+                        let url = url.clone();
+                        let cfg = cfg.clone();
+                        let store = LazyObjectStore::new(move || {
+                            let url = url.clone();
+                            let cfg = cfg.clone();
+                            async move { get_s3_object_store(&url, &cfg).await }
+                        });
+                        Arc::new(store)
+                    }
+                    ObjectStoreScheme::MicrosoftAzure => {
+                        let url = url.clone();
+                        let store = LazyObjectStore::new(move || {
+                            let url = url.clone();
+                            async move { get_azure_object_store(&url).await }
+                        });
+                        Arc::new(store)
+                    }
+                    ObjectStoreScheme::GoogleCloudStorage => {
+                        let url = url.clone();
+                        let store = LazyObjectStore::new(move || {
+                            let url = url.clone();
+                            async move { get_gcs_object_store(&url).await }
+                        });
+                        Arc::new(store)
+                    }
+                    ObjectStoreScheme::Http => {
+                        let url = url[..url::Position::BeforePath].to_string();
+                        let store = LazyObjectStore::new(move || {
+                            let url = url.to_string();
+                            async move { get_http_object_store(url).await }
+                        });
+                        Arc::new(store)
+                    }
+                    other => {
+                        return Err(object_store::Error::Generic {
+                            store: "unknown",
+                            source: Box::new(plan_datafusion_err!(
+                                "unsupported object store URL: {url} for {other:?}"
+                            )),
+                        });
+                    }
+                };
+                store
+            }
+        };
+        Ok(Arc::new(LoggingObjectStore::new(store)))
+    }
 }
 
 fn is_aliyun_oss_url(url: &Url) -> bool {

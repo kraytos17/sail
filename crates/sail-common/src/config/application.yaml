@@ -859,6 +859,54 @@
     per process.
   experimental: true
 
+- key: object_store.connect_timeout_secs
+  type: number
+  default: "5"
+  description: |
+    The timeout in seconds for establishing connections to object storage (S3 only).
+    Matches `object_store` crate default (5s). Lower values fail faster on unreachable endpoints.
+  experimental: true
+
+- key: object_store.request_timeout_secs
+  type: number
+  default: "30"
+  description: |
+    The timeout in seconds for individual object storage requests (S3 only, GET/PUT/LIST).
+    Matches `object_store` crate default (30s).
+  experimental: true
+
+- key: object_store.pool_idle_timeout_secs
+  type: number
+  default: "90"
+  description: |
+    The timeout in seconds for idle connections in the HTTP connection pool (S3 only).
+    Matches `object_store` crate default (90s).
+  experimental: true
+
+- key: object_store.pool_max_idle_per_host
+  type: number
+  default: "0"
+  description: |
+    The maximum number of idle HTTP connections per host in the connection pool (S3 only).
+    Matches `object_store` crate default (unlimited). Use 0 for unlimited.
+  experimental: true
+
+- key: object_store.http2_keep_alive_interval_secs
+  type: number
+  default: "0"
+  description: |
+    The interval in seconds for HTTP/2 keep-alive pings (S3 only).
+    Matches `object_store` crate default (disabled). Set to 0 to disable.
+  experimental: true
+
+- key: object_store.http2_keep_alive_timeout_secs
+  type: number
+  default: "0"
+  description: |
+    The timeout in seconds to wait for a keep-alive ping acknowledgment (S3 only).
+    Matches `object_store` crate default (disabled). Only effective when keep-alive is enabled.
+  experimental: true
+
 - key: telemetry.export_traces
   type: boolean
   default: "false"

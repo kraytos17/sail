@@ -29,6 +29,7 @@ pub struct AppConfig {
     pub spark: SparkConfig,
     pub flight: FlightConfig,
     pub server: ServerConfig,
+    pub object_store: ObjectStoreConfig,
     pub python: PythonConfig,
     pub telemetry: TelemetryConfig,
     /// Reserved for internal use.
@@ -747,6 +748,30 @@ pub struct ServerConfig {
         deserialize_with = "deserialize_non_empty_string"
     )]
     pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectStoreConfig {
+    pub connect_timeout_secs: u64,
+    pub request_timeout_secs: u64,
+    pub pool_idle_timeout_secs: u64,
+    pub pool_max_idle_per_host: usize,
+    pub http2_keep_alive_interval_secs: u64,
+    pub http2_keep_alive_timeout_secs: u64,
+}
+
+impl Default for ObjectStoreConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_secs: 5,
+            request_timeout_secs: 30,
+            pool_idle_timeout_secs: 90,
+            pool_max_idle_per_host: 0,
+            http2_keep_alive_interval_secs: 0,
+            http2_keep_alive_timeout_secs: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -43,7 +43,10 @@ impl RuntimeEnvFactory {
     where
         M: FnOnce(RuntimeEnvBuilder) -> Result<RuntimeEnvBuilder>,
     {
-        let registry = DynamicObjectStoreRegistry::new(self.runtime.clone());
+        let registry = DynamicObjectStoreRegistry::new_with_config(
+            self.runtime.clone(),
+            self.config.object_store.clone(),
+        );
         let cache_config = CacheManagerConfig::default()
             .with_file_statistics_cache(Some(self.create_file_statistics_cache()))
             .with_list_files_cache(Some(self.create_file_listing_cache()))

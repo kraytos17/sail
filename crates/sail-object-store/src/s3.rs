@@ -1,5 +1,6 @@
 use std::fmt::Formatter;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use aws_config::identity::IdentityCache;
@@ -21,10 +22,29 @@ use object_store::aws::{
     AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, resolve_bucket_region,
 };
 use object_store::{ClientOptions, CredentialProvider};
+use sail_common::config::ObjectStoreConfig;
 use tokio::sync::OnceCell;
 use url::Url;
 
 static DEFAULT_AWS_CONFIG: OnceCell<SdkConfig> = OnceCell::const_new();
+
+/// Build `ClientOptions` for S3 from Sail's `ObjectStoreConfig` (S3 only).
+/// Uses `0` sentinel for unlimited/disabled to match `object_store` crate defaults
+/// (crate defaults: 5s/30s/90s/unlimited/disabled).
+pub(crate) fn client_options_from_config(cfg: &ObjectStoreConfig) -> ClientOptions {
+    let mut opts = ClientOptions::default()
+        .with_connect_timeout(Duration::from_secs(cfg.connect_timeout_secs))
+        .with_timeout(Duration::from_secs(cfg.request_timeout_secs))
+        .with_pool_idle_timeout(Duration::from_secs(cfg.pool_idle_timeout_secs))
+        .with_pool_max_idle_per_host(cfg.pool_max_idle_per_host);
+    if cfg.http2_keep_alive_interval_secs > 0 {
+        opts = opts
+            .with_http2_keep_alive_interval(Duration::from_secs(cfg.http2_keep_alive_interval_secs))
+            .with_http2_keep_alive_timeout(Duration::from_secs(cfg.http2_keep_alive_timeout_secs))
+            .with_http2_keep_alive_while_idle();
+    }
+    opts
+}
 
 #[derive(Debug)]
 struct IdentityDataError;
@@ -102,15 +122,20 @@ impl CredentialProvider for S3CredentialProvider {
     }
 }
 
-pub async fn get_s3_object_store(url: &Url) -> object_store::Result<AmazonS3> {
+pub async fn get_s3_object_store(
+    url: &Url,
+    config: &ObjectStoreConfig,
+) -> object_store::Result<AmazonS3> {
     debug!("Creating S3 object store for url: {url}");
-    let mut builder = AmazonS3Builder::from_env();
-    let config = DEFAULT_AWS_CONFIG
+    let client_options = client_options_from_config(config);
+    let mut builder = AmazonS3Builder::from_env().with_client_options(client_options.clone());
+
+    let aws_config = DEFAULT_AWS_CONFIG
         .get_or_init(|| aws_config::defaults(BehaviorVersion::latest()).load())
         .await;
 
-    if let Some(provider) = config.credentials_provider() {
-        let cache = config
+    if let Some(provider) = aws_config.credentials_provider() {
+        let cache = aws_config
             .identity_cache()
             .unwrap_or_else(|| IdentityCache::lazy().build());
         let credentials = S3CredentialProvider::try_new(provider, cache)?;
@@ -130,11 +155,15 @@ pub async fn get_s3_object_store(url: &Url) -> object_store::Result<AmazonS3> {
     debug!("S3 object store bucket: {bucket} region from builder: {region:?}");
 
     if region.is_none_or(|r| r.is_empty()) {
-        let region = match config.region() {
+        let region = match aws_config.region() {
             Some(region) if !region.as_ref().is_empty() => region.to_string(),
             _ => {
                 debug!("Resolving S3 bucket region for url: {url} bucket: {bucket}");
-                resolve_bucket_region(bucket.as_str(), &ClientOptions::default()).await?
+                // Use the same client options for region resolution
+                let region_client_options = ClientOptions::default()
+                    .with_connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+                    .with_timeout(Duration::from_secs(config.request_timeout_secs));
+                resolve_bucket_region(bucket.as_str(), &region_client_options).await?
             }
         };
         debug!("S3 object store bucket: {bucket} resolved region: {region}");
