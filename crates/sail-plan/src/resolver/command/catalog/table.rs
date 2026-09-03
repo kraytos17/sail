@@ -2,7 +2,8 @@ use datafusion_expr::LogicalPlan;
 use sail_catalog::command::CatalogCommand;
 use sail_catalog::manager::CatalogManager;
 use sail_catalog::provider::{
-    AlterTableOptions, CatalogPartitionField, CreateTableColumnOptions, CreateTableOptions,
+    AddColumn, AlterTableOptions, CatalogPartitionField, CreateTableColumnOptions,
+    CreateTableOptions,
 };
 use sail_common::spec;
 use sail_common_datafusion::catalog::{
@@ -469,6 +470,9 @@ impl PlanResolver<'_> {
         state: &mut PlanResolverState,
     ) -> PlanResult<LogicalPlan> {
         let options = match operation {
+            spec::AlterTableOperation::RenameTable { new_name } => AlterTableOptions::RenameTable {
+                new_name: new_name.into(),
+            },
             spec::AlterTableOperation::SetTableProperties { properties } => {
                 AlterTableOptions::SetTableProperties { properties }
             }
@@ -486,6 +490,32 @@ impl PlanResolver<'_> {
                     name: name.into(),
                     default,
                 }
+            }
+            spec::AlterTableOperation::AddColumns { items } => {
+                let columns: Vec<AddColumn> = items
+                    .into_iter()
+                    .map(|c| -> PlanResult<AddColumn> {
+                        let name: Vec<String> = c.name.into();
+                        Ok(AddColumn {
+                            name,
+                            data_type: self.resolve_data_type(&c.data_type, state)?,
+                            nullable: c.nullable,
+                            default: c.default,
+                            comment: c.comment,
+                        })
+                    })
+                    .collect::<PlanResult<Vec<_>>>()?;
+                AlterTableOptions::AddColumns { columns }
+            }
+            spec::AlterTableOperation::DropColumns { names, if_exists } => {
+                let names = names
+                    .into_iter()
+                    .map(|n| {
+                        let parts: Vec<String> = n.into();
+                        parts.join(".")
+                    })
+                    .collect();
+                AlterTableOptions::DropColumns { names, if_exists }
             }
             spec::AlterTableOperation::AddCheckConstraint { .. } => {
                 return Err(PlanError::unsupported(

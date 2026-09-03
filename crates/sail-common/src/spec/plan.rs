@@ -1372,6 +1372,9 @@ pub enum ExplainMode {
 #[serde(rename_all = "camelCase")]
 pub enum AlterTableOperation {
     Unknown,
+    RenameTable {
+        new_name: ObjectName,
+    },
     SetTableProperties {
         properties: Vec<(String, String)>,
     },
@@ -1387,11 +1390,30 @@ pub enum AlterTableOperation {
         name: ObjectName,
         default: Option<String>,
     },
+    AddColumns {
+        items: Vec<ColumnDefinition>,
+    },
+    DropColumns {
+        names: Vec<ObjectName>,
+        if_exists: bool,
+    },
     AddCheckConstraint {
         name: Identifier,
         expression: ExprWithSource,
     },
     // TODO: add all the alter table operations
+}
+
+/// Definition of a column for `ALTER TABLE ADD COLUMNS`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnDefinition {
+    pub name: ObjectName,
+    pub data_type: DataType,
+    pub nullable: bool,
+    /// The raw SQL text of the column default expression, if any.
+    pub default: Option<String>,
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

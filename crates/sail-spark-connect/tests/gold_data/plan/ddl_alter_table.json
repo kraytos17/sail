@@ -38,7 +38,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -55,7 +73,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -72,7 +108,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -89,7 +143,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -106,7 +178,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -123,7 +213,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -140,7 +248,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -157,7 +283,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -174,7 +318,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -191,7 +353,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -208,7 +388,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -225,7 +423,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -242,7 +458,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -259,7 +493,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -276,7 +528,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -293,7 +563,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -310,7 +598,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -327,7 +633,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -344,7 +668,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -361,7 +703,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -378,7 +738,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -395,7 +773,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -412,7 +808,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -429,7 +843,25 @@
                 "my_tab"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": false,
+                      "default": "'abc'",
+                      "comment": "a"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -488,7 +920,21 @@
                 "t1"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": "int32",
+                      "nullable": false,
+                      "default": "42",
+                      "comment": null
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -597,7 +1043,21 @@
                 "table_name"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": "int32",
+                      "nullable": true,
+                      "default": null,
+                      "comment": null
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -614,7 +1074,21 @@
                 "table_name"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": "int32",
+                      "nullable": true,
+                      "default": null,
+                      "comment": null
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -631,7 +1105,21 @@
                 "table_name"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": "int32",
+                      "nullable": true,
+                      "default": null,
+                      "comment": "doc"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -648,7 +1136,21 @@
                 "table_name"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": "int32",
+                      "nullable": true,
+                      "default": null,
+                      "comment": null
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -665,7 +1167,21 @@
                 "table_name"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": "int32",
+                      "nullable": false,
+                      "default": null,
+                      "comment": null
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -682,7 +1198,23 @@
                 "table_name"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x",
+                        "y",
+                        "z"
+                      ],
+                      "dataType": "int32",
+                      "nullable": true,
+                      "default": null,
+                      "comment": "doc"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -699,7 +1231,37 @@
                 "table_name"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x",
+                        "y",
+                        "z"
+                      ],
+                      "dataType": "int32",
+                      "nullable": true,
+                      "default": null,
+                      "comment": "doc"
+                    },
+                    {
+                      "name": [
+                        "a",
+                        "b"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": true,
+                      "default": null,
+                      "comment": null
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -716,7 +1278,21 @@
                 "table_name"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": "int32",
+                      "nullable": true,
+                      "default": null,
+                      "comment": "doc"
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -733,7 +1309,21 @@
                 "table_name"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": "int32",
+                      "nullable": true,
+                      "default": null,
+                      "comment": null
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -750,7 +1340,21 @@
                 "table_name"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": "int32",
+                      "nullable": true,
+                      "default": null,
+                      "comment": null
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }
@@ -767,7 +1371,34 @@
                 "table_name"
               ],
               "ifExists": false,
-              "operation": "unknown"
+              "operation": {
+                "addColumns": {
+                  "items": [
+                    {
+                      "name": [
+                        "x"
+                      ],
+                      "dataType": "int32",
+                      "nullable": true,
+                      "default": null,
+                      "comment": null
+                    },
+                    {
+                      "name": [
+                        "y"
+                      ],
+                      "dataType": {
+                        "configuredUtf8": {
+                          "utf8Type": "configured"
+                        }
+                      },
+                      "nullable": true,
+                      "default": null,
+                      "comment": null
+                    }
+                  ]
+                }
+              }
             },
             "planId": null
           }

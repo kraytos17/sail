@@ -23,11 +23,12 @@ use sail_catalog::lakehouse::{
     TableAccessSession,
 };
 use sail_catalog::provider::{
-    AlterTableOptions, CatalogPartitionField, CatalogProvider, CreateDatabaseOptions,
+    AddColumn, AlterTableOptions, CatalogPartitionField, CatalogProvider, CreateDatabaseOptions,
     CreateTableColumnOptions, CreateTableOptions, CreateViewColumnOptions, CreateViewOptions,
     DropDatabaseOptions, DropTableOptions, DropViewOptions, Namespace, PartitionTransform,
 };
 use sail_catalog::utils::{get_property, quote_name_if_needed, quote_namespace_if_needed};
+use sail_common::spec::CreateTableMode;
 use sail_common::utils::http::SAIL_USER_AGENT;
 use sail_common_datafusion::catalog::managed::METADATA_LOCATION_KEY;
 use sail_common_datafusion::catalog::{
@@ -38,6 +39,7 @@ use sail_common_datafusion::catalog::{
 use sail_iceberg::utils::partition_transform::catalog_partition_field_from_iceberg;
 use sail_iceberg::{
     FormatVersion, Literal, NestedField, StructType, arrow_type_to_iceberg, iceberg_type_to_arrow,
+    is_reserved_iceberg_table_property,
 };
 use tokio::sync::OnceCell;
 
@@ -1151,10 +1153,44 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             return Ok(existing);
         }
 
-        if mode.is_replace() {
-            return Err(CatalogError::NotSupported(
-                "Replace table is not supported yet".to_string(),
-            ));
+        // `CREATE OR REPLACE` / `REPLACE` must drop the existing catalog registration
+        // (metadata + data with purge) before recreating, matching Spark semantics and the
+        // in-repo `MemoryCatalogProvider`. Plain `Replace` requires an existing table;
+        // `CreateOrReplace` on a missing table simply creates it.
+        let existing = match self.get_table(database, table).await {
+            Ok(status) => Some(status),
+            Err(CatalogError::NotFound(CatalogObject::Table, _)) => None,
+            Err(e) => return Err(e),
+        };
+        match (existing, mode) {
+            (Some(_), CreateTableMode::Create) => {
+                return Err(CatalogError::AlreadyExists(
+                    CatalogObject::Table,
+                    table.to_string(),
+                ));
+            }
+            (Some(_), CreateTableMode::CreateIfNotExists) => {
+                // Handled by the `ignore_if_exists` branch above; kept for exhaustiveness.
+                return Ok(self.get_table(database, table).await?);
+            }
+            (Some(_), CreateTableMode::CreateOrReplace | CreateTableMode::Replace) => {
+                self.drop_table(
+                    database,
+                    table,
+                    DropTableOptions {
+                        if_exists: true,
+                        purge: true,
+                    },
+                )
+                .await?;
+            }
+            (None, CreateTableMode::Replace) => {
+                return Err(CatalogError::NotFound(
+                    CatalogObject::Table,
+                    table.to_string(),
+                ));
+            }
+            (None, _) => {}
         }
 
         let format_version = requested_iceberg_format_version(&properties)?;
@@ -1308,13 +1344,74 @@ impl CatalogProvider for IcebergRestCatalogProvider {
 
     async fn alter_table(
         &self,
-        _database: &Namespace,
-        _table: &str,
-        _options: AlterTableOptions,
+        database: &Namespace,
+        table: &str,
+        options: AlterTableOptions,
     ) -> CatalogResult<()> {
-        Err(CatalogError::NotSupported(
-            "alter table in Iceberg catalog".to_string(),
-        ))
+        match options {
+            AlterTableOptions::RenameTable { new_name } => {
+                let catalog_config = self.resolved_catalog_config().await?;
+                let prefix = catalog_config.prefix().map(ToOwned::to_owned);
+                let source = crate::r#gen::TableIdentifier {
+                    namespace: Box::new(database.clone().into()),
+                    name: table.to_string(),
+                };
+                let (destination_namespace, destination_name) = match new_name.as_slice() {
+                    [name] => (Vec::<String>::from(database.clone()), name.clone()),
+                    parts => {
+                        let (namespace, name) = parts.split_at(parts.len() - 1);
+                        (namespace.to_vec(), name[0].clone())
+                    }
+                };
+                let destination = crate::r#gen::TableIdentifier {
+                    namespace: Box::new(destination_namespace.into()),
+                    name: destination_name,
+                };
+                let request = crate::r#gen::RenameTableRequest {
+                    source: Box::new(source),
+                    destination: Box::new(destination),
+                };
+                self.with_auth_retry(|client| {
+                    let prefix = prefix.clone();
+                    let request = request.clone();
+                    async move { client.rename_table(prefix, request).await }
+                })
+                .await?
+                .map_err(|e| CatalogError::External(format!("Failed to rename table: {e}")))?;
+                Ok(())
+            }
+            AlterTableOptions::SetTableProperties { properties } => {
+                self.alter_table_properties(
+                    database,
+                    table,
+                    properties
+                        .into_iter()
+                        .map(|(key, value)| (key, Some(value)))
+                        .collect(),
+                    false,
+                )
+                .await
+            }
+            AlterTableOptions::UnsetTableProperties { keys, if_exists } => {
+                self.alter_table_properties(
+                    database,
+                    table,
+                    keys.into_iter().map(|key| (key, None)).collect(),
+                    if_exists,
+                )
+                .await
+            }
+            AlterTableOptions::AddColumns { columns } => {
+                self.alter_table_add_columns(database, table, columns).await
+            }
+            AlterTableOptions::DropColumns { names, if_exists } => {
+                self.alter_table_drop_columns(database, table, names, if_exists)
+                    .await
+            }
+            _ => Err(CatalogError::NotSupported(
+                "alter table in Iceberg catalog".to_string(),
+            )),
+        }
     }
 
     async fn commit_lakehouse_table(
@@ -1728,6 +1825,381 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             Err(e) if e.status() == Some(reqwest::StatusCode::NOT_FOUND) && if_exists => Ok(()),
             Err(e) => Err(CatalogError::External(format!("Failed to drop view: {e}"))),
         }
+    }
+}
+
+/// Converts an Iceberg REST schema field into a sail-iceberg `NestedField`.
+fn gen_struct_field_to_nested_field(
+    field: &crate::r#gen::StructField,
+) -> CatalogResult<Arc<sail_iceberg::spec::NestedField>> {
+    let field_type = sail_iceberg::spec::types::Type::try_from(field.r#type.as_ref().clone())
+        .map_err(|e| {
+            CatalogError::External(format!(
+                "Failed to convert Iceberg type for field '{}': {e}",
+                field.name
+            ))
+        })?;
+    let mut result = sail_iceberg::spec::NestedField::new(
+        field.id,
+        field.name.clone(),
+        field_type,
+        field.required,
+    );
+    if let Some(doc) = &field.doc {
+        result = result.with_doc(doc);
+    }
+    Ok(Arc::new(result))
+}
+
+impl IcebergRestCatalogProvider {
+    async fn alter_table_properties(
+        &self,
+        database: &Namespace,
+        table: &str,
+        changes: Vec<(String, Option<String>)>,
+        if_exists: bool,
+    ) -> CatalogResult<()> {
+        let catalog_config = self.resolved_catalog_config().await?;
+        let prefix = catalog_config.prefix().map(ToOwned::to_owned);
+        let namespace = catalog_config.namespace_string(database)?;
+        let result = self.load_table_result(database, table, None).await?;
+        let metadata = result.metadata;
+        let current_properties = metadata.properties.unwrap_or_default();
+
+        let mut set_properties: HashMap<String, String> = Default::default();
+        let mut remove_properties: Vec<String> = Vec::new();
+        for (key, value) in changes {
+            if is_reserved_iceberg_table_property(&key) {
+                continue;
+            }
+            match value {
+                Some(value) => {
+                    set_properties.insert(key, value);
+                }
+                None => {
+                    if !if_exists && !current_properties.contains_key(&key) {
+                        return Err(CatalogError::InvalidArgument(format!(
+                            "cannot remove property '{key}' because it is not set on the table"
+                        )));
+                    }
+                    remove_properties.push(key);
+                }
+            }
+        }
+
+        let mut updates: Vec<crate::r#gen::TableUpdate> = Vec::new();
+        if !set_properties.is_empty() {
+            updates.push(crate::r#gen::TableUpdate::SetProperties {
+                updates: set_properties,
+            });
+        }
+        if !remove_properties.is_empty() {
+            updates.push(crate::r#gen::TableUpdate::RemoveProperties {
+                removals: remove_properties,
+            });
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let requirements = vec![crate::r#gen::TableRequirement::AssertTableUuid {
+            uuid: metadata.table_uuid.clone(),
+        }];
+        let request = crate::r#gen::CommitTableRequest {
+            identifier: Some(Box::new(crate::r#gen::TableIdentifier {
+                namespace: Box::new(database.clone().into()),
+                name: table.to_string(),
+            })),
+            requirements,
+            updates,
+        };
+        self.commit_alter_table_updates(database, table, &namespace, prefix, request)
+            .await
+    }
+
+    async fn alter_table_add_columns(
+        &self,
+        database: &Namespace,
+        table: &str,
+        columns: Vec<AddColumn>,
+    ) -> CatalogResult<()> {
+        let catalog_config = self.resolved_catalog_config().await?;
+        let prefix = catalog_config.prefix().map(ToOwned::to_owned);
+        let namespace = catalog_config.namespace_string(database)?;
+        let result = self.load_table_result(database, table, None).await?;
+        let metadata = result.metadata;
+
+        let current_schema =
+            find_by_id_or_last(metadata.schemas.as_ref(), metadata.current_schema_id, |s| {
+                s.schema_id
+            })
+            .ok_or_else(|| {
+                CatalogError::External("Missing current schema in table metadata".to_string())
+            })?;
+        let identifier_field_ids = current_schema
+            .identifier_field_ids
+            .clone()
+            .unwrap_or_default();
+        let last_column_id = metadata.last_column_id.unwrap_or(0);
+
+        let mut new_fields = current_schema
+            .fields
+            .iter()
+            .map(gen_struct_field_to_nested_field)
+            .collect::<CatalogResult<Vec<_>>>()?;
+        let mut next_id = last_column_id + 1;
+        for col in columns.iter() {
+            let field_type = arrow_type_to_iceberg(&col.data_type).map_err(|e| {
+                CatalogError::External(format!(
+                    "Failed to convert Arrow type to Iceberg type for column '{}': {e}",
+                    col.name.join(".")
+                ))
+            })?;
+            let mut field = NestedField::optional(next_id, col.name.join("."), field_type);
+            if let Some(comment) = &col.comment {
+                field = field.with_doc(comment);
+            }
+            new_fields.push(Arc::new(field));
+            next_id += 1;
+        }
+        let new_schema_id = metadata
+            .schemas
+            .as_ref()
+            .map(|schemas| {
+                schemas
+                    .iter()
+                    .filter_map(|schema| schema.schema_id)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+            + 1;
+
+        let schema = sail_iceberg::spec::Schema::builder()
+            .with_schema_id(new_schema_id)
+            .with_fields(new_fields)
+            .with_identifier_field_ids(identifier_field_ids)
+            .build()
+            .map_err(|e| CatalogError::External(format!("Failed to build schema: {e}")))?;
+        let schema = crate::r#gen::Schema::try_from(schema)?;
+
+        let current_schema_id = metadata.current_schema_id.unwrap_or(0);
+        let requirements = vec![
+            crate::r#gen::TableRequirement::AssertTableUuid {
+                uuid: metadata.table_uuid.clone(),
+            },
+            crate::r#gen::TableRequirement::AssertCurrentSchemaId { current_schema_id },
+            crate::r#gen::TableRequirement::AssertLastAssignedFieldId {
+                last_assigned_field_id: last_column_id,
+            },
+        ];
+        let updates = vec![
+            crate::r#gen::TableUpdate::AddSchema {
+                schema: Box::new(schema),
+                last_column_id: Some(next_id - 1),
+            },
+            crate::r#gen::TableUpdate::SetCurrentSchema {
+                schema_id: new_schema_id,
+            },
+        ];
+        let request = crate::r#gen::CommitTableRequest {
+            identifier: Some(Box::new(crate::r#gen::TableIdentifier {
+                namespace: Box::new(database.clone().into()),
+                name: table.to_string(),
+            })),
+            requirements,
+            updates,
+        };
+        self.commit_alter_table_updates(database, table, &namespace, prefix, request)
+            .await
+    }
+
+    async fn alter_table_drop_columns(
+        &self,
+        database: &Namespace,
+        table: &str,
+        names: Vec<String>,
+        if_exists: bool,
+    ) -> CatalogResult<()> {
+        let catalog_config = self.resolved_catalog_config().await?;
+        let prefix = catalog_config.prefix().map(ToOwned::to_owned);
+        let namespace = catalog_config.namespace_string(database)?;
+        let result = self.load_table_result(database, table, None).await?;
+        let metadata = result.metadata;
+
+        let current_schema =
+            find_by_id_or_last(metadata.schemas.as_ref(), metadata.current_schema_id, |s| {
+                s.schema_id
+            })
+            .ok_or_else(|| {
+                CatalogError::External("Missing current schema in table metadata".to_string())
+            })?;
+
+        let mut new_fields = current_schema
+            .fields
+            .iter()
+            .map(gen_struct_field_to_nested_field)
+            .collect::<CatalogResult<Vec<_>>>()?;
+        for name in &names {
+            let pos = new_fields.iter().position(|field| field.name == *name);
+            match pos {
+                Some(idx) => {
+                    new_fields.remove(idx);
+                }
+                None => {
+                    if !if_exists {
+                        return Err(CatalogError::InvalidArgument(format!(
+                            "Column '{name}' not found in Iceberg table schema"
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Nothing was removed (e.g. IF EXISTS on a missing column): the schema is
+        // unchanged, so this is a no-op. Do not commit an identical schema.
+        if new_fields.len() == current_schema.fields.len() {
+            return Ok(());
+        }
+
+        let removed_ids: std::collections::HashSet<i32> = current_schema
+            .fields
+            .iter()
+            .filter(|field| names.contains(&field.name))
+            .map(|field| field.id)
+            .collect();
+        let identifier_field_ids = current_schema
+            .identifier_field_ids
+            .clone()
+            .map(|ids| {
+                ids.into_iter()
+                    .filter(|id| !removed_ids.contains(id))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let new_schema_id = metadata
+            .schemas
+            .as_ref()
+            .map(|schemas| {
+                schemas
+                    .iter()
+                    .filter_map(|schema| schema.schema_id)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+            + 1;
+
+        let schema = sail_iceberg::spec::Schema::builder()
+            .with_schema_id(new_schema_id)
+            .with_fields(new_fields)
+            .with_identifier_field_ids(identifier_field_ids)
+            .build()
+            .map_err(|e| CatalogError::External(format!("Failed to build schema: {e}")))?;
+        let schema = crate::r#gen::Schema::try_from(schema)?;
+
+        let last_column_id = metadata.last_column_id.unwrap_or(0);
+        let current_schema_id = metadata.current_schema_id.unwrap_or(0);
+        let requirements = vec![
+            crate::r#gen::TableRequirement::AssertTableUuid {
+                uuid: metadata.table_uuid.clone(),
+            },
+            crate::r#gen::TableRequirement::AssertCurrentSchemaId { current_schema_id },
+            crate::r#gen::TableRequirement::AssertLastAssignedFieldId {
+                last_assigned_field_id: last_column_id,
+            },
+        ];
+        let updates = vec![
+            crate::r#gen::TableUpdate::AddSchema {
+                schema: Box::new(schema),
+                last_column_id: Some(last_column_id),
+            },
+            crate::r#gen::TableUpdate::SetCurrentSchema {
+                schema_id: new_schema_id,
+            },
+        ];
+        let request = crate::r#gen::CommitTableRequest {
+            identifier: Some(Box::new(crate::r#gen::TableIdentifier {
+                namespace: Box::new(database.clone().into()),
+                name: table.to_string(),
+            })),
+            requirements,
+            updates,
+        };
+        self.commit_alter_table_updates(database, table, &namespace, prefix, request)
+            .await
+    }
+
+    /// Sends an Iceberg REST `update_table` commit for an ALTER TABLE operation and maps
+    /// the response error into a `CatalogError`.
+    async fn commit_alter_table_updates(
+        &self,
+        database: &Namespace,
+        table: &str,
+        namespace: &str,
+        prefix: Option<String>,
+        request: crate::r#gen::CommitTableRequest,
+    ) -> CatalogResult<()> {
+        let table_name = table.to_string();
+        self.with_auth_retry(|client| {
+            let prefix = prefix.clone();
+            let namespace = namespace.to_string();
+            let table_name = table_name.clone();
+            let request = request.clone();
+            async move {
+                client
+                    .update_table(prefix, namespace, table_name, request)
+                    .await
+            }
+        })
+        .await?
+        .map(|response| response.inner)
+        .map_err(|e| match e {
+            e if e.status() == Some(reqwest::StatusCode::NOT_FOUND) => CatalogError::NotFound(
+                CatalogObject::Table,
+                format!(
+                    "{}.{}",
+                    quote_namespace_if_needed(database),
+                    quote_name_if_needed(table)
+                ),
+            ),
+            e if e.status() == Some(reqwest::StatusCode::CONFLICT) => {
+                CatalogError::Conflict(format!(
+                    "Iceberg REST catalog commit conflict for {}.{}: {e}",
+                    quote_namespace_if_needed(database),
+                    quote_name_if_needed(table)
+                ))
+            }
+            e if e.status() == Some(reqwest::StatusCode::UNAUTHORIZED) => {
+                CatalogError::Unauthorized(format!(
+                    "Iceberg REST catalog commit unauthorized for {}.{}: {e}",
+                    quote_namespace_if_needed(database),
+                    quote_name_if_needed(table)
+                ))
+            }
+            e if e.status() == Some(reqwest::StatusCode::FORBIDDEN) => {
+                CatalogError::Forbidden(format!(
+                    "Iceberg REST catalog commit forbidden for {}.{}: {e}",
+                    quote_namespace_if_needed(database),
+                    quote_name_if_needed(table)
+                ))
+            }
+            e if e.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) => {
+                CatalogError::RateLimited(format!(
+                    "Iceberg REST catalog commit rate limited for {}.{}: {e}",
+                    quote_namespace_if_needed(database),
+                    quote_name_if_needed(table)
+                ))
+            }
+            e if e.status().is_some() => CatalogError::External(format!(
+                "Failed to alter Iceberg table {}.{}: {e}",
+                quote_namespace_if_needed(database),
+                quote_name_if_needed(table)
+            )),
+            e => CatalogError::External(format!("Failed to commit table: {e}")),
+        })?;
+        Ok(())
     }
 }
 

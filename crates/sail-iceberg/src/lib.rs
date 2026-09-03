@@ -42,6 +42,7 @@ pub use physical_plan::discovery_exec::IcebergDiscoveryExec;
 pub use physical_plan::manifest_scan_exec::{IcebergManifestScanExec, manifest_scan_schema};
 pub use physical_plan::scan_by_data_files_exec::IcebergScanByDataFilesExec;
 pub use physical_plan::{IcebergBaseWriteContext, IcebergWriteContext, IcebergWriterExecOptions};
+pub use properties::is_reserved_iceberg_table_property;
 pub use schema_evolution::*;
 pub use spec::*;
 pub use table_format::*;

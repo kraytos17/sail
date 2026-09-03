@@ -59,7 +59,7 @@ pub(crate) fn apply_table_property_changes(
     Ok(())
 }
 
-pub(crate) fn is_reserved_iceberg_table_property(key: &str) -> bool {
+pub fn is_reserved_iceberg_table_property(key: &str) -> bool {
     if key.starts_with("__sail.")
         || key.starts_with("metadata.")
         || is_metadata_location_key(key)

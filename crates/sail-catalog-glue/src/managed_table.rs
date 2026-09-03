@@ -36,6 +36,21 @@ pub(crate) fn apply_alter_table_options(
                 "AWS Glue catalog does not support ALTER COLUMN DEFAULT".to_string(),
             ));
         }
+        AlterTableOptions::RenameTable { .. } => {
+            return Err(CatalogError::NotSupported(
+                "AWS Glue catalog does not support ALTER TABLE RENAME TO".to_string(),
+            ));
+        }
+        AlterTableOptions::AddColumns { .. } => {
+            return Err(CatalogError::NotSupported(
+                "AWS Glue catalog does not support ALTER TABLE ADD COLUMNS".to_string(),
+            ));
+        }
+        AlterTableOptions::DropColumns { .. } => {
+            return Err(CatalogError::NotSupported(
+                "AWS Glue catalog does not support ALTER TABLE DROP COLUMNS".to_string(),
+            ));
+        }
         AlterTableOptions::AddCheckConstraint { .. } => {
             return Err(CatalogError::NotSupported(
                 "CHECK constraints are handled by lakehouse table formats".to_string(),

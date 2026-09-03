@@ -11,15 +11,15 @@ use sail_sql_parser::ast::statement::{
     AlterColumnOperation, AlterTableOperation, AlterViewOperation, AnalyzeTableModifier,
     AsQueryClause, Assignment, AssignmentList, ColumnAlteration, ColumnAlterationList,
     ColumnAlterationOption, ColumnDefinition, ColumnDefinitionList, ColumnDefinitionOption,
-    ColumnPosition, ColumnTypeDefinition, CommentValue, CreateDatabaseClause, CreateTableClause,
-    CreateViewClause, CreateViewDefinition, DeleteTableAlias, DescribeFunctionName, DescribeItem,
-    ExplainFormat, FileFormat, InsertDirectoryDestination, MergeMatchClause, MergeMatchedAction,
-    MergeNotMatchedBySourceAction, MergeNotMatchedByTargetAction, MergeSource, PartitionByItem,
-    PartitionByList, PartitionClause, PartitionValue, PartitionValueList, PropertyKey,
-    PropertyKeyList, PropertyKeyValue, PropertyList, PropertyValue, RowFormat,
-    RowFormatDelimitedClause, SetClause, ShowFunctionScope, ShowFunctionsClause,
-    ShowFunctionsPattern, SortColumn, SortColumnClause, SortColumnList, Statement,
-    TableColumnIdentityOption, TableColumnIdentityOptions, UpdateTableAlias, ViewColumn,
+    ColumnDropList, ColumnPosition, ColumnTypeDefinition, CommentValue, CreateDatabaseClause,
+    CreateTableClause, CreateViewClause, CreateViewDefinition, DeleteTableAlias,
+    DescribeFunctionName, DescribeItem, ExplainFormat, FileFormat, InsertDirectoryDestination,
+    MergeMatchClause, MergeMatchedAction, MergeNotMatchedBySourceAction,
+    MergeNotMatchedByTargetAction, MergeSource, PartitionByItem, PartitionByList, PartitionClause,
+    PartitionValue, PartitionValueList, PropertyKey, PropertyKeyList, PropertyKeyValue,
+    PropertyList, PropertyValue, RowFormat, RowFormatDelimitedClause, SetClause, ShowFunctionScope,
+    ShowFunctionsClause, ShowFunctionsPattern, SortColumn, SortColumnClause, SortColumnList,
+    Statement, TableColumnIdentityOption, TableColumnIdentityOptions, UpdateTableAlias, ViewColumn,
     ViewColumnList, ViewUsingClause,
 };
 use sail_sql_parser::tree::TreeText;
@@ -2166,7 +2166,9 @@ impl TryFrom<Vec<ColumnAlterationOption>> for ColumnAlterationOptions {
 }
 
 // TODO: implement the conversion properly for column-level ALTER TABLE operations
-fn from_ast_column_alteration_list(items: ColumnAlterationList) -> SqlResult<()> {
+fn from_ast_column_alteration_list(
+    items: ColumnAlterationList,
+) -> SqlResult<Vec<spec::ColumnDefinition>> {
     // TODO: implement the conversion properly
     let columns = match items {
         ColumnAlterationList::Delimited {
@@ -2176,19 +2178,39 @@ fn from_ast_column_alteration_list(items: ColumnAlterationList) -> SqlResult<()>
         } => columns,
         ColumnAlterationList::NotDelimited { columns } => columns,
     };
-    let _ = columns
+    columns
         .into_items()
         .map(|x| {
             let ColumnAlteration {
-                name: _,
-                data_type: _,
+                name,
+                data_type,
                 options,
             } = x;
-            let _: ColumnAlterationOptions = options.try_into()?;
-            Ok(())
+            let options: ColumnAlterationOptions = options.try_into()?;
+            Ok(spec::ColumnDefinition {
+                name: from_ast_object_name(name)?,
+                data_type: from_ast_data_type(data_type)?,
+                nullable: !options.not_null,
+                default: options
+                    .default
+                    .as_ref()
+                    .map(|expr| expr.text().trim().to_string()),
+                comment: options.comment.map(from_ast_string).transpose()?,
+            })
         })
-        .collect::<SqlResult<Vec<_>>>()?;
-    Ok(())
+        .collect()
+}
+
+fn from_ast_column_drop_list(names: ColumnDropList) -> SqlResult<Vec<spec::ObjectName>> {
+    let names = match names {
+        ColumnDropList::Delimited {
+            left: _,
+            columns,
+            right: _,
+        } => columns,
+        ColumnDropList::NotDelimited { columns } => columns,
+    };
+    names.into_items().map(from_ast_object_name).collect()
 }
 
 fn from_ast_merge_optional_condition<T>(
@@ -2280,9 +2302,12 @@ fn from_ast_alter_table_operation(
                 },
             })
         }
-        AlterTableOperation::RenameTable { .. }
-        | AlterTableOperation::RenamePartition { .. }
-        | AlterTableOperation::DropColumns { .. }
+        AlterTableOperation::RenameTable { name, .. } => {
+            Ok(spec::AlterTableOperation::RenameTable {
+                new_name: from_ast_object_name(name)?,
+            })
+        }
+        AlterTableOperation::RenamePartition { .. }
         | AlterTableOperation::RenameColumn { .. }
         | AlterTableOperation::AddPartitions { .. }
         | AlterTableOperation::DropPartition { .. }
@@ -2290,10 +2315,19 @@ fn from_ast_alter_table_operation(
         | AlterTableOperation::SetLocation { .. }
         | AlterTableOperation::RecoverPartitions { .. } => Ok(spec::AlterTableOperation::Unknown),
         AlterTableOperation::AlterColumn { .. } => Ok(spec::AlterTableOperation::Unknown),
-        AlterTableOperation::AddColumns { items, .. }
-        | AlterTableOperation::ReplaceColumns { items, .. } => {
+        AlterTableOperation::AddColumns { items, .. } => {
+            let items = from_ast_column_alteration_list(items)?;
+            Ok(spec::AlterTableOperation::AddColumns { items })
+        }
+        AlterTableOperation::DropColumns {
+            names, if_exists, ..
+        } => Ok(spec::AlterTableOperation::DropColumns {
+            names: from_ast_column_drop_list(names)?,
+            if_exists: if_exists.is_some(),
+        }),
+        AlterTableOperation::ReplaceColumns { items, .. } => {
             // Validate column descriptors (e.g. detect duplicate COMMENT/DEFAULT/NOT NULL/POSITION
-            // clauses) even though we do not yet translate these operations.
+            // clauses) even though we do not yet translate this operation.
             from_ast_column_alteration_list(items)?;
             Ok(spec::AlterTableOperation::Unknown)
         }

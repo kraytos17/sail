@@ -344,67 +344,94 @@ impl CatalogProvider for MemoryCatalogProvider {
         let mut db = self.databases.get_mut(database).ok_or_else(|| {
             CatalogError::NotFound(CatalogObject::Database, quote_namespace_if_needed(database))
         })?;
-        let status = db
-            .tables
-            .get_mut(table)
-            .ok_or_else(|| CatalogError::NotFound(CatalogObject::Table, table.to_string()))?;
-        match &mut status.kind {
-            TableKind::Table {
-                columns,
-                properties,
-                ..
-            } => match options {
-                AlterTableOptions::SetTableProperties {
-                    properties: new_props,
-                } => {
-                    managed_table::validate_metadata_location_precondition(
-                        table, properties, &new_props,
-                    )?;
-                    for (key, value) in new_props {
-                        if let Some(existing) = properties.iter_mut().find(|(k, _)| k == &key) {
-                            existing.1 = value;
-                        } else {
-                            properties.push((key, value));
+        match options {
+            AlterTableOptions::RenameTable { new_name } => {
+                let new_table_name = new_name.last().cloned().ok_or_else(|| {
+                    CatalogError::InvalidArgument(
+                        "RENAME TO requires a valid table name".to_string(),
+                    )
+                })?;
+                let status = db.tables.remove(table).ok_or_else(|| {
+                    CatalogError::NotFound(CatalogObject::Table, table.to_string())
+                })?;
+                db.tables.insert(new_table_name, status);
+                Ok(())
+            }
+            options => {
+                let status = db.tables.get_mut(table).ok_or_else(|| {
+                    CatalogError::NotFound(CatalogObject::Table, table.to_string())
+                })?;
+                match &mut status.kind {
+                    TableKind::Table {
+                        columns,
+                        properties,
+                        ..
+                    } => match options {
+                        AlterTableOptions::RenameTable { .. } => unreachable!(),
+                        AlterTableOptions::SetTableProperties {
+                            properties: new_props,
+                        } => {
+                            managed_table::validate_metadata_location_precondition(
+                                table, properties, &new_props,
+                            )?;
+                            for (key, value) in new_props {
+                                if let Some(existing) =
+                                    properties.iter_mut().find(|(k, _)| k == &key)
+                                {
+                                    existing.1 = value;
+                                } else {
+                                    properties.push((key, value));
+                                }
+                            }
+                            Ok(())
                         }
-                    }
-                    Ok(())
-                }
-                AlterTableOptions::UnsetTableProperties { keys, if_exists } => {
-                    for key in &keys {
-                        let found = properties.iter().any(|(k, _)| k == key);
-                        if !found && !if_exists {
-                            return Err(CatalogError::NotFound(
-                                CatalogObject::Table,
-                                format!("property '{key}' not found on table '{table}'"),
-                            ));
+                        AlterTableOptions::UnsetTableProperties { keys, if_exists } => {
+                            for key in &keys {
+                                let found = properties.iter().any(|(k, _)| k == key);
+                                if !found && !if_exists {
+                                    return Err(CatalogError::NotFound(
+                                        CatalogObject::Table,
+                                        format!("property '{key}' not found on table '{table}'"),
+                                    ));
+                                }
+                                properties.retain(|(k, _)| k != key);
+                            }
+                            Ok(())
                         }
-                        properties.retain(|(k, _)| k != key);
-                    }
-                    Ok(())
+                        AlterTableOptions::AlterColumnType { name, data_type } => {
+                            alter_column_type(columns, &name, data_type).map_err(|e| {
+                                CatalogError::InvalidArgument(format!(
+                                    "failed to alter column type for '{}': {e}",
+                                    name.join(".")
+                                ))
+                            })
+                        }
+                        AlterTableOptions::AlterColumnDefault { name, default } => {
+                            alter_column_default(columns, &name, default).map_err(|e| {
+                                CatalogError::InvalidArgument(format!(
+                                    "failed to alter column default for '{}': {e}",
+                                    name.join(".")
+                                ))
+                            })
+                        }
+                        AlterTableOptions::AddColumns { .. } => Err(CatalogError::NotSupported(
+                            "ADD COLUMNS is not supported for memory tables".to_string(),
+                        )),
+                        AlterTableOptions::DropColumns { .. } => Err(CatalogError::NotSupported(
+                            "DROP COLUMNS is not supported for memory tables".to_string(),
+                        )),
+                        AlterTableOptions::AddCheckConstraint { .. } => {
+                            Err(CatalogError::NotSupported(
+                                "CHECK constraints are handled by lakehouse table formats"
+                                    .to_string(),
+                            ))
+                        }
+                    },
+                    _ => Err(CatalogError::NotSupported(
+                        "ALTER TABLE is not supported for views".to_string(),
+                    )),
                 }
-                AlterTableOptions::AlterColumnType { name, data_type } => {
-                    alter_column_type(columns, &name, data_type).map_err(|e| {
-                        CatalogError::InvalidArgument(format!(
-                            "failed to alter column type for '{}': {e}",
-                            name.join(".")
-                        ))
-                    })
-                }
-                AlterTableOptions::AlterColumnDefault { name, default } => {
-                    alter_column_default(columns, &name, default).map_err(|e| {
-                        CatalogError::InvalidArgument(format!(
-                            "failed to alter column default for '{}': {e}",
-                            name.join(".")
-                        ))
-                    })
-                }
-                AlterTableOptions::AddCheckConstraint { .. } => Err(CatalogError::NotSupported(
-                    "CHECK constraints are handled by lakehouse table formats".to_string(),
-                )),
-            },
-            _ => Err(CatalogError::NotSupported(
-                "ALTER TABLE is not supported for views".to_string(),
-            )),
+            }
         }
     }
 
