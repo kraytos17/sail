@@ -353,6 +353,20 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             let node = spec::CommandNode::ShowTableExtended { database, pattern };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::ShowTblProperties {
+            show: _,
+            tblproperties: _,
+            table,
+            property_key,
+        } => {
+            let node = spec::CommandNode::ShowTblProperties {
+                table: from_ast_object_name(table)?,
+                property_key: property_key
+                    .map(|(_, key, _)| from_ast_string(key))
+                    .transpose()?,
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
         Statement::ShowCreateTable { .. } => Err(SqlError::todo("SHOW CREATE TABLE")),
         Statement::ShowColumns {
             show: _,
@@ -1235,6 +1249,16 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
                         column,
                     }
                 }
+                DescribeItem::View {
+                    view: _,
+                    extended,
+                    name,
+                } => spec::CommandNode::DescribeTable {
+                    table: from_ast_object_name(name)?,
+                    extended: extended.is_some(),
+                    partition: Default::default(),
+                    column: None,
+                },
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
