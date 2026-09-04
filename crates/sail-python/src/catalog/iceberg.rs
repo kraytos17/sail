@@ -4,7 +4,9 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use sail_catalog::credentials::EmptyCatalogCredentials;
 use sail_catalog::provider::RuntimeAwareCatalogProvider;
-use sail_catalog_iceberg::{IcebergRestCatalogOptions, IcebergRestCatalogProvider};
+use sail_catalog_iceberg::{
+    IcebergRestAccessDelegation, IcebergRestCatalogOptions, IcebergRestCatalogProvider,
+};
 
 use crate::catalog::provider::PyCatalogProvider;
 use crate::catalog::to_py_error;
@@ -54,6 +56,7 @@ impl PyIcebergRestCatalogProvider {
                     IcebergRestCatalogOptions {
                         credentials: Arc::new(EmptyCatalogCredentials),
                         properties,
+                        access_delegation: IcebergRestAccessDelegation::default(),
                     },
                 ))
             },

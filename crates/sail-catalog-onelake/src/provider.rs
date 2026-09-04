@@ -15,8 +15,8 @@ use sail_catalog::provider::{
     Namespace,
 };
 use sail_catalog_iceberg::{
-    IcebergRestCatalogOptions, IcebergRestCatalogProvider, REST_CATALOG_PROP_PREFIX,
-    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
+    IcebergRestAccessDelegation, IcebergRestCatalogOptions, IcebergRestCatalogProvider,
+    REST_CATALOG_PROP_PREFIX, REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE,
 };
 use sail_catalog_unity::{UnityCatalogOptions, UnityCatalogProvider};
 use sail_common_datafusion::catalog::{DatabaseStatus, TableKind, TableStatus};
@@ -102,6 +102,7 @@ impl OneLakeCatalogProvider {
                     IcebergRestCatalogOptions {
                         credentials,
                         properties,
+                        access_delegation: IcebergRestAccessDelegation::default(),
                     },
                 ))
             }
