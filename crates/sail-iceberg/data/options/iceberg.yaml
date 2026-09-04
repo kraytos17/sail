@@ -421,6 +421,9 @@
     (the Iceberg `write.target-file-size-bytes` default). Row groups/data files are rolled
     once this encoded size is reached, so a single partition no longer accumulates one
     unbounded parquet file.
+  default:
+    value: ""
+    parser: crate::options::parsers::parse_optional_u64
   supported: true
   rust_type: "Option<u64>"
   scopes: [write]
@@ -577,6 +580,9 @@
   description: |
     Override compression codec. Defaults to "zstd". Accepted values:
     zstd, snappy, gzip, lz4, brotli, uncompressed, none.
+  default:
+    value: "zstd"
+    parser: crate::options::parsers::parse_optional_string
   supported: true
   rust_type: "Option<String>"
   scopes: [write]

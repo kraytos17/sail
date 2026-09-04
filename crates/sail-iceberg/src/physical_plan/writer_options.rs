@@ -217,7 +217,7 @@ mod tests {
             merge_schema: false,
             shred_variants: false,
             variant_inference_buffer_size: 100,
-            compression_codec: compression_codec.to_string(),
+            compression_codec: Some(compression_codec.to_string()),
             write_data_path: None,
             write_folder_storage_path: None,
             target_file_size_bytes,

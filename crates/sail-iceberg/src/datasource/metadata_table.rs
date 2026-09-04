@@ -272,6 +272,8 @@ fn refs_batch(metadata: &TableMetadata) -> Result<RecordBatch> {
 mod tests {
     use std::collections::HashMap;
 
+    use datafusion::arrow::array::Array;
+
     use super::*;
     use crate::spec::snapshots::{SnapshotReference, SnapshotRetention, Summary};
     use crate::spec::{FormatVersion, Operation, Schema};
