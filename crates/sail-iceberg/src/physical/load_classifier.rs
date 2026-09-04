@@ -126,7 +126,7 @@ async fn resolve_source_files(
         let key = meta.location.to_string();
         if suffix_filter
             .as_deref()
-            .map_or(true, |sfx| key.ends_with(sfx))
+            .is_none_or(|sfx| key.ends_with(sfx))
         {
             let url = prefix_url.join(&format!("/{key}")).map_err(|e| {
                 DataFusionError::Plan(format!("failed to resolve source URL for {key}: {e}"))

@@ -176,6 +176,8 @@ pub(crate) fn build_writer_properties(
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used)]
+
     use datafusion::arrow::array::{Int32Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;

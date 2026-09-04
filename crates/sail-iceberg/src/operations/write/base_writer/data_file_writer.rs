@@ -156,16 +156,20 @@ pub(crate) fn aggregate_from_parquet_metadata_with_field_map(
         }
         for c in rg.columns() {
             let col_path = c.column_descr().path().string();
-            let col_name = col_path.split('.').last().unwrap_or(&col_path).to_string();
+            let col_name = col_path
+                .split('.')
+                .next_back()
+                .unwrap_or(&col_path)
+                .to_string();
             let Some(&iceberg_field_id) = field_id_map.get(&col_name) else {
                 continue;
             };
             *col_sizes.entry(iceberg_field_id).or_insert(0) += c.compressed_size() as u64;
             *val_counts.entry(iceberg_field_id).or_insert(0) += c.num_values() as u64;
-            if let Some(stats) = c.statistics() {
-                if let Some(n) = stats.null_count_opt() {
-                    *null_counts.entry(iceberg_field_id).or_insert(0) += n;
-                }
+            if let Some(stats) = c.statistics()
+                && let Some(n) = stats.null_count_opt()
+            {
+                *null_counts.entry(iceberg_field_id).or_insert(0) += n;
             }
         }
     }

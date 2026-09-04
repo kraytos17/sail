@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::Result as DFResult;
+use datafusion::config::TableParquetOptions;
 use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::physical_plan::parquet::CachedParquetFileReaderFactory;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, FileSource};
 use datafusion::execution::SessionState;
 use datafusion::execution::object_store::ObjectStoreUrl;
@@ -14,6 +16,7 @@ use datafusion_common::{DataFusionError, GetExt};
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use sail_common_datafusion::catalog::CatalogPartitionField;
 use sail_common_datafusion::datasource::PhysicalSinkMode;
+use sail_common_datafusion::schema_evolution::SchemaEvolutionPhysicalExprAdapterFactory;
 use sail_data_source::options::ResolveOptions;
 use sail_logical_plan::load_data::LoadDataNode;
 
@@ -264,9 +267,31 @@ fn build_fallback_scan(
         "json" => Arc::new(datafusion::datasource::physical_plan::JsonSource::new(
             Arc::new(table_schema.clone()),
         )),
-        "parquet" => Arc::new(datafusion::datasource::physical_plan::ParquetSource::new(
-            Arc::new(table_schema.clone()),
-        )),
+        "parquet" => {
+            // Mirror the provider/listing scan path: session parquet options,
+            // a cached footer reader, and the (name-based) schema-evolution
+            // adapter for files whose schema differs from the table schema.
+            let parquet_options = TableParquetOptions {
+                global: session_state.config_options().execution.parquet.clone(),
+                ..Default::default()
+            };
+            let store = session_state
+                .runtime_env()
+                .object_store(object_store_url.clone())?;
+            let metadata_cache = session_state
+                .runtime_env()
+                .cache_manager
+                .get_file_metadata_cache();
+            let reader_factory =
+                Arc::new(CachedParquetFileReaderFactory::new(store, metadata_cache));
+            Arc::new(
+                datafusion::datasource::physical_plan::ParquetSource::new(Arc::new(
+                    table_schema.clone(),
+                ))
+                .with_table_parquet_options(parquet_options)
+                .with_parquet_file_reader_factory(reader_factory),
+            )
+        }
         _ => {
             return Err(DataFusionError::Plan(format!(
                 "unsupported fallback format: {format}"
@@ -278,6 +303,7 @@ fn build_fallback_scan(
     let config = FileScanConfigBuilder::new(object_store_url, source)
         .with_file_groups(file_groups.into_iter().map(FileGroup::new).collect())
         .with_file_compression_type(FileCompressionType::from(compression))
+        .with_expr_adapter(Some(Arc::new(SchemaEvolutionPhysicalExprAdapterFactory {})))
         .build();
 
     let target_partitions = session_state.config().target_partitions().max(1);

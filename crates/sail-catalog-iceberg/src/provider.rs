@@ -1173,7 +1173,7 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             }
             (Some(_), CreateTableMode::CreateIfNotExists) => {
                 // Handled by the `ignore_if_exists` branch above; kept for exhaustiveness.
-                return Ok(self.get_table(database, table).await?);
+                return self.get_table(database, table).await;
             }
             (Some(_), CreateTableMode::CreateOrReplace | CreateTableMode::Replace) => {
                 self.drop_table(

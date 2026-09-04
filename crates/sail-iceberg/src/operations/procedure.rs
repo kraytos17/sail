@@ -12,7 +12,7 @@ use crate::spec::{
 };
 
 /// Look up a snapshot by ID in the metadata's snapshot list.
-fn find_snapshot<'a>(metadata: &'a TableMetadata, snapshot_id: i64) -> Option<&'a Snapshot> {
+fn find_snapshot(metadata: &TableMetadata, snapshot_id: i64) -> Option<&Snapshot> {
     metadata
         .snapshots
         .iter()
@@ -142,7 +142,7 @@ fn retained_snapshot_ids(
     let mut retained: std::collections::HashSet<i64> =
         retained_refs.values().map(|r| r.snapshot_id).collect();
     let mut referenced: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    for (_, reference) in &retained_refs {
+    for reference in retained_refs.values() {
         if !reference.is_branch() {
             referenced.insert(reference.snapshot_id);
             continue;

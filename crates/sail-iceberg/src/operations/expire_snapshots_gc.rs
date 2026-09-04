@@ -168,6 +168,9 @@ pub async fn expire_files_gc(
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used)]
+    #![expect(clippy::expect_used)]
+
     use std::collections::HashMap;
     use std::sync::Arc;
 

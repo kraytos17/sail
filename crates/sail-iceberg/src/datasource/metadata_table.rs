@@ -270,6 +270,8 @@ fn refs_batch(metadata: &TableMetadata) -> Result<RecordBatch> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used)]
+
     use std::collections::HashMap;
 
     use datafusion::arrow::array::Array;

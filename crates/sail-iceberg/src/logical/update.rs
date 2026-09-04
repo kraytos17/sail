@@ -92,10 +92,10 @@ fn ensure_update_metadata_columns(plan: LogicalPlan) -> Result<LogicalPlan> {
                         .fields()
                         .iter()
                         .position(|f| f.name() == MERGE_FILE_COLUMN);
-                    if let Some(idx) = file_col_idx {
-                        if !new_proj.contains(&idx) {
-                            new_proj.push(idx);
-                        }
+                    if let Some(idx) = file_col_idx
+                        && !new_proj.contains(&idx)
+                    {
+                        new_proj.push(idx);
                     }
                     new_scan.projection = Some(new_proj);
                 }

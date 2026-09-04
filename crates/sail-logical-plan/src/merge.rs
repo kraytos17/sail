@@ -246,6 +246,7 @@ impl RowLevelWriteNode {
 
     /// Create an UPDATE write node carrying the write plan, touched files plan,
     /// and condition for the physical planner.
+    #[expect(clippy::too_many_arguments)]
     pub fn new_update(
         raw_target: Arc<LogicalPlan>,
         raw_input_schema: DFSchemaRef,
