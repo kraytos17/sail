@@ -50,7 +50,7 @@ FROM python:${PYTHON_VERSION}-slim
 
 ARG PYSPARK_VERSION
 
-RUN python3 -m pip install --no-cache-dir "pyspark-client==${PYSPARK_VERSION}"
+RUN python3 -m pip install --no-cache-dir "pyspark[connect]==${PYSPARK_VERSION}"
 
 COPY --from=builder /usr/local/bin/sail /usr/local/bin
 
