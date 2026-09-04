@@ -347,10 +347,9 @@ async fn plan_iceberg_update(
 
     // Physicalize the touched_files_plan if present.
     let touched_files_physical = if let Some(touched_plan) = node.touched_files_plan() {
-        let touched_logical = LogicalPlanBuilder::from((*touched_plan).clone()).build()?;
         Some(
             planner
-                .create_physical_plan(&touched_logical, session_state)
+                .create_physical_plan(touched_plan, session_state)
                 .await?,
         )
     } else {
@@ -467,6 +466,8 @@ fn build_targeted_writer_input(
     write_plan: Arc<dyn ExecutionPlan>,
     touched_file_paths: &[String],
 ) -> Result<(Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>)> {
+    use datafusion::physical_plan::execution_plan::reset_plan_states;
+
     let file_path_idx = write_plan
         .schema()
         .index_of(MERGE_FILE_COLUMN)
@@ -483,9 +484,19 @@ fn build_targeted_writer_input(
     let touch_idx = touched_source.schema().index_of(MERGE_FILE_COLUMN)?;
     let left_width = touched_source.schema().fields().len();
 
+    // Create fresh copies of the plans for each join to avoid double-execution.
+    // Physical plans can hold runtime state after execution; each consumer needs
+    // its own reset copy rather than sharing a multi-parent DAG.
+    let non_insert_for_anti = reset_plan_states(Arc::clone(&non_insert))?;
+    let non_insert_for_inner = reset_plan_states(non_insert)?;
+    let touched_for_anti = reset_plan_states(Arc::clone(&touched_source))?;
+    let touched_for_inner = reset_plan_states(touched_source)?;
+
+    // RightAnti: rows whose file path is NOT in the touched set (untouched rows).
+    // Output is the right side's columns only, so no identity projection needed.
     let untouched_join = Arc::new(HashJoinExec::try_new(
-        Arc::clone(&touched_source),
-        Arc::clone(&non_insert),
+        touched_for_anti,
+        non_insert_for_anti,
         vec![(
             Arc::new(Column::new(MERGE_FILE_COLUMN, touch_idx)),
             Arc::new(Column::new(MERGE_FILE_COLUMN, file_path_idx)),
@@ -497,22 +508,12 @@ fn build_targeted_writer_input(
         NullEquality::NullEqualsNothing,
         false,
     )?);
-    let untouched_rows = Arc::new(ProjectionExec::try_new(
-        (0..untouched_join.schema().fields().len())
-            .map(|i| {
-                (
-                    Arc::new(Column::new(untouched_join.schema().field(i).name(), i))
-                        as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-                    untouched_join.schema().field(i).name().clone(),
-                )
-            })
-            .collect::<Vec<_>>(),
-        untouched_join,
-    )?);
 
+    // Inner: rows whose file path IS in the touched set (touched rows).
+    // Output is [left (touched_source) cols, right (non_insert) cols]; project right side only.
     let touched_join = Arc::new(HashJoinExec::try_new(
-        touched_source,
-        non_insert,
+        touched_for_inner,
+        non_insert_for_inner,
         vec![(
             Arc::new(Column::new(MERGE_FILE_COLUMN, touch_idx)),
             Arc::new(Column::new(MERGE_FILE_COLUMN, file_path_idx)),
@@ -537,7 +538,7 @@ fn build_targeted_writer_input(
         touched_join,
     )?);
 
-    Ok((untouched_rows, touched_rows))
+    Ok((untouched_join, touched_rows))
 }
 
 fn strip_internal_columns(
