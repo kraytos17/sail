@@ -1043,6 +1043,20 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::TruncateTable {
+            truncate: _,
+            table: _,
+            name,
+        } => {
+            // `TRUNCATE TABLE` is `DELETE` without a `WHERE` clause: the delete path
+            // commits an empty snapshot (see `plan_iceberg_truncate` when condition is None).
+            let node = spec::CommandNode::Delete {
+                table: from_ast_object_name(name)?,
+                table_alias: None,
+                condition: None,
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
         Statement::LoadData {
             load_data: _,
             local,

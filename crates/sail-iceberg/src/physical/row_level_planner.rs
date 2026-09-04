@@ -5,6 +5,7 @@ use datafusion::execution::SessionState;
 use datafusion::logical_expr::logical_plan::builder::LogicalPlanBuilder;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_planner::PhysicalPlanner;
 use sail_common_datafusion::datasource::{PhysicalSinkMode, RowLevelCommand};
 use sail_data_source::options::ResolveOptions;
@@ -101,7 +102,10 @@ async fn plan_iceberg_delete(
     planner: &dyn PhysicalPlanner,
     node: &RowLevelWriteNode,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    // TODO: Support conditionless DELETE by scanning all rows into equality deletes.
+    // TRUNCATE TABLE (and conditionless DELETE) removes every row.
+    if node.condition().is_none() {
+        return plan_iceberg_truncate(session_state, node).await;
+    }
     let condition = node.condition().ok_or_else(|| {
         DataFusionError::Plan(
             "Iceberg equality-delete MOR DELETE requires a WHERE condition".to_string(),
@@ -163,6 +167,79 @@ async fn plan_iceberg_delete(
             table_url,
             writer_options.lakehouse_table.clone(),
             SnapshotUpdateKind::RowDelta,
+        )
+        .with_expected_snapshot_id(node.expected_snapshot_id()),
+    ))
+}
+
+/// Plans `TRUNCATE TABLE` (and conditionless `DELETE`) for Iceberg.
+///
+/// - A table that was created but never written (no current snapshot) has nothing to
+///   delete: an empty input commits nothing and the commit exec reports `count = 0`.
+/// - Otherwise all rows are dropped by committing an **empty full overwrite**: the writer
+///   emits a `commit_meta` with no data files and `FullOverwrite` drops every parent
+///   manifest, leaving an empty snapshot. Affected rows are reported as `0`, matching
+///   `TRUNCATE TABLE` semantics.
+async fn plan_iceberg_truncate(
+    session_state: &SessionState,
+    node: &RowLevelWriteNode,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let table_url =
+        IcebergTableFormat::parse_table_url(vec![node.target_location().to_string()]).await?;
+    let metadata_location = metadata_location_from_options(node.target_options());
+    let catalog_managed_table = catalog_managed_iceberg_from_options(node.target_options());
+    let metadata_location_for_load = catalog_managed_table.then_some(metadata_location).flatten();
+    let table = Table::load_with_metadata_location(
+        session_state,
+        table_url.clone(),
+        metadata_location_for_load,
+    )
+    .await?;
+    let current_schema = table.metadata().current_schema().ok_or_else(|| {
+        DataFusionError::Plan("Iceberg table metadata is missing current schema".to_string())
+    })?;
+    let current_arrow_schema =
+        crate::datasource::type_converter::iceberg_schema_to_arrow(current_schema)?;
+
+    if table.metadata().current_snapshot().is_none() {
+        let empty: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(Arc::new(current_arrow_schema)));
+        return Ok(Arc::new(IcebergCommitExec::new(
+            empty,
+            table_url,
+            node.target_lakehouse_table().cloned(),
+            SnapshotUpdateKind::FastAppend,
+        )));
+    }
+
+    let writer_options = resolve_row_level_writer_options(session_state, node)?;
+    let partition_columns = IcebergTableFormat::partition_columns_from_metadata(&table)?;
+    let write_context = prepare_iceberg_write_context(
+        &table_url,
+        Some(table.metadata()),
+        &writer_options,
+        &partition_columns,
+        &PhysicalSinkMode::Append,
+        &current_arrow_schema,
+    )?;
+    let empty_input: Arc<dyn ExecutionPlan> =
+        Arc::new(EmptyExec::new(Arc::new(current_arrow_schema)));
+    let writer: Arc<dyn ExecutionPlan> = Arc::new(IcebergWriterExec::new(
+        empty_input,
+        table_url.clone(),
+        partition_columns,
+        PhysicalSinkMode::Append,
+        true,
+        writer_options.clone(),
+        write_context,
+    )?);
+
+    Ok(Arc::new(
+        IcebergCommitExec::new(
+            writer,
+            table_url,
+            writer_options.lakehouse_table.clone(),
+            SnapshotUpdateKind::FullOverwrite,
         )
         .with_expected_snapshot_id(node.expected_snapshot_id()),
     ))

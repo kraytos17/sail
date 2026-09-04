@@ -17,8 +17,8 @@ use crate::ast::keywords::{
     Partition, Partitioned, Partitions, Properties, Purge, Recover, Refresh, Rename, Replace,
     Restrict, Row, Schema, Schemas, Serde, Serdeproperties, Set, Show, Sorted, Source, Start,
     Statistics, Stored, System, Table, Tables, Target, Tblproperties, Temp, Temporary, Terminated,
-    Then, Time, To, Type, Uncache, Unset, Update, Use, User, Using, Values, Verbose, View, Views,
-    When, With, Zone,
+    Then, Time, To, Truncate, Type, Uncache, Unset, Update, Use, User, Using, Values, Verbose,
+    View, Views, When, With, Zone,
 };
 use crate::ast::literal::{IntegerLiteral, NumberLiteral, StringLiteral};
 use crate::ast::operator::{
@@ -273,6 +273,11 @@ pub enum Statement {
         alias: Option<DeleteTableAlias>,
         #[parser(function = |(_, _, e, _), o| compose(e, o))]
         r#where: Option<WhereClause>,
+    },
+    TruncateTable {
+        truncate: Truncate,
+        table: Table,
+        name: ObjectName,
     },
     LoadData {
         load_data: (Load, Data),
