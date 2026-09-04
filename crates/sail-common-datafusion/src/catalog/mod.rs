@@ -7,6 +7,7 @@ mod status;
 
 use datafusion_common::Column;
 use datafusion_expr::expr;
+pub use iceberg::IcebergMetadataTableType;
 pub use lakehouse::*;
 use serde::{Deserialize, Serialize};
 pub use status::*;

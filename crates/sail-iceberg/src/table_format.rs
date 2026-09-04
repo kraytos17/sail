@@ -19,6 +19,7 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{
     DataFusionError, Result, TableReference, ToDFSchema, not_impl_err, plan_err,
 };
+use datafusion::datasource::provider_as_source;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{LogicalPlan, TableScan, TableSource};
 use datafusion::physical_plan::ExecutionPlan;
@@ -44,6 +45,7 @@ use sail_common_datafusion::variant::with_variant_extension_if_marked_storage;
 use sail_data_source::options::ResolveOptions;
 use url::Url;
 
+use crate::datasource::metadata_table::IcebergMetadataTableProvider;
 use crate::datasource::provider::IcebergTableProvider;
 use crate::datasource::type_converter::{ICEBERG_ARROW_FIELD_DOC_KEY, arrow_schema_to_iceberg};
 use crate::io::StoreContext;
@@ -93,6 +95,9 @@ impl TableFormat for IcebergTableFormat {
         ctx: &dyn Session,
         info: SourceInfo,
     ) -> Result<Arc<dyn TableSource>> {
+        if info.metadata_table.is_some() {
+            return build_iceberg_metadata_source(ctx, info).await;
+        }
         let provider = build_iceberg_provider(ctx, info).await?;
         Ok(Arc::new(IcebergTableSource::new(provider)))
     }
@@ -172,6 +177,7 @@ impl TableFormat for IcebergTableFormat {
             options: options.clone(),
             // TODO: Thread resolver session case-sensitivity into TableFormat::create_deleter.
             read_case_sensitive: true,
+            metadata_table: None,
         };
         let provider = build_iceberg_provider(ctx, source_info).await?;
         let expected_snapshot_id = Some(
@@ -345,6 +351,83 @@ impl TableFormat for IcebergTableFormat {
                     .await
             }
             op => not_impl_err!("unsupported Iceberg ALTER TABLE operation: {op:?}"),
+        }
+    }
+
+    async fn call_procedure(
+        &self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+        path: &str,
+        operation: sail_common_datafusion::datasource::TableFormatProcedureOperation,
+        lakehouse_table: Option<LakehouseExecutionContext>,
+    ) -> Result<datafusion::arrow::array::RecordBatch> {
+        use crate::operations::expire_snapshots_gc::expire_files_gc;
+        use crate::operations::procedure::{
+            apply_procedure_updates, compute_procedure_output, compute_procedure_updates,
+            procedure_requirements, validate_procedure_requirements,
+        };
+
+        let table_url = Self::parse_table_url(vec![path.to_string()]).await?;
+        let object_store = runtime_env
+            .object_store_registry
+            .get_store(&table_url)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
+
+        // Catalog-managed commits need session-level catalog access, which `call_procedure`
+        // does not receive (only a runtime env); support the filesystem commit path.
+        if let Some(context) = &lakehouse_table
+            && context.commit != CommitAuthority::Filesystem
+        {
+            return not_impl_err!(
+                "CALL procedures for catalog-managed Iceberg tables are not yet supported: {}",
+                context.catalog_table().join(".")
+            );
+        }
+
+        let latest_meta = find_latest_metadata_file(&object_store, &table_url).await?;
+        let bytes = load_metadata_file_bytes(&object_store, &latest_meta).await?;
+        let pre_commit =
+            TableMetadata::from_json(&bytes).map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let updates = compute_procedure_updates(&operation, &pre_commit)?;
+        let requirements = procedure_requirements(&pre_commit);
+        let output = compute_procedure_output(&operation, &pre_commit)?;
+
+        let updates_for_commit = updates.clone();
+        let requirements_for_commit = requirements.clone();
+        Self::retry_metadata_commit(
+            object_store.clone(),
+            &store_ctx,
+            &table_url,
+            latest_meta,
+            true,
+            move |table_meta| {
+                validate_procedure_requirements(table_meta, &requirements_for_commit)?;
+                apply_procedure_updates(table_meta, &updates_for_commit)?;
+                Ok(())
+            },
+        )
+        .await?;
+
+        match &operation {
+            sail_common_datafusion::datasource::TableFormatProcedureOperation::ExpireSnapshots { .. } => {
+                let post_commit_meta = find_latest_metadata_file(&object_store, &table_url).await?;
+                let bytes = load_metadata_file_bytes(&object_store, &post_commit_meta).await?;
+                let post_commit = TableMetadata::from_json(&bytes)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let counts = expire_files_gc(&store_ctx, &pre_commit, &post_commit).await?;
+                Ok(crate::operations::procedure::CallProcedureOutput::ExpireSnapshots {
+                    deleted_data_files_count: counts.data_files as i64,
+                    deleted_position_delete_files_count: counts.position_delete_files as i64,
+                    deleted_equality_delete_files_count: counts.equality_delete_files as i64,
+                    deleted_manifest_files_count: counts.manifest_files as i64,
+                    deleted_manifest_lists_count: counts.manifest_lists as i64,
+                    deleted_statistics_files_count: counts.statistics_files as i64,
+                }
+                .to_record_batch()?)
+            }
+            _ => output.to_record_batch(),
         }
     }
 }
@@ -591,13 +674,48 @@ impl IcebergTableFormat {
         let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
 
         let initial_latest_meta = find_latest_metadata_file(&object_store, &table_url).await?;
+        Self::retry_metadata_commit(
+            object_store,
+            &store_ctx,
+            &table_url,
+            initial_latest_meta,
+            true,
+            |table_meta| {
+                crate::properties::apply_table_property_changes(
+                    &mut *table_meta,
+                    &changes,
+                    if_exists,
+                )
+            },
+        )
+        .await
+    }
+
+    /// Retries a metadata-file commit against concurrent writes.
+    ///
+    /// Shared by `alter_table_properties` and `call_procedure`: re-reads the latest metadata
+    /// (attempt 1 reuses the caller's resolved `initial_latest_meta`), applies `mutate`,
+    /// writes the next monotonic version with `PutMode::Create`, and on collision retries up
+    /// to `MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES`. When `check_post_write` is set, a
+    /// post-write scan detects concurrent overwrites of the just-written version file.
+    pub(crate) async fn retry_metadata_commit<F>(
+        object_store: Arc<dyn object_store::ObjectStore>,
+        store_ctx: &StoreContext,
+        table_url: &Url,
+        initial_latest_meta: String,
+        check_post_write: bool,
+        mutate: F,
+    ) -> Result<()>
+    where
+        F: Fn(&mut crate::spec::TableMetadata) -> Result<()>,
+    {
         let mut attempt = 0;
         loop {
             attempt += 1;
             let latest_metadata_file = if attempt == 1 {
                 initial_latest_meta.clone()
             } else {
-                find_latest_metadata_file(&object_store, &table_url).await?
+                find_latest_metadata_file(&object_store, table_url).await?
             };
 
             let metadata_bytes =
@@ -605,12 +723,12 @@ impl IcebergTableFormat {
             let mut table_meta = TableMetadata::from_json(&metadata_bytes)
                 .map_err(|error| DataFusionError::External(Box::new(error)))?;
 
-            crate::properties::apply_table_property_changes(&mut table_meta, &changes, if_exists)?;
+            mutate(&mut table_meta)?;
 
             let current_version =
                 metadata_file_version_from_path(&latest_metadata_file).unwrap_or(0);
             let next_version = current_version + 1;
-            let next_version_files = metadata_files_for_version(&store_ctx, next_version).await?;
+            let next_version_files = metadata_files_for_version(store_ctx, next_version).await?;
             if !next_version_files.is_empty() {
                 log::warn!(
                     "Detected existing Iceberg metadata files for version {}: {:?}. Retrying attempt {}",
@@ -666,26 +784,28 @@ impl IcebergTableFormat {
                 Err(error) => return Err(DataFusionError::External(Box::new(error))),
             }
 
-            let version_files = metadata_files_for_version(&store_ctx, next_version).await?;
-            let conflict_after_write = version_files.iter().any(|path| path != &metadata_file);
-            if conflict_after_write {
-                log::warn!(
-                    "Concurrent Iceberg metadata writes detected for version {}: {:?}. Retrying attempt {}",
-                    next_version,
-                    version_files,
-                    attempt
-                );
-                if let Err(error) = store_ctx.prefixed.delete(&metadata_path).await {
+            if check_post_write {
+                let version_files = metadata_files_for_version(store_ctx, next_version).await?;
+                let conflict_after_write = version_files.iter().any(|path| path != &metadata_file);
+                if conflict_after_write {
                     log::warn!(
-                        "Failed to delete conflicted Iceberg metadata file {}: {:?}",
-                        metadata_file,
-                        error
+                        "Concurrent Iceberg metadata writes detected for version {}: {:?}. Retrying attempt {}",
+                        next_version,
+                        version_files,
+                        attempt
                     );
+                    if let Err(error) = store_ctx.prefixed.delete(&metadata_path).await {
+                        log::warn!(
+                            "Failed to delete conflicted Iceberg metadata file {}: {:?}",
+                            metadata_file,
+                            error
+                        );
+                    }
+                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
+                        return Err(alter_table_properties_conflict_error());
+                    }
+                    continue;
                 }
-                if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                    return Err(alter_table_properties_conflict_error());
-                }
-                continue;
             }
 
             write_version_hint(&store_ctx.prefixed, &next_version.to_string()).await;
@@ -733,6 +853,7 @@ async fn build_iceberg_provider(
         sort_order: _,
         options,
         read_case_sensitive: _,
+        metadata_table: _,
     } = info;
 
     validate_iceberg_read_lakehouse_context(lakehouse_table.as_ref())?;
@@ -748,6 +869,44 @@ async fn build_iceberg_provider(
         catalog_managed_table,
     )
     .await
+}
+
+async fn build_iceberg_metadata_source(
+    ctx: &dyn Session,
+    info: SourceInfo,
+) -> Result<Arc<dyn TableSource>> {
+    let SourceInfo {
+        paths,
+        lakehouse_table,
+        schema: _,
+        constraints: _,
+        partition_by: _,
+        bucket_by: _,
+        sort_order: _,
+        options,
+        read_case_sensitive: _,
+        metadata_table,
+    } = info;
+    let metadata_type = metadata_table.ok_or_else(|| {
+        DataFusionError::Internal(
+            "build_iceberg_metadata_source requires a metadata table type".to_string(),
+        )
+    })?;
+
+    validate_iceberg_read_lakehouse_context(lakehouse_table.as_ref())?;
+    let table_url = IcebergTableFormat::parse_table_url(paths).await?;
+    let metadata_location = metadata_location_from_options(&options);
+    let catalog_managed_table = catalog_managed_iceberg_from_options(&options);
+    let metadata_location = catalog_managed_table.then_some(metadata_location).flatten();
+    let table =
+        Table::load_with_metadata_location(ctx, table_url.clone(), metadata_location).await?;
+
+    let provider = Arc::new(IcebergMetadataTableProvider::new(
+        table_url,
+        table.metadata().clone(),
+        metadata_type,
+    ));
+    Ok(provider_as_source(provider))
 }
 
 fn validate_iceberg_read_lakehouse_context(

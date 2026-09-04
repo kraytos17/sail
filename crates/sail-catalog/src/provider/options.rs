@@ -179,3 +179,22 @@ pub struct AddColumn {
     pub default: Option<String>,
     pub comment: Option<String>,
 }
+
+/// Options for `CALL` procedures executed against a catalog-managed table.
+///
+/// The target table is carried separately by [`CatalogCommand::CallProcedure`]; these
+/// options encode the procedure-specific arguments.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Serialize, Deserialize)]
+pub enum CallProcedureOptions {
+    RollbackToSnapshot {
+        snapshot_id: i64,
+    },
+    SetCurrentSnapshot {
+        snapshot_id: Option<i64>,
+        r#ref: Option<String>,
+    },
+    ExpireSnapshots {
+        older_than_ms: Option<i64>,
+        retain_last: Option<i32>,
+    },
+}

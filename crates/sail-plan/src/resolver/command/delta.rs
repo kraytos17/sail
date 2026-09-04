@@ -129,6 +129,7 @@ impl PlanResolver<'_> {
             sort_order: vec![],
             options: vec![],
             read_case_sensitive: self.config.case_sensitive,
+            metadata_table: None,
         };
         let metadata = match table_format
             .infer_metadata(&self.ctx.state(), source_info)
@@ -544,7 +545,9 @@ impl PlanResolver<'_> {
                 items: info.properties.clone(),
             }],
             read_case_sensitive: self.config.case_sensitive,
+            metadata_table: None,
         };
+
         match table_format.infer_metadata(&self.ctx.state(), source).await {
             Ok(metadata) => Ok(Some(metadata)),
             Err(e) => {

@@ -130,6 +130,7 @@ impl PlanResolver<'_> {
                         },
                     ],
                     read_case_sensitive: self.config.case_sensitive,
+                    metadata_table: None,
                 };
                 let registry = self.ctx.extension::<TableFormatRegistry>()?;
                 let table_source = registry
@@ -478,6 +479,7 @@ impl PlanResolver<'_> {
                 items: options.into_iter().collect(),
             }],
             read_case_sensitive: self.config.case_sensitive,
+            metadata_table: None,
         };
         let registry = self.ctx.extension::<TableFormatRegistry>()?;
         let table_source = registry

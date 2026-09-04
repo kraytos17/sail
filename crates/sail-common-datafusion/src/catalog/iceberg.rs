@@ -9,6 +9,31 @@ pub const ICEBERG_METADATA_LOCATION_UNDERSCORE_KEY: &str =
 pub const ICEBERG_METADATA_LOCATION_KEYS: &[&str] = managed::METADATA_LOCATION_KEYS;
 pub const ICEBERG_PREVIOUS_METADATA_LOCATION_KEY: &str = managed::PREVIOUS_METADATA_LOCATION_KEY;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IcebergMetadataTableType {
+    Snapshots,
+    Refs,
+}
+
+impl IcebergMetadataTableType {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "snapshots" => Some(Self::Snapshots),
+            "refs" => Some(Self::Refs),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for IcebergMetadataTableType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Snapshots => write!(f, "snapshots"),
+            Self::Refs => write!(f, "refs"),
+        }
+    }
+}
+
 pub fn is_iceberg_table_marker(key: &str, value: &str) -> bool {
     managed::is_table_format_marker(key, value, ICEBERG_TABLE_TYPE_VALUE)
 }

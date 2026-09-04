@@ -13,9 +13,11 @@
 pub mod action;
 pub mod append;
 pub mod bootstrap;
+pub(crate) mod expire_snapshots_gc;
 pub mod helpers;
 pub mod overwrite;
 pub(crate) mod parquet_utils;
+pub(crate) mod procedure;
 pub mod snapshot;
 pub mod write;
 

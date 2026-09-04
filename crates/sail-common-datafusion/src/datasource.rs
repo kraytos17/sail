@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::plan_datafusion_err;
@@ -188,23 +189,15 @@ pub struct BucketBy {
 #[derive(Debug, Clone)]
 pub struct SourceInfo {
     pub paths: Vec<String>,
-    /// Unified lakehouse catalog context for catalog-coordinated reads.
     pub lakehouse_table: Option<LakehouseExecutionContext>,
-    /// The (optional) schema of the data source including partitioning columns.
     pub schema: Option<Schema>,
     pub constraints: Constraints,
     pub partition_by: Vec<String>,
     pub bucket_by: Option<BucketBy>,
     pub sort_order: Vec<Sort>,
-    /// The layers of options for the data source.
-    /// A later layer can override earlier ones.
     pub options: Vec<OptionLayer>,
-    /// Whether reads match the requested columns case-sensitively against the
-    /// physical file schema. Spark defaults to case-insensitive matching
-    /// (`spark.sql.caseSensitive=false`). This only affects formats that
-    /// reconcile a requested schema against files on read (e.g. Parquet); it is
-    /// inert for formats that resolve their schema from metadata.
     pub read_case_sensitive: bool,
+    pub metadata_table: Option<crate::catalog::IcebergMetadataTableType>,
 }
 
 impl SourceInfo {
@@ -623,6 +616,36 @@ pub trait TableFormat: Send + Sync {
             self.name()
         )
     }
+
+    /// Executes a catalog-managed table procedure (CALL).
+    async fn call_procedure(
+        &self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+        path: &str,
+        operation: TableFormatProcedureOperation,
+        lakehouse_table: Option<LakehouseExecutionContext>,
+    ) -> Result<RecordBatch> {
+        let _ = (runtime_env, path, operation, lakehouse_table);
+        not_impl_err!(
+            "CALL procedures are not supported for {} format",
+            self.name()
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TableFormatProcedureOperation {
+    RollbackToSnapshot {
+        snapshot_id: i64,
+    },
+    SetCurrentSnapshot {
+        snapshot_id: Option<i64>,
+        r#ref: Option<String>,
+    },
+    ExpireSnapshots {
+        older_than_ms: Option<i64>,
+        retain_last: Option<i32>,
+    },
 }
 
 /// Thread-safe registry of available `TableFormat` implementations.

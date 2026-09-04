@@ -171,6 +171,7 @@ impl<T: FormatFactory> TableFormat for ListingTableFormat<T> {
             sort_order,
             options,
             read_case_sensitive,
+            metadata_table: _,
         } = info;
 
         let read_format = T::read(ctx, options)?;

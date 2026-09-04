@@ -12,6 +12,7 @@ use crate::function::list_built_in_function_statuses;
 use crate::resolver::PlanResolver;
 use crate::resolver::state::PlanResolverState;
 
+mod call;
 mod catalog;
 mod checkpoint;
 mod delete;
@@ -326,6 +327,10 @@ impl PlanResolver<'_> {
             CommandNode::AnalyzeTable { .. } => Err(PlanError::todo("CommandNode::AnalyzeTable")),
             CommandNode::AnalyzeTables { .. } => Err(PlanError::todo("CommandNode::AnalyzeTables")),
             CommandNode::DescribeQuery { .. } => Err(PlanError::todo("CommandNode::DescribeQuery")),
+            CommandNode::CallProcedure { name, arguments } => {
+                self.resolve_command_call_procedure(name, arguments, state)
+                    .await
+            }
             CommandNode::DescribeFunction { function, extended } => {
                 self.resolve_catalog_command(CatalogCommand::DescribeFunction {
                     function: function.into(),

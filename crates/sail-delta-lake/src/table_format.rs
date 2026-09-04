@@ -98,6 +98,7 @@ impl TableFormat for DeltaTableFormat {
             sort_order: _,
             options,
             read_case_sensitive: _,
+            metadata_table: _,
         } = info;
         let table_url = Self::parse_table_url(ctx, paths).await?;
         let options = DeltaReadOptions::resolve(ctx, options)?;
@@ -115,6 +116,7 @@ impl TableFormat for DeltaTableFormat {
             sort_order: _,
             options,
             read_case_sensitive: _,
+            metadata_table: _,
         } = info;
         let table_url = Self::parse_table_url(ctx, paths).await?;
         let options = DeltaReadOptions::resolve(ctx, options)?;
@@ -136,6 +138,7 @@ impl TableFormat for DeltaTableFormat {
             sort_order: _,
             options,
             read_case_sensitive: _,
+            metadata_table: _,
         } = info;
         let table_url = Self::parse_table_url(ctx, paths).await?;
         let options = DeltaReadOptions::resolve(ctx, options)?;

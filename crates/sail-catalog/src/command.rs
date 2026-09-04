@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use sail_common_datafusion::array::serde::ArrowSerializer;
 use sail_common_datafusion::catalog::{CommitAuthority, FunctionStatus, LakehouseOperation};
 use sail_common_datafusion::datasource::{
     TableFormatAlterTableOperation, TableFormatCreateTableColumn, TableFormatCreateTableInfo,
-    TableFormatRegistry, is_lakehouse_format,
+    TableFormatProcedureOperation, TableFormatRegistry, is_lakehouse_format,
 };
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::session::plan::PlanService;
@@ -17,9 +19,9 @@ use crate::lakehouse::{
 use crate::manager::CatalogManager;
 use crate::manager::tracker::{CatalogFunctionId, CatalogLogicalPlanId};
 use crate::provider::{
-    AlterTableOptions, CreateDatabaseOptions, CreateTableOptions, CreateTemporaryViewOptions,
-    CreateViewOptions, DropDatabaseOptions, DropTableOptions, DropTemporaryViewOptions,
-    DropViewOptions,
+    AlterTableOptions, CallProcedureOptions, CreateDatabaseOptions, CreateTableOptions,
+    CreateTemporaryViewOptions, CreateViewOptions, DropDatabaseOptions, DropTableOptions,
+    DropTemporaryViewOptions, DropViewOptions,
 };
 use crate::utils::{quote_names_if_needed, quote_namespace_if_needed};
 
@@ -28,6 +30,10 @@ pub enum CatalogCommand {
     CurrentCatalog,
     SetCurrentCatalog {
         catalog: String,
+    },
+    CallProcedure {
+        table: Vec<String>,
+        procedure: CallProcedureOptions,
     },
     ListCatalogs {
         pattern: Option<String>,
@@ -173,6 +179,7 @@ impl CatalogCommand {
         match self {
             CatalogCommand::CurrentCatalog => "CurrentCatalog",
             CatalogCommand::SetCurrentCatalog { .. } => "SetCurrentCatalog",
+            CatalogCommand::CallProcedure { .. } => "CallProcedure",
             CatalogCommand::ListCatalogs { .. } => "ListCatalogs",
             CatalogCommand::CurrentDatabase => "CurrentDatabase",
             CatalogCommand::SetCurrentDatabase { .. } => "SetCurrentDatabase",
@@ -239,6 +246,10 @@ impl CatalogCommand {
             CatalogCommand::DescribeFunction { .. } => {
                 ArrowSerializer::default().schema::<DescribeFunctionRow>()?
             }
+            CatalogCommand::CallProcedure {
+                table: _,
+                procedure,
+            } => call_procedure_schema(procedure),
             CatalogCommand::SetCurrentCatalog { .. }
             | CatalogCommand::SetCurrentDatabase { .. }
             | CatalogCommand::RegisterFunction { .. }
@@ -576,6 +587,56 @@ impl CatalogCommand {
 
                 manager.alter_table(&table, options).await?;
                 display.bools().to_record_batch(vec![true])?
+            }
+            CatalogCommand::CallProcedure { table, procedure } => {
+                let table_status = manager.get_table_or_view(&table).await?;
+                let (location, format) = match &table_status.kind {
+                    sail_common_datafusion::catalog::TableKind::Table {
+                        location: Some(loc),
+                        format,
+                        ..
+                    } => (Some(loc.clone()), Some(format.clone())),
+                    _ => (None, None),
+                };
+                let location = location.ok_or_else(|| {
+                    CatalogError::NotSupported(
+                        "CALL procedures are only supported for tables with a location".to_string(),
+                    )
+                })?;
+                let format = format.ok_or_else(|| {
+                    CatalogError::NotSupported(
+                        "CALL procedures are only supported on tables".to_string(),
+                    )
+                })?;
+                if !format.eq_ignore_ascii_case("iceberg") {
+                    return Err(CatalogError::NotSupported(format!(
+                        "CALL procedures are only supported for Iceberg tables, got '{format}'"
+                    )));
+                }
+                let registry = ctx.extension::<TableFormatRegistry>().map_err(|e| {
+                    CatalogError::External(format!(
+                        "missing TableFormatRegistry for CALL procedure on format '{format}': {e}"
+                    ))
+                })?;
+                let table_format = registry.get(&format).map_err(|e| {
+                    CatalogError::External(format!(
+                        "unknown table format '{format}' for CALL procedure: {e}"
+                    ))
+                })?;
+                let runtime = ctx.runtime_env();
+                let lakehouse_table = manager
+                    .resolve_lakehouse_table_status(
+                        &table,
+                        &table_status,
+                        LakehouseOperation::Maintenance,
+                    )
+                    .await?
+                    .execution;
+                let operation = table_format_procedure_operation(&procedure);
+                table_format
+                    .call_procedure(runtime, &location, operation, Some(lakehouse_table))
+                    .await
+                    .map_err(|e| CatalogError::External(e.to_string()))?
             }
             CatalogCommand::ListColumns { table } => {
                 let rows = manager.get_table_or_view(&table).await?.kind.columns();
@@ -1119,6 +1180,55 @@ fn catalog_sync_alter_options(
         }
         _ => Ok(options.clone()),
     }
+}
+
+/// Converts `CallProcedureOptions` into the format-level procedure operation.
+///
+/// Mirrors `table_format_alter_operation` for the catalog → storage layer bridge.
+fn table_format_procedure_operation(
+    options: &CallProcedureOptions,
+) -> TableFormatProcedureOperation {
+    match options {
+        CallProcedureOptions::RollbackToSnapshot { snapshot_id } => {
+            TableFormatProcedureOperation::RollbackToSnapshot {
+                snapshot_id: *snapshot_id,
+            }
+        }
+        CallProcedureOptions::SetCurrentSnapshot { snapshot_id, r#ref } => {
+            TableFormatProcedureOperation::SetCurrentSnapshot {
+                snapshot_id: *snapshot_id,
+                r#ref: r#ref.clone(),
+            }
+        }
+        CallProcedureOptions::ExpireSnapshots {
+            older_than_ms,
+            retain_last,
+        } => TableFormatProcedureOperation::ExpireSnapshots {
+            older_than_ms: *older_than_ms,
+            retain_last: *retain_last,
+        },
+    }
+}
+
+/// The fixed output schema for a CALL procedure, matching the batch returned by the
+/// format's `call_procedure` implementation (see `CallProcedureOutput`).
+fn call_procedure_schema(procedure: &CallProcedureOptions) -> SchemaRef {
+    let fields = match procedure {
+        CallProcedureOptions::RollbackToSnapshot { .. }
+        | CallProcedureOptions::SetCurrentSnapshot { .. } => vec![
+            Field::new("previous_snapshot_id", DataType::Int64, true),
+            Field::new("current_snapshot_id", DataType::Int64, true),
+        ],
+        CallProcedureOptions::ExpireSnapshots { .. } => vec![
+            Field::new("deleted_data_files_count", DataType::Int64, true),
+            Field::new("deleted_position_delete_files_count", DataType::Int64, true),
+            Field::new("deleted_equality_delete_files_count", DataType::Int64, true),
+            Field::new("deleted_manifest_files_count", DataType::Int64, true),
+            Field::new("deleted_manifest_lists_count", DataType::Int64, true),
+            Field::new("deleted_statistics_files_count", DataType::Int64, true),
+        ],
+    };
+    Arc::new(Schema::new(fields))
 }
 
 #[derive(Serialize, Deserialize)]

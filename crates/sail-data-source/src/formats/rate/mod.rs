@@ -44,6 +44,7 @@ impl TableFormat for RateTableFormat {
             sort_order,
             options,
             read_case_sensitive: _,
+            metadata_table: _,
         } = info;
         if !constraints.deref().is_empty() {
             return plan_err!("the rate table format does not support constraints");
