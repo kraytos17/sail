@@ -28,7 +28,6 @@ use datafusion::physical_plan::{
 use datafusion_common::{DataFusionError, Result, ScalarValue, internal_err};
 use futures::StreamExt;
 use futures::stream::once;
-use parquet::file::properties::WriterProperties;
 use sail_common_datafusion::catalog::{CatalogPartitionField, LakehouseExecutionContext};
 use sail_common_datafusion::datasource::{
     MERGE_FILE_COLUMN, MERGE_ROW_INDEX_COLUMN, PhysicalSinkMode,
@@ -36,6 +35,7 @@ use sail_common_datafusion::datasource::{
 use url::Url;
 
 use crate::io::StoreContext;
+use crate::operations::write::arrow_parquet::build_writer_properties;
 use crate::operations::write::config::WriterConfig;
 use crate::operations::write::table_writer::IcebergTableWriter;
 use crate::physical_plan::action_schema::{
@@ -359,11 +359,15 @@ impl ExecutionPlan for IcebergWriterExec {
             let variant_shredding = write_context.variant_shredding.clone();
             let base_table_context = write_context.base_table.as_ref();
 
+            let compression = resolve_compression_codec(&options.compression_codec)?;
+            let writer_properties = build_writer_properties(&options.table_properties, compression)
+                .map_err(DataFusionError::Plan)?;
+
             let writer_config = WriterConfig {
                 table_schema: table_schema.clone(),
                 partition_columns: partition_columns.clone(),
-                writer_properties: WriterProperties::default(),
-                target_file_size: 134_217_728,
+                writer_properties,
+                target_file_size: options.target_file_size,
                 write_batch_size: 32 * 1024,
                 num_indexed_cols: 32,
                 stats_columns: None,
@@ -469,6 +473,9 @@ impl ExecutionPlan for IcebergWriterExec {
                     .commit_writer_partition_spec
                     .then(|| write_context.writer_partition_spec.clone())
                     .flatten(),
+                touched_file_paths: options.touched_file_paths,
+                overwrite_predicate: options.overwrite_predicate,
+                overwrite_partition_values: None,
             };
 
             let schema = iceberg_action_schema()?;
@@ -509,6 +516,22 @@ impl DisplayAs for IcebergWriterExec {
                 Ok(())
             }
         }
+    }
+}
+
+fn resolve_compression_codec(codec: &str) -> Result<parquet::basic::Compression> {
+    use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
+    match codec.to_ascii_lowercase().as_str() {
+        "zstd" => Ok(Compression::ZSTD(ZstdLevel::default())),
+        "snappy" => Ok(Compression::SNAPPY),
+        "gzip" => Ok(Compression::GZIP(GzipLevel::default())),
+        "lz4" => Ok(Compression::LZ4_RAW),
+        "brotli" => Ok(Compression::BROTLI(BrotliLevel::default())),
+        "none" | "uncompressed" => Ok(Compression::UNCOMPRESSED),
+        other => Err(DataFusionError::Plan(format!(
+            "unsupported parquet compression codec '{other}' (expected one of: \
+             zstd, snappy, gzip, lz4, brotli, none, uncompressed)"
+        ))),
     }
 }
 

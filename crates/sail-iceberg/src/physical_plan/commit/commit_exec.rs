@@ -1607,6 +1607,9 @@ mod tests {
                         lakehouse_table: None,
                         schema: None,
                         partition_spec: None,
+                        touched_file_paths: vec![],
+                        overwrite_predicate: None,
+                        overwrite_partition_values: None,
                     })
                     .expect("commit metadata action"),
                 ],

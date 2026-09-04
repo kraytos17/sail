@@ -7719,6 +7719,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "datafusion-common",
+ "datafusion-datasource",
  "datafusion-expr",
  "educe",
  "flate2",
@@ -7743,6 +7744,7 @@ dependencies = [
  "serde",
  "serde_arrow",
  "serde_json",
+ "tokio",
  "url",
  "uuid",
 ]

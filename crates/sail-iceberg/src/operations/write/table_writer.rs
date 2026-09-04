@@ -145,6 +145,19 @@ impl IcebergTableWriter {
             None => (partition_dir, self.new_partition_writer_state()?),
         };
         let state = self.write_partition_state(state, batch).await?;
+
+        let needs_roll = matches!(
+            &state,
+            PartitionWriterState::Open { writer, .. }
+                if self.config.target_file_size > 0
+                    && writer.buffered_size() >= self.config.target_file_size
+        );
+        if needs_roll {
+            self.flush_partition(state, &partition_dir, partition_values)
+                .await?;
+            return Ok(());
+        }
+
         self.writers.insert(
             partition_values,
             PartitionWriter {

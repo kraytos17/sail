@@ -27,6 +27,7 @@ sail-sql-analyzer = { path = "../sail-sql-analyzer" }
 # DataFusion dependencies
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
+datafusion-datasource = { workspace = true }
 datafusion-expr = { workspace = true }
 arrow-schema = { workspace = true }
 parquet-variant = { workspace = true }
@@ -50,6 +51,7 @@ log = { workspace = true }
 # itertools = { workspace = true }
 # percent-encoding = { workspace = true }
 once_cell = { workspace = true }
+tokio = { workspace = true }
 serde_arrow = { workspace = true }
 ordered-float = { workspace = true }
 apache-avro = { workspace = true }

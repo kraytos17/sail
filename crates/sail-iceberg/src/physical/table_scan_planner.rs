@@ -8,10 +8,12 @@ use datafusion::logical_expr::expr_rewriter::unnormalize_cols;
 use datafusion::logical_expr::{LogicalPlan, TableScan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
+use sail_logical_plan::load_data::LoadDataNode;
 use sail_logical_plan::merge::{MergeCardinalityCheckNode, RowLevelWriteNode};
 use sail_physical_plan::merge_cardinality_check::MergeCardinalityCheckExec;
 
 use crate::logical::IcebergTableSource;
+use crate::physical::load_data_planner::plan_load_data;
 use crate::physical::row_level_planner::plan_iceberg_row_level_write;
 use crate::table_format::{IcebergWriteNode, plan_iceberg_write};
 
@@ -41,6 +43,10 @@ impl ExtensionPlanner for IcebergPhysicalPlanner {
             return plan_iceberg_write(session_state, logical_input, physical_input.clone(), node)
                 .await
                 .map(Some);
+        }
+
+        if let Some(node) = node.as_any().downcast_ref::<LoadDataNode>() {
+            return plan_load_data(session_state, node).await.map(Some);
         }
 
         if let Some(node) = node.as_any().downcast_ref::<MergeCardinalityCheckNode>() {

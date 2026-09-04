@@ -254,6 +254,9 @@ impl ExecutionPlan for IcebergEqualityDeleteWriterExec {
                 lakehouse_table,
                 schema: None,
                 partition_spec: None,
+                touched_file_paths: vec![],
+                overwrite_predicate: None,
+                overwrite_partition_values: None,
             };
 
             let schema = iceberg_action_schema()?;

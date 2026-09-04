@@ -136,3 +136,46 @@ fn aggregate_from_parquet_metadata(
         split_offsets,
     ))
 }
+
+pub(crate) fn aggregate_from_parquet_metadata_with_field_map(
+    parquet_meta: &parquet::file::metadata::ParquetMetaData,
+    field_id_map: &std::collections::HashMap<String, i32>,
+) -> Result<AggregatedMetadata, String> {
+    let row_groups = parquet_meta.row_groups();
+
+    let mut col_sizes: HashMap<i32, u64> = HashMap::new();
+    let mut val_counts: HashMap<i32, u64> = HashMap::new();
+    let mut null_counts: HashMap<i32, u64> = HashMap::new();
+    let lower_bounds: HashMap<i32, Datum> = HashMap::new();
+    let upper_bounds: HashMap<i32, Datum> = HashMap::new();
+    let mut split_offsets: Vec<i64> = Vec::new();
+
+    for rg in row_groups {
+        if let Some(off) = rg.file_offset() {
+            split_offsets.push(off);
+        }
+        for c in rg.columns() {
+            let col_path = c.column_descr().path().string();
+            let col_name = col_path.split('.').last().unwrap_or(&col_path).to_string();
+            let Some(&iceberg_field_id) = field_id_map.get(&col_name) else {
+                continue;
+            };
+            *col_sizes.entry(iceberg_field_id).or_insert(0) += c.compressed_size() as u64;
+            *val_counts.entry(iceberg_field_id).or_insert(0) += c.num_values() as u64;
+            if let Some(stats) = c.statistics() {
+                if let Some(n) = stats.null_count_opt() {
+                    *null_counts.entry(iceberg_field_id).or_insert(0) += n;
+                }
+            }
+        }
+    }
+
+    Ok((
+        col_sizes,
+        val_counts,
+        null_counts,
+        lower_bounds,
+        upper_bounds,
+        split_offsets,
+    ))
+}

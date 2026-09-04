@@ -1,3 +1,15 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
@@ -39,21 +51,23 @@ pub struct CommitMeta {
     pub lakehouse_table: Option<LakehouseExecutionContext>,
     pub schema: Option<IcebergSchema>,
     pub partition_spec: Option<PartitionSpec>,
+    pub touched_file_paths: Vec<String>,
+    pub overwrite_predicate: Option<String>,
+    pub overwrite_partition_values: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitMetaAction {
     pub table_uri: String,
     pub row_count: u64,
-    /// Requirements are relatively small but hard to trace into Arrow schema; keep as JSON.
     pub requirements_json: String,
-    /// Table properties are applied only when bootstrapping new table metadata.
     pub table_properties_json: String,
     pub lakehouse_table_json: Option<String>,
-    /// Optional Iceberg Schema JSON (rare) to avoid huge Arrow schema.
     pub schema_json: Option<String>,
-    /// Optional PartitionSpec JSON (rare) to avoid huge Arrow schema.
     pub partition_spec_json: Option<String>,
+    pub touched_file_paths_json: Option<String>,
+    pub overwrite_predicate_json: Option<String>,
+    pub overwrite_partition_values_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -438,6 +452,14 @@ pub fn encode_commit_meta(meta: CommitMeta) -> Result<RecordBatch> {
         .map(serde_json::to_string)
         .transpose()
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let touched_file_paths_json = if meta.touched_file_paths.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&meta.touched_file_paths)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?,
+        )
+    };
 
     let rows = vec![ActionRow {
         action: ExecAction::CommitMeta(CommitMetaAction {
@@ -448,6 +470,9 @@ pub fn encode_commit_meta(meta: CommitMeta) -> Result<RecordBatch> {
             lakehouse_table_json,
             schema_json,
             partition_spec_json,
+            touched_file_paths_json,
+            overwrite_predicate_json: meta.overwrite_predicate,
+            overwrite_partition_values_json: meta.overwrite_partition_values,
         }),
     }];
     encode_actions(rows)
@@ -492,6 +517,13 @@ pub fn decode_actions_and_meta_from_batch(
                     .map(serde_json::from_str::<PartitionSpec>)
                     .transpose()
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let touched_file_paths: Vec<String> = m
+                    .touched_file_paths_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
+                    .unwrap_or_default();
                 meta = Some(CommitMeta {
                     table_uri: m.table_uri,
                     row_count: m.row_count,
@@ -500,6 +532,9 @@ pub fn decode_actions_and_meta_from_batch(
                     lakehouse_table,
                     schema,
                     partition_spec,
+                    touched_file_paths,
+                    overwrite_predicate: m.overwrite_predicate_json,
+                    overwrite_partition_values: m.overwrite_partition_values_json,
                 });
             }
         }
@@ -551,6 +586,9 @@ mod tests {
             lakehouse_table: None,
             schema: None,
             partition_spec: None,
+            touched_file_paths: vec![],
+            overwrite_predicate: None,
+            overwrite_partition_values: None,
         };
 
         let schema = iceberg_action_schema()?;
