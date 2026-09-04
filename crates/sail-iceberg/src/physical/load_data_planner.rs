@@ -167,6 +167,12 @@ pub async fn plan_load_data(
     for (format, files) in group_by_format(&fallback_files) {
         let scan =
             build_fallback_scan(session_state, &files, format.as_str(), &table_arrow_schema)?;
+        // Colocate partition values like the canonical write path so each
+        // writer task owns a stable slice of partitions.
+        let scan = crate::physical_plan::plan_builder::repartition_for_iceberg_write(
+            scan,
+            &partition_columns,
+        )?;
 
         let writer: Arc<dyn ExecutionPlan> = Arc::new(IcebergWriterExec::new(
             scan,
@@ -192,24 +198,32 @@ pub async fn plan_load_data(
 }
 
 fn group_by_format(files: &[(String, u64)]) -> Vec<(String, Vec<(String, u64)>)> {
-    let mut groups: std::collections::HashMap<String, Vec<(String, u64)>> =
-        std::collections::HashMap::new();
+    // Group by (extension, compression): a FileScanConfig carries a single
+    // compression type, so mixed-compression directories need separate scans.
+    let mut groups: std::collections::HashMap<
+        (String, CompressionTypeVariant),
+        Vec<(String, u64)>,
+    > = std::collections::HashMap::new();
     for (f, size) in files {
-        let ext = if f.ends_with(".csv") {
+        let lower = f.to_ascii_lowercase();
+        let ext = if lower.ends_with(".csv") {
             "csv"
-        } else if f.ends_with(".json") || f.ends_with(".jsonl") {
+        } else if lower.ends_with(".json") || lower.ends_with(".jsonl") {
             "json"
-        } else if f.ends_with(".parquet") {
+        } else if lower.ends_with(".parquet") {
             "parquet"
         } else {
             "csv"
         };
         groups
-            .entry(ext.to_string())
+            .entry((ext.to_string(), infer_source_compression(f)))
             .or_default()
             .push((f.clone(), *size));
     }
-    groups.into_iter().collect()
+    groups
+        .into_iter()
+        .map(|((ext, _), files)| (ext, files))
+        .collect()
 }
 
 fn build_fallback_scan(
@@ -236,13 +250,15 @@ fn build_fallback_scan(
 
     let source: Arc<dyn FileSource> = match format {
         "csv" => {
+            // Sail's CsvSource: projected decoding, lossy UTF-8, byte-range
+            // splitting, and projection pushdown over the stock source.
+            // Header default follows the session catalog config.
+            let has_header = session_state.config_options().catalog.has_header;
             let csv_options =
-                datafusion_common::config::CsvOptions::default().with_has_header(true);
+                datafusion_common::config::CsvOptions::default().with_has_header(has_header);
             Arc::new(
-                datafusion::datasource::physical_plan::CsvSource::new(Arc::new(
-                    table_schema.clone(),
-                ))
-                .with_csv_options(csv_options),
+                sail_data_source::formats::csv::CsvSource::new(Arc::new(table_schema.clone()))
+                    .with_csv_options(csv_options),
             )
         }
         "json" => Arc::new(datafusion::datasource::physical_plan::JsonSource::new(

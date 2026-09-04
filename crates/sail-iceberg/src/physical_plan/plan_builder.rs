@@ -91,39 +91,7 @@ impl<'a> IcebergPlanBuilder<'a> {
         &self,
         input: Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let repartitioning = if self.table_config.partition_columns.is_empty() {
-            Partitioning::RoundRobinBatch(4)
-        } else {
-            let schema = input.schema();
-            let mut seen = std::collections::HashSet::new();
-            let partition_source_columns = self
-                .table_config
-                .partition_columns
-                .iter()
-                .filter_map(|field| {
-                    if seen.insert(field.column.clone()) {
-                        Some(field.column.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            let exprs: Vec<Arc<dyn PhysicalExpr>> = partition_source_columns
-                .iter()
-                .map(|name| {
-                    let idx = schema.index_of(name).map_err(|_| {
-                        datafusion::common::DataFusionError::Plan(format!(
-                            "Partition column '{}' not found in schema",
-                            name
-                        ))
-                    })?;
-                    Ok(Arc::new(Column::new(name, idx)) as Arc<dyn PhysicalExpr>)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Partitioning::Hash(exprs, 4)
-        };
-
-        Ok(Arc::new(RepartitionExec::try_new(input, repartitioning)?))
+        repartition_for_iceberg_write(input, &self.table_config.partition_columns)
     }
 
     fn add_sort_node(&self, input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
@@ -167,4 +135,44 @@ impl<'a> IcebergPlanBuilder<'a> {
             ),
         ))
     }
+}
+
+/// Repartition write input the way all Iceberg write paths do: round-robin
+/// for unpartitioned tables, hash on the (deduped) partition columns
+/// otherwise, so each writer task owns a stable slice of partitions.
+pub(crate) fn repartition_for_iceberg_write(
+    input: Arc<dyn ExecutionPlan>,
+    partition_columns: &[CatalogPartitionField],
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let repartitioning = if partition_columns.is_empty() {
+        Partitioning::RoundRobinBatch(4)
+    } else {
+        let schema = input.schema();
+        let mut seen = std::collections::HashSet::new();
+        let partition_source_columns = partition_columns
+            .iter()
+            .filter_map(|field| {
+                if seen.insert(field.column.clone()) {
+                    Some(field.column.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let exprs: Vec<Arc<dyn PhysicalExpr>> = partition_source_columns
+            .iter()
+            .map(|name| {
+                let idx = schema.index_of(name).map_err(|_| {
+                    datafusion::common::DataFusionError::Plan(format!(
+                        "Partition column '{}' not found in schema",
+                        name
+                    ))
+                })?;
+                Ok(Arc::new(Column::new(name, idx)) as Arc<dyn PhysicalExpr>)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Partitioning::Hash(exprs, 4)
+    };
+
+    Ok(Arc::new(RepartitionExec::try_new(input, repartitioning)?))
 }

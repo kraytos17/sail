@@ -56,7 +56,7 @@ pub(crate) async fn classify_source_files(
     let tasks = fast_paths.into_iter().map(|(key, url, size)| {
         let store = Arc::clone(&object_store);
         async move {
-            let footer = read_parquet_footer(&store, &key).await;
+            let footer = read_parquet_footer(&store, &key, size).await;
             (key, url, size, footer)
         }
     });

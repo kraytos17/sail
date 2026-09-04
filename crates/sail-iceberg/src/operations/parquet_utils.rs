@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::ObjectStore;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use parquet::file::metadata::ParquetMetaData;
 
@@ -15,13 +15,9 @@ pub(crate) struct ParquetFooterInfo {
 pub(crate) async fn read_parquet_footer(
     store: &Arc<dyn ObjectStore>,
     path: &str,
+    file_size: u64,
 ) -> Result<ParquetFooterInfo, String> {
     let file_path = object_store::path::Path::from(path);
-    let file_meta = store
-        .head(&file_path)
-        .await
-        .map_err(|e| format!("failed to head parquet file {path}: {e}"))?;
-    let file_size = file_meta.size as u64;
 
     let reader =
         ParquetObjectReader::new(Arc::clone(store), file_path.clone()).with_file_size(file_size);
