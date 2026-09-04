@@ -71,6 +71,7 @@ message ExtendedPhysicalPlanNode {
     IcebergMergeMetadataExecNode iceberg_merge_metadata = 56;
     IcebergEqualityDeleteWriterExecNode iceberg_equality_delete_writer = 57;
     PartitionedTopKExecNode partitioned_top_k = 58;
+    IcebergLoadDataFastExecNode iceberg_load_data_fast = 59;
   }
 }
 
@@ -1062,6 +1063,18 @@ message IcebergEqualityDeleteWriterExecNode {
   optional string write_folder_storage_path = 5;
   string lakehouse_table_json = 6;
   string write_context_json = 7;
+}
+
+message IcebergLoadDataFastExecNode {
+  // Pre-built Iceberg data files (from parquet footers), serialized as JSON.
+  string data_files_json = 1;
+  string table_url = 2;
+  // Iceberg table requirements, serialized as JSON.
+  string requirements_json = 3;
+  // Table properties as JSON array of [key, value] pairs.
+  string table_properties_json = 4;
+  // Iceberg lakehouse execution context, serialized as JSON (empty = None).
+  string lakehouse_table_json = 5;
 }
 
 message DeltaLogReplayHashInputs {
