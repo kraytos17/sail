@@ -291,6 +291,28 @@ pub struct DeleteInfo {
     pub options: Vec<OptionLayer>,
 }
 
+/// Information required to create a logical UPDATE plan for a table format.
+#[derive(Debug, Clone)]
+pub struct UpdateInfo {
+    pub table_name: Vec<String>,
+    pub path: String,
+    /// Resolved logical target table scan (real column names, not opaque field IDs).
+    pub target: Arc<LogicalPlan>,
+    pub condition: Option<ExprWithSource>,
+    pub assignments: Vec<UpdateAssignment>,
+    pub lakehouse_table: Option<LakehouseExecutionContext>,
+    pub options: Vec<OptionLayer>,
+}
+
+/// A single SET assignment in an UPDATE statement.
+#[derive(Debug, Clone)]
+pub struct UpdateAssignment {
+    /// The column path (single-element for now; nested paths are a future extension).
+    pub column_path: Vec<String>,
+    /// The resolved expression for the new value.
+    pub expression: Expr,
+}
+
 /// Information required to create a logical MERGE plan for a table format.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct MergeInfo {
@@ -521,6 +543,12 @@ pub trait TableFormat: Send + Sync {
     async fn create_deleter(&self, ctx: &dyn Session, info: DeleteInfo) -> Result<LogicalPlan> {
         let _ = (ctx, info);
         not_impl_err!("DELETE is not yet implemented for {} format", self.name())
+    }
+
+    /// Creates a logical plan for UPDATE.
+    async fn create_updater(&self, ctx: &dyn Session, info: UpdateInfo) -> Result<LogicalPlan> {
+        let _ = (ctx, info);
+        not_impl_err!("UPDATE is not yet implemented for {} format", self.name())
     }
 
     /// Creates a logical plan for MERGE.

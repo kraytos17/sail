@@ -22,6 +22,7 @@ use datafusion_expr::{
 };
 use educe::Educe;
 use log::trace;
+use sail_common_datafusion::datasource::UpdateInfo;
 use sail_common_datafusion::logical_expr::ExprWithSource;
 use sail_common_datafusion::utils::items::ItemTaker;
 use sail_function::scalar::misc::raise_error::RaiseError;
@@ -243,6 +244,42 @@ impl RowLevelWriteNode {
         }
     }
 
+    /// Create an UPDATE write node carrying the write plan, touched files plan,
+    /// and condition for the physical planner.
+    pub fn new_update(
+        raw_target: Arc<LogicalPlan>,
+        raw_input_schema: DFSchemaRef,
+        write_plan: Arc<LogicalPlan>,
+        touched_files_plan: Arc<LogicalPlan>,
+        condition: Option<ExprWithSource>,
+        format: String,
+        location: String,
+        table_name: Vec<String>,
+        options: Vec<OptionLayer>,
+        lakehouse_table: Option<LakehouseExecutionContext>,
+    ) -> Self {
+        Self {
+            command: RowLevelCommand::Update,
+            raw_target,
+            raw_source: None,
+            raw_input_schema,
+            write_plan: Some(write_plan),
+            touched_files_plan: Some(touched_files_plan),
+            row_index_delete_plan: None,
+            condition,
+            merge_options: None,
+            target_format: format,
+            target_location: location,
+            target_table_name: table_name,
+            target_partition_by: Vec::new(),
+            target_options: options,
+            target_lakehouse_table: lakehouse_table,
+            expected_snapshot_id: None,
+            with_schema_evolution: false,
+            schema: Arc::new(DFSchema::empty()),
+        }
+    }
+
     pub fn command(&self) -> RowLevelCommand {
         self.command
     }
@@ -438,6 +475,14 @@ pub struct MergeExpansion {
     pub row_index_delete_plan: Option<LogicalPlan>,
     pub output_schema: DFSchemaRef,
     pub options: MergeIntoOptions,
+}
+
+/// Result of expanding an UPDATE into a write plan and touched-files plan.
+#[derive(Debug, Clone)]
+pub struct UpdateExpansion {
+    pub write_plan: LogicalPlan,
+    pub touched_files_plan: LogicalPlan,
+    pub output_schema: DFSchemaRef,
 }
 
 fn merge_name_key(name: &str, case_sensitive: bool) -> String {
@@ -912,6 +957,82 @@ pub fn expand_merge(
         row_index_column,
         row_delete_metadata_columns,
     )
+}
+
+/// Expand an UPDATE into a write plan and touched-files plan.
+///
+/// For each column in the target:
+/// - If there is an assignment AND a condition: `CASE WHEN condition THEN new_value ELSE current END`
+/// - If there is an assignment but no condition: the assignment value directly
+/// - If no assignment: keep the current value
+///
+/// The `path_column` (`__sail_file_path`) is appended to the projections so the physical
+/// planner can identify which file each row came from for targeted rewrite.
+pub fn expand_update(info: UpdateInfo, path_column: &str) -> Result<UpdateExpansion> {
+    use datafusion_expr::when;
+
+    let target_plan = info.target.as_ref().clone();
+    let target_schema = target_plan.schema();
+
+    // Build a map from column_path[0] -> expression for quick lookup.
+    let assignment_map: HashMap<String, Expr> = info
+        .assignments
+        .iter()
+        .filter_map(|a| {
+            a.column_path
+                .first()
+                .map(|col| (col.clone(), a.expression.clone()))
+        })
+        .collect();
+
+    let mut projections: Vec<Expr> = Vec::new();
+
+    for field in target_schema.fields() {
+        let col_name = field.name().clone();
+        if col_name == path_column {
+            // Keep the path column as-is.
+            projections.push(Expr::Column(Column::new_unqualified(&col_name)));
+            continue;
+        }
+
+        if let Some(assign_expr) = assignment_map.get(&col_name) {
+            let current = Expr::Column(Column::new_unqualified(&col_name));
+            if let Some(ref condition) = info.condition {
+                // CASE WHEN condition THEN new_value ELSE current_value END
+                projections
+                    .push(when(condition.expr.clone(), assign_expr.clone()).otherwise(current)?);
+            } else {
+                // No condition: use assignment value directly.
+                projections.push(assign_expr.clone());
+            }
+        } else {
+            // No assignment for this column: keep current value.
+            projections.push(Expr::Column(Column::new_unqualified(&col_name)));
+        }
+    }
+
+    let write_plan = LogicalPlanBuilder::from(target_plan.clone())
+        .project(projections)?
+        .build()?;
+
+    // Touched files plan: filter by condition, project the path column.
+    let touched_files_plan = match &info.condition {
+        Some(cond) => LogicalPlanBuilder::from(target_plan)
+            .filter(cond.expr.clone())?
+            .project(vec![Expr::Column(Column::new_unqualified(path_column))])?
+            .build()?,
+        None => LogicalPlanBuilder::from(target_plan)
+            .project(vec![Expr::Column(Column::new_unqualified(path_column))])?
+            .build()?,
+    };
+
+    let output_schema = Arc::new(DFSchema::empty());
+
+    Ok(UpdateExpansion {
+        write_plan,
+        touched_files_plan,
+        output_schema,
+    })
 }
 
 /// Default MERGE expansion: full outer join + presence columns + touched files.

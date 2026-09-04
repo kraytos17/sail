@@ -220,6 +220,14 @@ impl TableFormat for IcebergTableFormat {
         crate::logical::merge::expand_merge_node(info)
     }
 
+    async fn create_updater(
+        &self,
+        _ctx: &dyn Session,
+        info: sail_common_datafusion::datasource::UpdateInfo,
+    ) -> Result<LogicalPlan> {
+        crate::logical::update::expand_update_node(info)
+    }
+
     async fn create_table_metadata(
         &self,
         runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
