@@ -640,7 +640,7 @@ pub enum CacheType {
     Session,
 }
 
-fn default_catalog_cache_type() -> CacheType {
+const fn default_catalog_cache_type() -> CacheType {
     CacheType::None
 }
 

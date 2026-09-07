@@ -1,4 +1,81 @@
+use std::fmt;
+
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+
+/// Request payload for a catalog-coordinated lakehouse metadata commit.
+///
+/// Requirements and updates are serialized table-protocol values (e.g. Iceberg
+/// REST `TableRequirement` / `TableUpdate` JSON); the commit client forwards
+/// them opaquely so this crate stays free of catalog-provider dependencies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LakehouseCommitClientRequest {
+    pub context: LakehouseExecutionContext,
+    pub format: String,
+    pub requirements: Vec<serde_json::Value>,
+    pub updates: Vec<serde_json::Value>,
+    pub payload: Option<serde_json::Value>,
+}
+
+/// Outcome of a catalog-coordinated lakehouse metadata commit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum LakehouseCommitClientOutcome {
+    Committed {
+        context: LakehouseExecutionContext,
+        payload: Option<serde_json::Value>,
+    },
+    Noop {
+        context: LakehouseExecutionContext,
+    },
+    RetryableConflict {
+        message: String,
+    },
+    StateUnknown {
+        message: String,
+    },
+    Rejected {
+        message: String,
+    },
+}
+
+/// Failure modes of a catalog-coordinated lakehouse metadata commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LakehouseCommitClientError {
+    /// The catalog does not support commits for this table.
+    NotSupported(String),
+    /// The commit conflicted with a concurrent writer (safe to retry).
+    Conflict(String),
+    /// The commit may have succeeded but its outcome is unknown (do not retry blindly).
+    StateUnknown(String),
+    /// Any other commit failure.
+    Failed(String),
+}
+
+impl fmt::Display for LakehouseCommitClientError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotSupported(message) => write!(f, "lakehouse commit not supported: {message}"),
+            Self::Conflict(message) => write!(f, "lakehouse commit conflict: {message}"),
+            Self::StateUnknown(message) => write!(f, "lakehouse commit state unknown: {message}"),
+            Self::Failed(message) => write!(f, "lakehouse commit failed: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for LakehouseCommitClientError {}
+
+/// Catalog commit capability for table-format operations that cannot reach the
+/// catalog manager directly (e.g. `TableFormat::call_procedure`, which only
+/// receives a runtime env). Implemented by the catalog layer and threaded
+/// through as a trait object so format crates stay decoupled from providers.
+#[async_trait]
+pub trait LakehouseCommitClient: Send + Sync {
+    async fn commit_lakehouse_table(
+        &self,
+        table: &[String],
+        request: LakehouseCommitClientRequest,
+    ) -> Result<LakehouseCommitClientOutcome, LakehouseCommitClientError>;
+}
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Serialize, Deserialize)]
 pub struct CatalogProviderId(pub String);

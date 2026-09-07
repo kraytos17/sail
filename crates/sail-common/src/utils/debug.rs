@@ -8,7 +8,7 @@ pub struct DebugBinary<'a> {
 }
 
 impl<'a> DebugBinary<'a> {
-    pub fn from(data: &'a [u8]) -> Self {
+    pub const fn from(data: &'a [u8]) -> Self {
         Self { data }
     }
 }

@@ -78,7 +78,7 @@ pub struct ConfigDefinition<'a> {
 }
 
 impl<'a> ConfigDefinition<'a> {
-    pub fn new(raw: &'a str) -> Self {
+    pub const fn new(raw: &'a str) -> Self {
         Self {
             raw,
             profile: Profile::Default,

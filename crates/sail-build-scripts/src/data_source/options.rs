@@ -1,17 +1,15 @@
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
-use lazy_static::lazy_static;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use regex::Regex;
 use serde::Deserialize;
 
-lazy_static! {
-    static ref KEY_PATTERN: Regex = {
-        #[expect(clippy::unwrap_used)]
-        Regex::new(r"^[a-z][a-z0-9_]*$").unwrap()
-    };
-}
+static KEY_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    #[expect(clippy::unwrap_used)]
+    Regex::new(r"^[a-z][a-z0-9_]*$").unwrap()
+});
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,7 +47,7 @@ enum OptionScope {
 }
 
 impl OptionScope {
-    fn name(&self) -> &'static str {
+    const fn name(&self) -> &'static str {
         match self {
             OptionScope::Read => "Read",
             OptionScope::Write => "Write",

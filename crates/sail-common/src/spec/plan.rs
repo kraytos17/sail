@@ -45,7 +45,7 @@ pub struct QueryPlan {
 }
 
 impl QueryPlan {
-    pub fn new(node: QueryNode) -> Self {
+    pub const fn new(node: QueryNode) -> Self {
         Self {
             node,
             plan_id: None,
@@ -62,7 +62,7 @@ pub struct CommandPlan {
 }
 
 impl CommandPlan {
-    pub fn new(node: CommandNode) -> Self {
+    pub const fn new(node: CommandNode) -> Self {
         Self {
             node,
             plan_id: None,
@@ -934,15 +934,15 @@ pub enum CreateTableMode {
 }
 
 impl CreateTableMode {
-    pub fn ignore_if_exists(self) -> bool {
+    pub const fn ignore_if_exists(self) -> bool {
         matches!(self, Self::CreateIfNotExists)
     }
 
-    pub fn is_replace(self) -> bool {
+    pub const fn is_replace(self) -> bool {
         matches!(self, Self::CreateOrReplace | Self::Replace)
     }
 
-    pub fn replace_requires_existing(self) -> bool {
+    pub const fn replace_requires_existing(self) -> bool {
         matches!(self, Self::Replace)
     }
 }

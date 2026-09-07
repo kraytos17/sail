@@ -9,7 +9,7 @@ use datafusion_expr::{Expr, JoinType, LogicalPlan, LogicalPlanBuilder};
 pub struct DecorrelateLateralProjection;
 
 impl DecorrelateLateralProjection {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }

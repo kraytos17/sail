@@ -887,7 +887,7 @@ fn generate_transparent_display_impl(
     })
 }
 
-fn rust_type_is_displayable(rust_type: &RustType) -> bool {
+const fn rust_type_is_displayable(rust_type: &RustType) -> bool {
     match rust_type {
         RustType::Bool
         | RustType::I32

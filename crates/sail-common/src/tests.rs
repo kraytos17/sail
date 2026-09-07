@@ -5,13 +5,13 @@ use serde::{Deserialize, Serialize};
 
 pub const UPDATE_GOLD_DATA_ENV_VAR: &str = "SAIL_UPDATE_GOLD_DATA";
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TestData<S, T> {
     tests: Vec<TestCase<S, T>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TestCase<S, T> {
     input: S,
@@ -20,20 +20,20 @@ pub struct TestCase<S, T> {
     output: Option<TestOutput<T>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub enum TestOutput<T> {
     Success(T),
     Failure(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InputOnlyTestData<S> {
     tests: Vec<InputOnlyTestCase<S>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InputOnlyTestCase<S> {
     input: S,

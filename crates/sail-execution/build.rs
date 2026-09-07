@@ -11,7 +11,7 @@ struct ProtoBuilder<'a> {
 }
 
 impl<'a> ProtoBuilder<'a> {
-    fn new(package: &'a str, files: &'a [&'a str]) -> Self {
+    const fn new(package: &'a str, files: &'a [&'a str]) -> Self {
         Self {
             package,
             files,
@@ -21,17 +21,17 @@ impl<'a> ProtoBuilder<'a> {
         }
     }
 
-    fn skip_debug(mut self, skip_debug: &'a [&'a str]) -> Self {
+    const fn skip_debug(mut self, skip_debug: &'a [&'a str]) -> Self {
         self.skip_debug = Some(skip_debug);
         self
     }
 
-    fn boxed_fields(mut self, boxed_fields: &'a [&'a str]) -> Self {
+    const fn boxed_fields(mut self, boxed_fields: &'a [&'a str]) -> Self {
         self.boxed_fields = boxed_fields;
         self
     }
 
-    fn with_service(mut self) -> Self {
+    const fn with_service(mut self) -> Self {
         self.with_service = true;
         self
     }

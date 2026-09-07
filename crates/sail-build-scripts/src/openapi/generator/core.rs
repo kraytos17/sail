@@ -35,7 +35,7 @@ pub(super) struct OpenApiGenerator<'a> {
 }
 
 impl<'a> OpenApiGenerator<'a> {
-    pub(super) fn new(openapi: &'a OpenApi, config: OpenApiConfig) -> Self {
+    pub(super) const fn new(openapi: &'a OpenApi, config: OpenApiConfig) -> Self {
         Self { openapi, config }
     }
 

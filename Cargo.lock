@@ -7195,7 +7195,6 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 name = "sail-build-scripts"
 version = "0.7.1"
 dependencies = [
- "lazy_static",
  "prettyplease",
  "proc-macro2",
  "quote",
@@ -7449,7 +7448,6 @@ dependencies = [
  "datafusion-expr",
  "either",
  "futures",
- "lazy_static",
  "lexical-core",
  "parquet-variant",
  "parquet-variant-compute",

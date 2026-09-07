@@ -3,7 +3,9 @@ use std::sync::Arc;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use sail_common_datafusion::array::serde::ArrowSerializer;
-use sail_common_datafusion::catalog::{CommitAuthority, FunctionStatus, LakehouseOperation};
+use sail_common_datafusion::catalog::{
+    CommitAuthority, FunctionStatus, LakehouseCommitClient, LakehouseOperation,
+};
 use sail_common_datafusion::datasource::{
     TableFormatAlterTableOperation, TableFormatCreateTableColumn, TableFormatCreateTableInfo,
     TableFormatProcedureOperation, TableFormatRegistry, is_lakehouse_format,
@@ -634,7 +636,13 @@ impl CatalogCommand {
                     .execution;
                 let operation = table_format_procedure_operation(&procedure);
                 table_format
-                    .call_procedure(runtime, &location, operation, Some(lakehouse_table))
+                    .call_procedure(
+                        runtime,
+                        &location,
+                        operation,
+                        Some(lakehouse_table),
+                        Some(manager as &dyn LakehouseCommitClient),
+                    )
                     .await
                     .map_err(|e| CatalogError::External(e.to_string()))?
             }

@@ -7,7 +7,6 @@ edition = { workspace = true }
 workspace = true
 
 [dependencies]
-lazy_static = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }

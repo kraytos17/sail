@@ -56,7 +56,7 @@ impl<T: Actor> ActorContext<T> {
         }
     }
 
-    pub fn handle(&self) -> &ActorHandle<T> {
+    pub const fn handle(&self) -> &ActorHandle<T> {
         &self.handle
     }
 
@@ -88,7 +88,7 @@ impl<T: Actor> ActorContext<T> {
     }
 
     /// Return the system that owns the children of this actor.
-    pub fn children_mut(&mut self) -> &mut ActorSystem {
+    pub const fn children_mut(&mut self) -> &mut ActorSystem {
         &mut self.children
     }
 

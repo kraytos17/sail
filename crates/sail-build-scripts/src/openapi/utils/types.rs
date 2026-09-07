@@ -24,7 +24,7 @@ pub enum RustType {
 }
 
 impl RustType {
-    pub fn is_unit(&self) -> bool {
+    pub const fn is_unit(&self) -> bool {
         matches!(self, Self::Unit)
     }
 
@@ -36,11 +36,11 @@ impl RustType {
         }
     }
 
-    pub fn is_vec(&self) -> bool {
+    pub const fn is_vec(&self) -> bool {
         matches!(self, Self::Vec(_))
     }
 
-    pub fn is_option(&self) -> bool {
+    pub const fn is_option(&self) -> bool {
         matches!(self, Self::Option(_))
     }
 }

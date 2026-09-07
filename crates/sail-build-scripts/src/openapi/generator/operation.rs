@@ -677,7 +677,7 @@ enum ParameterKind {
 }
 
 impl ParameterKind {
-    fn required(&self) -> bool {
+    const fn required(&self) -> bool {
         match self {
             Self::Path { required }
             | Self::Query { required, .. }

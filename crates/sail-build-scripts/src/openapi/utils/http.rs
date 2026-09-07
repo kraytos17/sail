@@ -13,7 +13,7 @@ pub enum HttpMethod {
 }
 
 impl HttpMethod {
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Get => "GET",
             Self::Put => "PUT",
@@ -56,7 +56,7 @@ impl HttpStatus {
         )))
     }
 
-    pub fn range(self) -> Option<(u16, u16)> {
+    pub const fn range(self) -> Option<(u16, u16)> {
         match self {
             Self::ClientError => Some((400, 499)),
             Self::ServerError => Some((500, 599)),

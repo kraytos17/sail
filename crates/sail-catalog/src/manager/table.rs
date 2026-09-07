@@ -1,4 +1,8 @@
-use sail_common_datafusion::catalog::TableStatus;
+use async_trait::async_trait;
+use sail_common_datafusion::catalog::{
+    LakehouseCommitClient, LakehouseCommitClientError, LakehouseCommitClientOutcome,
+    LakehouseCommitClientRequest, TableStatus,
+};
 
 use crate::error::{CatalogError, CatalogObject, CatalogResult};
 use crate::lakehouse::{
@@ -226,5 +230,58 @@ impl CatalogManager {
             )),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// Adapts [`CatalogManager`] to the format-crate commit interface so table
+/// formats can issue catalog-coordinated commits without depending on this
+/// crate (which would be a dependency cycle).
+#[async_trait]
+impl LakehouseCommitClient for CatalogManager {
+    async fn commit_lakehouse_table(
+        &self,
+        table: &[String],
+        request: LakehouseCommitClientRequest,
+    ) -> Result<LakehouseCommitClientOutcome, LakehouseCommitClientError> {
+        let outcome = self
+            .commit_lakehouse_table(
+                table,
+                LakehouseCommitRequest {
+                    context: request.context,
+                    format: request.format,
+                    requirements: request.requirements,
+                    updates: request.updates,
+                    payload: request.payload,
+                },
+            )
+            .await
+            .map_err(|e| match e {
+                CatalogError::NotSupported(message)
+                | CatalogError::UnsupportedCapability(message) => {
+                    LakehouseCommitClientError::NotSupported(message)
+                }
+                CatalogError::Conflict(message) => LakehouseCommitClientError::Conflict(message),
+                CatalogError::CommitStateUnknown(message) => {
+                    LakehouseCommitClientError::StateUnknown(message)
+                }
+                e => LakehouseCommitClientError::Failed(e.to_string()),
+            })?;
+        Ok(match outcome {
+            LakehouseCommitOutcome::Committed { context, payload } => {
+                LakehouseCommitClientOutcome::Committed { context, payload }
+            }
+            LakehouseCommitOutcome::Noop { context } => {
+                LakehouseCommitClientOutcome::Noop { context }
+            }
+            LakehouseCommitOutcome::RetryableConflict { message } => {
+                LakehouseCommitClientOutcome::RetryableConflict { message }
+            }
+            LakehouseCommitOutcome::StateUnknown { message } => {
+                LakehouseCommitClientOutcome::StateUnknown { message }
+            }
+            LakehouseCommitOutcome::Rejected { message } => {
+                LakehouseCommitClientOutcome::Rejected { message }
+            }
+        })
     }
 }

@@ -630,7 +630,7 @@ impl TryFrom<YearMonthIntervalField> for IntervalFieldType {
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Schema {
     pub fields: Fields,
 }

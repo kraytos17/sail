@@ -1,6 +1,6 @@
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
-use lazy_static::lazy_static;
 use quote::{format_ident, quote};
 use regex::Regex;
 use serde::Deserialize;
@@ -11,7 +11,7 @@ struct ProtoBuilder<'a> {
 }
 
 impl<'a> ProtoBuilder<'a> {
-    fn new(package: &'a str, files: &'a [&'a str]) -> Self {
+    const fn new(package: &'a str, files: &'a [&'a str]) -> Self {
         Self { package, files }
     }
 
@@ -32,13 +32,11 @@ impl<'a> ProtoBuilder<'a> {
     }
 }
 
-lazy_static! {
-    /// A restricted SQL identifier pattern for database, table, and column names.
-    static ref SQL_IDENTIFIER_PATTERN: Regex = {
-        #[expect(clippy::unwrap_used)]
-        Regex::new(r"^[a-z]+(_[a-z]+)*$").unwrap()
-    };
-}
+/// A restricted SQL identifier pattern for database, table, and column names.
+static SQL_IDENTIFIER_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    #[expect(clippy::unwrap_used)]
+    Regex::new(r"^[a-z]+(_[a-z]+)*$").unwrap()
+});
 
 /// Converts a SQL identifier in `snake_case` to a Rust type identifier in `PascalCase`.
 fn type_identifier(value: &str) -> String {

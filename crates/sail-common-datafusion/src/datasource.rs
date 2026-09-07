@@ -16,7 +16,7 @@ use datafusion_common::{Constraints, DFSchema, DFSchemaRef, Result, not_impl_err
 use datafusion_expr::expr::Sort;
 use datafusion_expr::{Expr, TableSource};
 
-use crate::catalog::{CatalogPartitionField, LakehouseExecutionContext};
+use crate::catalog::{CatalogPartitionField, LakehouseCommitClient, LakehouseExecutionContext};
 use crate::extension::SessionExtension;
 use crate::logical_expr::ExprWithSource;
 
@@ -646,14 +646,19 @@ pub trait TableFormat: Send + Sync {
     }
 
     /// Executes a catalog-managed table procedure (CALL).
+    ///
+    /// `commit_client` provides catalog-coordinated commits for tables whose
+    /// commit authority is not the filesystem (e.g. Iceberg REST). It is
+    /// `None` when the caller cannot provide catalog access.
     async fn call_procedure(
         &self,
         runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
         path: &str,
         operation: TableFormatProcedureOperation,
         lakehouse_table: Option<LakehouseExecutionContext>,
+        commit_client: Option<&dyn LakehouseCommitClient>,
     ) -> Result<RecordBatch> {
-        let _ = (runtime_env, path, operation, lakehouse_table);
+        let _ = (runtime_env, path, operation, lakehouse_table, commit_client);
         not_impl_err!(
             "CALL procedures are not supported for {} format",
             self.name()

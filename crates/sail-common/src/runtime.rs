@@ -50,15 +50,15 @@ pub struct RuntimeHandle {
 }
 
 impl RuntimeHandle {
-    pub fn new(primary: Handle, io: Handle) -> Self {
+    pub const fn new(primary: Handle, io: Handle) -> Self {
         Self { primary, io }
     }
 
-    pub fn primary(&self) -> &Handle {
+    pub const fn primary(&self) -> &Handle {
         &self.primary
     }
 
-    pub fn io(&self) -> &Handle {
+    pub const fn io(&self) -> &Handle {
         &self.io
     }
 }

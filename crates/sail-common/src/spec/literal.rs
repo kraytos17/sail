@@ -184,13 +184,13 @@ pub enum Literal {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntervalDayTime {
     pub days: i32,
     pub milliseconds: i32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntervalMonthDayNano {
     pub months: i32,
     pub days: i32,

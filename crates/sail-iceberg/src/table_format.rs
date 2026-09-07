@@ -31,8 +31,9 @@ use object_store::ObjectStoreExt;
 use sail_common_datafusion::catalog::iceberg::is_iceberg_table_marker;
 use sail_common_datafusion::catalog::managed::metadata_location_value;
 use sail_common_datafusion::catalog::{
-    CatalogPartitionField, CommitAuthority, LakehouseExecutionContext, LakehouseOperation,
-    ScanAuthority,
+    CatalogPartitionField, CommitAuthority, LakehouseCommitClient, LakehouseCommitClientError,
+    LakehouseCommitClientOutcome, LakehouseCommitClientRequest, LakehouseExecutionContext,
+    LakehouseOperation, ScanAuthority,
 };
 use sail_common_datafusion::datasource::{
     BucketBy, DeleteInfo, OptionLayer, PhysicalSinkMode, SinkInfo, SinkMode, SourceInfo,
@@ -370,6 +371,7 @@ impl TableFormat for IcebergTableFormat {
         path: &str,
         operation: sail_common_datafusion::datasource::TableFormatProcedureOperation,
         lakehouse_table: Option<LakehouseExecutionContext>,
+        commit_client: Option<&dyn LakehouseCommitClient>,
     ) -> Result<datafusion::arrow::array::RecordBatch> {
         use crate::operations::expire_snapshots_gc::expire_files_gc;
         use crate::operations::procedure::{
@@ -384,8 +386,26 @@ impl TableFormat for IcebergTableFormat {
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
 
-        // Catalog-managed commits need session-level catalog access, which `call_procedure`
-        // does not receive (only a runtime env); support the filesystem commit path.
+        // Catalog-coordinated commits (e.g. Iceberg REST) go through the
+        // commit client supplied by the catalog layer; the filesystem path
+        // below writes metadata files directly to object storage.
+        if let Some(context) = lakehouse_table.as_ref()
+            && matches!(
+                context.commit,
+                CommitAuthority::IcebergRestCommit | CommitAuthority::VersionedCatalogCommit
+            )
+            && let Some(client) = commit_client
+        {
+            return Self::call_procedure_via_catalog_commit(
+                client,
+                &object_store,
+                &store_ctx,
+                &table_url,
+                context,
+                &operation,
+            )
+            .await;
+        }
         if let Some(context) = &lakehouse_table
             && context.commit != CommitAuthority::Filesystem
         {
@@ -427,6 +447,125 @@ impl TableFormat for IcebergTableFormat {
                 let post_commit = TableMetadata::from_json(&bytes)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 let counts = expire_files_gc(&store_ctx, &pre_commit, &post_commit).await?;
+                Ok(crate::operations::procedure::CallProcedureOutput::ExpireSnapshots {
+                    deleted_data_files_count: counts.data_files as i64,
+                    deleted_position_delete_files_count: counts.position_delete_files as i64,
+                    deleted_equality_delete_files_count: counts.equality_delete_files as i64,
+                    deleted_manifest_files_count: counts.manifest_files as i64,
+                    deleted_manifest_lists_count: counts.manifest_lists as i64,
+                    deleted_statistics_files_count: counts.statistics_files as i64,
+                }
+                .to_record_batch()?)
+            }
+            _ => output.to_record_batch(),
+        }
+    }
+}
+
+impl IcebergTableFormat {
+    /// Executes a CALL procedure against a catalog-coordinated table by
+    /// committing metadata updates through the catalog instead of writing
+    /// metadata files directly. Retries on commit conflicts, mirroring the
+    /// filesystem path's [`Self::retry_metadata_commit`] behavior.
+    async fn call_procedure_via_catalog_commit(
+        client: &dyn LakehouseCommitClient,
+        object_store: &Arc<dyn object_store::ObjectStore>,
+        store_ctx: &StoreContext,
+        table_url: &Url,
+        lakehouse_table: &LakehouseExecutionContext,
+        operation: &sail_common_datafusion::datasource::TableFormatProcedureOperation,
+    ) -> Result<datafusion::arrow::array::RecordBatch> {
+        use crate::catalog_support::commit::catalog_requirements;
+        use crate::operations::expire_snapshots_gc::expire_files_gc;
+        use crate::operations::procedure::{
+            compute_procedure_output, compute_procedure_updates, procedure_requirements,
+        };
+
+        let mut attempt = 0;
+        let (pre_commit, output) = loop {
+            attempt += 1;
+            let latest_meta = find_latest_metadata_file(object_store, table_url).await?;
+            let bytes = load_metadata_file_bytes(object_store, &latest_meta).await?;
+            let pre_commit = TableMetadata::from_json(&bytes)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let updates = compute_procedure_updates(operation, &pre_commit)?;
+            let output = compute_procedure_output(operation, &pre_commit)?;
+            if updates.is_empty() {
+                // Nothing to commit (e.g. expire_snapshots with an empty expire set).
+                return output.to_record_batch();
+            }
+            let requirements =
+                catalog_requirements(&pre_commit, &procedure_requirements(&pre_commit), &[]);
+            let requirements = requirements
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let updates = updates
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            match client
+                .commit_lakehouse_table(
+                    lakehouse_table.catalog_table(),
+                    LakehouseCommitClientRequest {
+                        context: lakehouse_table.clone(),
+                        format: "iceberg".to_string(),
+                        requirements,
+                        updates,
+                        payload: None,
+                    },
+                )
+                .await
+            {
+                Err(LakehouseCommitClientError::Conflict(message))
+                | Ok(LakehouseCommitClientOutcome::RetryableConflict { message }) => {
+                    log::warn!(
+                        "Iceberg catalog commit conflict for CALL procedure on {}: {message}",
+                        lakehouse_table.catalog_table().join(".")
+                    );
+                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
+                        return Err(alter_table_properties_conflict_error());
+                    }
+                }
+                Err(LakehouseCommitClientError::NotSupported(message)) => {
+                    log::debug!("Iceberg catalog commit is not supported: {message}");
+                    return Err(DataFusionError::Execution(format!(
+                        "Iceberg catalog commit is not supported: {message}"
+                    )));
+                }
+                Err(LakehouseCommitClientError::StateUnknown(message))
+                | Ok(LakehouseCommitClientOutcome::StateUnknown { message }) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Iceberg catalog commit state is unknown: {message}"
+                    )));
+                }
+                Err(LakehouseCommitClientError::Failed(message)) => {
+                    return Err(DataFusionError::Execution(message));
+                }
+                Ok(
+                    LakehouseCommitClientOutcome::Committed { .. }
+                    | LakehouseCommitClientOutcome::Noop { .. },
+                ) => break (pre_commit, output),
+                Ok(LakehouseCommitClientOutcome::Rejected { message }) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Iceberg catalog commit was rejected: {message}"
+                    )));
+                }
+            }
+        };
+
+        match operation {
+            sail_common_datafusion::datasource::TableFormatProcedureOperation::ExpireSnapshots { .. } => {
+                let post_commit_meta =
+                    find_latest_metadata_file(object_store, table_url).await?;
+                let bytes = load_metadata_file_bytes(object_store, &post_commit_meta).await?;
+                let post_commit = TableMetadata::from_json(&bytes)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let counts = expire_files_gc(store_ctx, &pre_commit, &post_commit).await?;
                 Ok(crate::operations::procedure::CallProcedureOutput::ExpireSnapshots {
                     deleted_data_files_count: counts.data_files as i64,
                     deleted_position_delete_files_count: counts.position_delete_files as i64,
