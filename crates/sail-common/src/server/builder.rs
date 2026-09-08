@@ -28,7 +28,11 @@ impl Default for ServerBuilderOptions {
             nodelay: true,
             keepalive: Some(std::time::Duration::from_mins(1)),
             http2_keepalive_interval: Some(std::time::Duration::from_mins(1)),
-            http2_keepalive_timeout: Some(std::time::Duration::from_secs(10)),
+            // Time to wait for a keepalive ACK from the client before closing the
+            // connection.  Increased from 10 s to 60 s so that long-running queries
+            // (e.g. LOAD DATA streaming 10 GB from S3) don't get killed by the server
+            // while the client is busy processing data.
+            http2_keepalive_timeout: Some(std::time::Duration::from_secs(60)),
             http2_adaptive_window: Some(true),
         }
     }
