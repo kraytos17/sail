@@ -1013,34 +1013,3 @@
     If a read operation takes longer than this duration, a warning is logged suggesting
     faster I/O or subprocess isolation.
   experimental: true
-
-# ============================================================================
-# LOAD DATA Optimization
-# ============================================================================
-
-- key: execution.load_data.target_chunk_size
-  type: number
-  default: "268435456"
-  description: |
-    Target chunk size in bytes for splitting large files during LOAD DATA.
-    Files larger than this are split into multiple read operations to improve
-    parallelism and reduce memory pressure. Default is 256MB.
-  experimental: true
-
-- key: execution.load_data.read_buffer_size
-  type: number
-  default: "262144"
-  description: |
-    Read buffer size in bytes for CSV parsing during LOAD DATA.
-    Larger buffers improve throughput for sequential I/O by reducing syscall
-    overhead and improving CPU cache utilization. Default is 256KB.
-  experimental: true
-
-- key: execution.load_data.max_concurrent_files
-  type: number
-  default: "64"
-  description: |
-    Maximum number of concurrent file reads during LOAD DATA.
-    Higher values improve throughput but increase memory usage and S3 connection count.
-    Should be at least 2x the target_partitions for optimal performance.
-  experimental: true
