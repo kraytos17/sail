@@ -129,6 +129,12 @@ pub async fn get_s3_object_store(url: &Url) -> object_store::Result<AmazonS3> {
         .with_config(
             AmazonS3ConfigKey::Client(ClientConfigKey::PoolIdleTimeout),
             "120s",
+        )
+        // Connection pool sizing for parallel LOAD DATA operations.
+        // Higher values allow more concurrent S3 reads without connection churn.
+        .with_config(
+            AmazonS3ConfigKey::Client(ClientConfigKey::PoolMaxIdlePerHost),
+            "64",
         );
     let config = DEFAULT_AWS_CONFIG
         .get_or_init(|| aws_config::defaults(BehaviorVersion::latest()).load())

@@ -36,6 +36,11 @@ use crate::table_format::{
 use crate::utils::partition_transform::catalog_partition_field_from_iceberg;
 use crate::utils::{get_object_store_from_session, url_to_object_path};
 
+/// Target chunk size for splitting large files (256MB).
+/// Files larger than this are split into multiple read operations
+/// to improve parallelism and reduce memory pressure.
+const TARGET_CHUNK_SIZE: u64 = 256 * 1024 * 1024;
+
 pub async fn plan_load_data(
     session_state: &SessionState,
     node: &LoadDataNode,
@@ -241,13 +246,38 @@ fn build_fallback_scan(
     let object_store_url = ObjectStoreUrl::parse(store_url_str)
         .map_err(|e| DataFusionError::Plan(format!("invalid object store URL: {e}")))?;
 
+    // Split large files into chunks to improve parallelism and reduce memory pressure.
+    // Each chunk becomes a separate file group, enabling more parallel readers.
     let file_groups: Vec<Vec<PartitionedFile>> = files
         .iter()
-        .map(|(path, size)| {
-            let parsed = url::Url::parse(path)
-                .map_err(|e| DataFusionError::Plan(format!("invalid file URL: {e}")))?;
-            let key = url_to_object_path(&parsed)?;
-            Ok(vec![PartitionedFile::new(key.to_string(), *size)])
+        .flat_map(|(path, size)| {
+            let parsed = match url::Url::parse(path) {
+                Ok(p) => p,
+                Err(e) => {
+                    return vec![Err(DataFusionError::Plan(format!("invalid file URL: {e}")))];
+                }
+            };
+            let key = match url_to_object_path(&parsed) {
+                Ok(k) => k,
+                Err(e) => return vec![Err(e)],
+            };
+
+            if *size > TARGET_CHUNK_SIZE {
+                // Split large files into chunks
+                let num_chunks = size.div_ceil(TARGET_CHUNK_SIZE);
+                (0..num_chunks)
+                    .map(move |i| {
+                        let start = i * TARGET_CHUNK_SIZE;
+                        let end = std::cmp::min((i + 1) * TARGET_CHUNK_SIZE, *size);
+                        Ok(vec![
+                            PartitionedFile::new(key.to_string(), *size)
+                                .with_range(start as i64, end as i64),
+                        ])
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                vec![Ok(vec![PartitionedFile::new(key.to_string(), *size)])]
+            }
         })
         .collect::<DFResult<_>>()?;
 

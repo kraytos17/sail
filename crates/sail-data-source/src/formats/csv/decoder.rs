@@ -5,7 +5,10 @@ use datafusion_common::Result;
 use futures::stream::{self, BoxStream};
 use futures::{StreamExt, TryStreamExt};
 
-const READ_BUFFER_SIZE: usize = 8 * 1024;
+/// Read buffer size for UTF-8 lossy decoding.
+/// Larger buffers (256KB vs 8KB default) improve throughput for sequential
+/// reads from S3 by reducing syscall overhead and improving CPU cache utilization.
+const READ_BUFFER_SIZE: usize = 256 * 1024;
 const REPLACEMENT_CHARACTER: &[u8] = "\u{FFFD}".as_bytes();
 
 #[derive(Debug, PartialEq)]

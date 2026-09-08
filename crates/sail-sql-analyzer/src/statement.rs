@@ -106,6 +106,81 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             let plan = from_ast_query(query)?;
             Ok(spec::Plan::Query(plan))
         }
+        // Database commands
+        Statement::SetCatalog { .. }
+        | Statement::UseCatalog { .. }
+        | Statement::UseDatabase { .. }
+        | Statement::CreateDatabase { .. }
+        | Statement::AlterDatabase { .. }
+        | Statement::DropDatabase { .. }
+        | Statement::ShowDatabases { .. }
+        | Statement::ShowCatalogs { .. } => from_ast_database_command(statement),
+        // Table commands
+        Statement::CreateTable { .. }
+        | Statement::ReplaceTable { .. }
+        | Statement::RefreshTable { .. }
+        | Statement::AlterTable { .. }
+        | Statement::DropTable { .. }
+        | Statement::ShowTables { .. }
+        | Statement::ShowTableExtended { .. }
+        | Statement::ShowTblProperties { .. }
+        | Statement::ShowCreateTable { .. }
+        | Statement::ShowColumns { .. } => from_ast_table_command(statement),
+        // View commands
+        Statement::CreateView { .. }
+        | Statement::AlterView { .. }
+        | Statement::DropView { .. }
+        | Statement::ShowViews { .. }
+        | Statement::RefreshFunction { .. } => from_ast_view_command(statement),
+        // Function commands
+        Statement::DropFunction { .. } | Statement::ShowFunctions { .. } => {
+            from_ast_function_command(statement)
+        }
+        // DML commands
+        Statement::InsertOverwriteDirectory { .. }
+        | Statement::InsertIntoAndReplace { .. }
+        | Statement::InsertInto { .. }
+        | Statement::MergeInto { .. }
+        | Statement::Update { .. }
+        | Statement::Delete { .. }
+        | Statement::TruncateTable { .. }
+        | Statement::LoadData { .. } => from_ast_dml_command(statement),
+        // Other commands
+        Statement::Explain { .. } => {
+            let Statement::Explain {
+                explain: _,
+                format,
+                statement,
+            } = statement
+            else {
+                unreachable!()
+            };
+            let mode = from_ast_explain_format(format)?;
+            let statement = from_ast_statement(*statement)?;
+            let node = spec::CommandNode::Explain {
+                mode,
+                input: Box::new(statement),
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::CacheTable { .. }
+        | Statement::UncacheTable { .. }
+        | Statement::ClearCache { .. }
+        | Statement::SetTimeZone { .. }
+        | Statement::SetProperty { .. }
+        | Statement::AnalyzeTable { .. }
+        | Statement::AnalyzeTables { .. }
+        | Statement::Describe { .. }
+        | Statement::CommentOnCatalog { .. }
+        | Statement::CommentOnDatabase { .. }
+        | Statement::CommentOnTable { .. }
+        | Statement::CommentOnColumn { .. } => from_ast_utility_command(statement),
+    }
+}
+
+/// Handles database-related SQL commands (SET CATALOG, USE, CREATE/DROP/SHOW DATABASE, etc.).
+fn from_ast_database_command(statement: Statement) -> SqlResult<spec::Plan> {
+    match statement {
         Statement::SetCatalog {
             set: _,
             catalog: _,
@@ -214,6 +289,13 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             let node = spec::CommandNode::ListCatalogs { pattern };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        _ => Err(SqlError::invalid("expected a database command")),
+    }
+}
+
+/// Handles table-related SQL commands (CREATE/DROP/ALTER/SHOW TABLE, etc.).
+fn from_ast_table_command(statement: Statement) -> SqlResult<spec::Plan> {
+    match statement {
         Statement::CreateTable {
             create: _,
             or_replace,
@@ -397,6 +479,13 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             let node = spec::CommandNode::ListColumns { table };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        _ => Err(SqlError::invalid("expected a table command")),
+    }
+}
+
+/// Handles view-related SQL commands (CREATE/ALTER/DROP/SHOW VIEW, etc.).
+fn from_ast_view_command(statement: Statement) -> SqlResult<spec::Plan> {
+    match statement {
         Statement::CreateView {
             create: _,
             or_replace,
@@ -600,6 +689,13 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        _ => Err(SqlError::invalid("expected a view command")),
+    }
+}
+
+/// Handles function-related SQL commands (DROP/SHOW FUNCTION, etc.).
+fn from_ast_function_command(statement: Statement) -> SqlResult<spec::Plan> {
+    match statement {
         Statement::DropFunction {
             drop: _,
             temporary,
@@ -630,19 +726,13 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
-        Statement::Explain {
-            explain: _,
-            format,
-            statement,
-        } => {
-            let mode = from_ast_explain_format(format)?;
-            let statement = from_ast_statement(*statement)?;
-            let node = spec::CommandNode::Explain {
-                mode,
-                input: Box::new(statement),
-            };
-            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
-        }
+        _ => Err(SqlError::invalid("expected a function command")),
+    }
+}
+
+/// Handles DML commands (INSERT, MERGE, UPDATE, DELETE, TRUNCATE, LOAD DATA, etc.).
+fn from_ast_dml_command(statement: Statement) -> SqlResult<spec::Plan> {
+    match statement {
         Statement::InsertOverwriteDirectory {
             insert: _,
             overwrite: _,
@@ -1079,6 +1169,26 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        _ => Err(SqlError::invalid("expected a DML command")),
+    }
+}
+
+/// Handles utility SQL commands (CACHE, UNCACHE, SET, ANALYZE, DESCRIBE, COMMENT, etc.).
+fn from_ast_utility_command(statement: Statement) -> SqlResult<spec::Plan> {
+    match statement {
+        Statement::Explain {
+            explain: _,
+            format,
+            statement,
+        } => {
+            let mode = from_ast_explain_format(format)?;
+            let statement = from_ast_statement(*statement)?;
+            let node = spec::CommandNode::Explain {
+                mode,
+                input: Box::new(statement),
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
         Statement::CacheTable {
             cache: _,
             lazy,
@@ -1324,6 +1434,7 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        _ => Err(SqlError::invalid("expected a utility command")),
     }
 }
 

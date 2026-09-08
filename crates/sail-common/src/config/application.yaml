@@ -341,18 +341,20 @@
 
 - key: execution.batch_size
   type: number
-  default: "8192"
-  description: The batch size for physical plan execution.
+  default: "32768"
+  description: |
+    The batch size for physical plan execution.
+    Larger batches improve throughput for sequential I/O workloads like LOAD DATA
+    by reducing per-batch overhead and improving SIMD utilization.
   experimental: true
 
 - key: execution.default_parallelism
   type: number
-  default: "0"
+  default: "16"
   description: |
     The default parallelism used when generating physical plans, which determines the number of partitions a plan node is split into.
-    If the value is `0`, the parallelism is determined based on the number of available CPU cores.
-    It is recommended to set this value explicitly in the cluster mode since the number of CPU cores
-    available to the driver may not be the same as that available to the workers.
+    Higher values improve throughput for I/O-bound workloads like LOAD DATA by enabling more parallel readers.
+    Set to 16 to maximize parallel S3 reads. Use 0 for auto-detection based on CPU cores.
   experimental: true
 
 - key: execution.collect_statistics
@@ -1010,4 +1012,35 @@
     The threshold in milliseconds for logging a warning when Python read operations are slow.
     If a read operation takes longer than this duration, a warning is logged suggesting
     faster I/O or subprocess isolation.
+  experimental: true
+
+# ============================================================================
+# LOAD DATA Optimization
+# ============================================================================
+
+- key: execution.load_data.target_chunk_size
+  type: number
+  default: "268435456"
+  description: |
+    Target chunk size in bytes for splitting large files during LOAD DATA.
+    Files larger than this are split into multiple read operations to improve
+    parallelism and reduce memory pressure. Default is 256MB.
+  experimental: true
+
+- key: execution.load_data.read_buffer_size
+  type: number
+  default: "262144"
+  description: |
+    Read buffer size in bytes for CSV parsing during LOAD DATA.
+    Larger buffers improve throughput for sequential I/O by reducing syscall
+    overhead and improving CPU cache utilization. Default is 256KB.
+  experimental: true
+
+- key: execution.load_data.max_concurrent_files
+  type: number
+  default: "64"
+  description: |
+    Maximum number of concurrent file reads during LOAD DATA.
+    Higher values improve throughput but increase memory usage and S3 connection count.
+    Should be at least 2x the target_partitions for optimal performance.
   experimental: true
