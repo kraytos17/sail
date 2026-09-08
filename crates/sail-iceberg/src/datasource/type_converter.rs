@@ -312,6 +312,14 @@ pub fn iceberg_primitive_to_arrow(primitive: &PrimitiveType) -> Result<ArrowData
     Ok(arrow_type)
 }
 
+/// Check if a timezone string is a UTC alias (UTC, +00:00, Etc/UTC, Z, etc.).
+fn is_utc_timezone(tz: &str) -> bool {
+    matches!(
+        tz.trim(),
+        "UTC" | "+00:00" | "Etc/UTC" | "Z" | "GMT" | "Etc/GMT"
+    )
+}
+
 /// Convert Arrow data type to Iceberg primitive type
 pub fn arrow_primitive_to_iceberg(arrow_type: &ArrowDataType) -> Result<PrimitiveType> {
     let primitive_type = match arrow_type {
@@ -340,21 +348,21 @@ pub fn arrow_primitive_to_iceberg(arrow_type: &ArrowDataType) -> Result<Primitiv
         | ArrowDataType::Time64(TimeUnit::Microsecond) => PrimitiveType::Time,
         ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => PrimitiveType::Timestamp,
         ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(tz)) => {
-            if tz.as_ref() == "UTC" || tz.as_ref() == "+00:00" {
+            if is_utc_timezone(tz.as_ref()) {
                 PrimitiveType::Timestamptz
             } else {
                 return plan_err!(
-                    "Unsupported timezone for Iceberg Timestamptz conversion: {tz}. Timezone must be UTC or +00:00"
+                    "Unsupported timezone for Iceberg Timestamptz conversion: {tz}. Timezone must be UTC, +00:00, Etc/UTC, Z, or GMT"
                 );
             }
         }
         ArrowDataType::Timestamp(TimeUnit::Nanosecond, None) => PrimitiveType::TimestampNs,
         ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz)) => {
-            if tz.as_ref() == "UTC" || tz.as_ref() == "+00:00" {
+            if is_utc_timezone(tz.as_ref()) {
                 PrimitiveType::TimestamptzNs
             } else {
                 return plan_err!(
-                    "Unsupported timezone for Iceberg TimestamptzNs conversion: {tz}. Timezone must be UTC or +00:00"
+                    "Unsupported timezone for Iceberg TimestamptzNs conversion: {tz}. Timezone must be UTC, +00:00, Etc/UTC, Z, or GMT"
                 );
             }
         }
