@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_flight::flight_service_client::FlightServiceClient;
 use sail_common::telemetry::{TracingClientLayer, TracingClientService};
@@ -104,6 +105,13 @@ macro_rules! impl_client_builder {
             async fn connect(options: &ClientOptions) -> ExecutionResult<Self> {
                 let channel = tonic::transport::Endpoint::new(options.to_url_string())?
                     .http2_max_header_list_size(CLIENT_MAX_HEADER_LIST_SIZE)
+                    // TCP and HTTP/2 keepalive to prevent broken pipe on long-running
+                    // Flight data transfers. Without these, idle connections can be
+                    // severed by intermediate proxies or OS-level TCP timeouts.
+                    .tcp_keepalive(Some(Duration::from_secs(30)))
+                    .http2_keep_alive_interval(Duration::from_secs(30))
+                    .keep_alive_timeout(Duration::from_secs(10))
+                    .keep_alive_while_idle(true)
                     .connect()
                     .await?;
                 let channel = ServiceBuilder::new()

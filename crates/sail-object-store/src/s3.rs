@@ -17,10 +17,11 @@ use aws_smithy_runtime_api::client::runtime_components::{
 use aws_smithy_types::config_bag::ConfigBag;
 use datafusion_common::plan_datafusion_err;
 use log::debug;
+use object_store::CredentialProvider;
 use object_store::aws::{
     AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, resolve_bucket_region,
 };
-use object_store::{ClientOptions, CredentialProvider};
+use object_store::client::{ClientConfigKey, ClientOptions};
 use tokio::sync::OnceCell;
 use url::Url;
 
@@ -104,7 +105,31 @@ impl CredentialProvider for S3CredentialProvider {
 
 pub async fn get_s3_object_store(url: &Url) -> object_store::Result<AmazonS3> {
     debug!("Creating S3 object store for url: {url}");
-    let mut builder = AmazonS3Builder::from_env();
+    let mut builder = AmazonS3Builder::from_env()
+        // HTTP/2 keepalive and timeouts to prevent broken pipe on large S3 reads.
+        // Without these, long-running transfers (e.g. 150MB+ files from SeaweedFS)
+        // can have the connection severed due to idle timeout or missing keepalive.
+        .with_config(
+            AmazonS3ConfigKey::Client(ClientConfigKey::ConnectTimeout),
+            "10s",
+        )
+        .with_config(AmazonS3ConfigKey::Client(ClientConfigKey::Timeout), "300s")
+        .with_config(
+            AmazonS3ConfigKey::Client(ClientConfigKey::Http2KeepAliveInterval),
+            "30s",
+        )
+        .with_config(
+            AmazonS3ConfigKey::Client(ClientConfigKey::Http2KeepAliveTimeout),
+            "10s",
+        )
+        .with_config(
+            AmazonS3ConfigKey::Client(ClientConfigKey::Http2KeepAliveWhileIdle),
+            "true",
+        )
+        .with_config(
+            AmazonS3ConfigKey::Client(ClientConfigKey::PoolIdleTimeout),
+            "120s",
+        );
     let config = DEFAULT_AWS_CONFIG
         .get_or_init(|| aws_config::defaults(BehaviorVersion::latest()).load())
         .await;
