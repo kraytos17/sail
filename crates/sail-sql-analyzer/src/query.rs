@@ -406,6 +406,23 @@ fn from_ast_values(values: ValuesClause) -> SqlResult<spec::QueryPlan> {
     query_plan_with_table_alias(plan, alias)
 }
 
+fn unnest_outer_flag(table: &TableFactor) -> Option<bool> {
+    match table {
+        TableFactor::TableFunction { function, .. } => {
+            let ObjectName(parts) = &function.name;
+            parts
+                .items()
+                .next()
+                .and_then(|i| match i.value.to_ascii_lowercase().as_str() {
+                    "unnest" => Some(false),
+                    "unnest_outer" => Some(true),
+                    _ => None,
+                })
+        }
+        _ => None,
+    }
+}
+
 fn from_ast_table(
     input: Option<spec::QueryPlan>,
     table: TableWithJoins,
@@ -430,6 +447,8 @@ fn from_ast_table(
                 "expected function or subquery for lateral table factor",
             )),
         }
+    } else if let Some(outer) = unnest_outer_flag(&table) {
+        query_plan_with_lateral_table_factor(input, table, outer)
     } else {
         query_plan_with_table_factor(input, table, joins)
     }

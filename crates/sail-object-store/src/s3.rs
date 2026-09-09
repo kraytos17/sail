@@ -113,14 +113,14 @@ pub async fn get_s3_object_store(url: &Url) -> object_store::Result<AmazonS3> {
             AmazonS3ConfigKey::Client(ClientConfigKey::ConnectTimeout),
             "10s",
         )
-        .with_config(AmazonS3ConfigKey::Client(ClientConfigKey::Timeout), "300s")
+        .with_config(AmazonS3ConfigKey::Client(ClientConfigKey::Timeout), "600s")
         .with_config(
             AmazonS3ConfigKey::Client(ClientConfigKey::Http2KeepAliveInterval),
             "30s",
         )
         .with_config(
             AmazonS3ConfigKey::Client(ClientConfigKey::Http2KeepAliveTimeout),
-            "10s",
+            "60s",
         )
         .with_config(
             AmazonS3ConfigKey::Client(ClientConfigKey::Http2KeepAliveWhileIdle),

@@ -6,8 +6,8 @@ use datafusion_expr::ScalarFunctionArgs;
 
 pub fn explode_name_to_kind(name: &str) -> Result<ExplodeKind> {
     match name {
-        "explode" => Ok(ExplodeKind::Explode),
-        "explode_outer" => Ok(ExplodeKind::ExplodeOuter),
+        "explode" | "unnest" => Ok(ExplodeKind::Explode),
+        "explode_outer" | "unnest_outer" => Ok(ExplodeKind::ExplodeOuter),
         "posexplode" => Ok(ExplodeKind::PosExplode),
         "posexplode_outer" => Ok(ExplodeKind::PosExplodeOuter),
         "inline" => Ok(ExplodeKind::Inline),
