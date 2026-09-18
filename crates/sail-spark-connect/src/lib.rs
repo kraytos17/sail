@@ -3,6 +3,7 @@ mod debug;
 pub mod entrypoint;
 mod error;
 mod executor;
+pub mod multiplexer;
 mod proto;
 mod schema;
 pub mod server;
@@ -12,6 +13,7 @@ mod session_manager;
 mod streaming;
 
 pub use proto::data_type_json::JsonDataType;
+pub use session_manager::create_spark_session_manager;
 
 pub mod spark {
     #[expect(clippy::all, clippy::allow_attributes)]

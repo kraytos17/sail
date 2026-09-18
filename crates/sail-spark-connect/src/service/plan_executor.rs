@@ -606,9 +606,12 @@ pub(crate) async fn handle_reattach_execute(
     response_id: Option<String>,
 ) -> SparkResult<ExecutePlanResponseStream> {
     let spark = ctx.extension::<SparkSession>()?;
-    let executor = spark
-        .get_executor(operation_id.as_str())?
-        .ok_or_else(|| SparkError::invalid(format!("operation not found: {operation_id}")))?;
+    let executor = spark.get_executor(operation_id.as_str())?.ok_or_else(|| {
+        SparkError::invalid(format!(
+            "operation not found: {operation_id}; the operation may belong to a previous \
+                 session (e.g. the server restarted) or may have been released; re-run the query"
+        ))
+    })?;
     if !executor.metadata.reattachable {
         return Err(SparkError::invalid(format!(
             "operation not reattachable: {operation_id}"
