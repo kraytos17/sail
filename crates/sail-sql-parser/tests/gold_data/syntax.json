@@ -1300,6 +1300,22 @@
               }
             },
             {
+              "name": "CallArgumentList",
+              "node": {
+                "sequence": [
+                  {
+                    "nonTerminal": "Operator(LeftParenthesis)"
+                  },
+                  {
+                    "nonTerminal": "Option(Sequence(FunctionArgument, Operator(Comma)))"
+                  },
+                  {
+                    "nonTerminal": "Operator(RightParenthesis)"
+                  }
+                ]
+              }
+            },
+            {
               "name": "CaseElse",
               "node": {
                 "sequence": [
@@ -4429,6 +4445,14 @@
               "node": {
                 "terminal": {
                   "keyword": "CACHE"
+                }
+              }
+            },
+            {
+              "name": "Keyword(Call)",
+              "node": {
+                "terminal": {
+                  "keyword": "CALL"
                 }
               }
             },
@@ -10418,6 +10442,19 @@
                       },
                       {
                         "nonTerminal": "CommentValue"
+                      }
+                    ]
+                  },
+                  {
+                    "sequence": [
+                      {
+                        "nonTerminal": "Keyword(Call)"
+                      },
+                      {
+                        "nonTerminal": "ObjectName"
+                      },
+                      {
+                        "nonTerminal": "CallArgumentList"
                       }
                     ]
                   }

@@ -1,7 +1,7 @@
 use either::Either;
 use sail_common::spec;
 use sail_common::spec::QueryPlan;
-use sail_sql_parser::ast::expression::{BooleanLiteral, Expr, OrderDirection};
+use sail_sql_parser::ast::expression::{BooleanLiteral, Expr, FunctionArgument, OrderDirection};
 use sail_sql_parser::ast::identifier::{Ident, ObjectName};
 use sail_sql_parser::ast::keywords::{Cascade, Overwrite, Restrict};
 use sail_sql_parser::ast::literal::{IntegerLiteral, NumberLiteral, StringLiteral};
@@ -9,17 +9,18 @@ use sail_sql_parser::ast::operator::{Minus, Plus};
 use sail_sql_parser::ast::query::{IdentList, WhereClause};
 use sail_sql_parser::ast::statement::{
     AlterColumnOperation, AlterTableOperation, AlterViewOperation, AnalyzeTableModifier,
-    AsQueryClause, Assignment, AssignmentList, ColumnAlteration, ColumnAlterationList,
-    ColumnAlterationOption, ColumnDefinition, ColumnDefinitionList, ColumnDefinitionOption,
-    ColumnDropList, ColumnPosition, ColumnTypeDefinition, CommentValue, CreateDatabaseClause,
-    CreateTableClause, CreateViewClause, CreateViewDefinition, DeleteTableAlias,
-    DescribeFunctionName, DescribeItem, ExplainFormat, FileFormat, InsertDirectoryDestination,
-    MergeMatchClause, MergeMatchedAction, MergeNotMatchedBySourceAction,
-    MergeNotMatchedByTargetAction, MergeSource, PartitionByItem, PartitionByList, PartitionClause,
-    PartitionValue, PartitionValueList, PropertyKey, PropertyKeyList, PropertyKeyValue,
-    PropertyList, PropertyValue, RowFormat, RowFormatDelimitedClause, SetClause, ShowFunctionScope,
-    ShowFunctionsClause, ShowFunctionsPattern, SortColumn, SortColumnClause, SortColumnList,
-    Statement, TableColumnIdentityOption, TableColumnIdentityOptions, UpdateTableAlias, ViewColumn,
+    AsQueryClause, Assignment, AssignmentList, CallArgumentList, ColumnAlteration,
+    ColumnAlterationList, ColumnAlterationOption, ColumnDefinition, ColumnDefinitionList,
+    ColumnDefinitionOption, ColumnDropList, ColumnPosition, ColumnTypeDefinition, CommentValue,
+    CreateDatabaseClause, CreateTableClause, CreateViewClause, CreateViewDefinition,
+    DeleteTableAlias, DescribeFunctionName, DescribeItem, ExplainFormat, FileFormat,
+    InsertDirectoryDestination, MergeMatchClause, MergeMatchedAction,
+    MergeNotMatchedBySourceAction, MergeNotMatchedByTargetAction, MergeSource, PartitionByItem,
+    PartitionByList, PartitionClause, PartitionValue, PartitionValueList, PropertyKey,
+    PropertyKeyList, PropertyKeyValue, PropertyList, PropertyValue, RowFormat,
+    RowFormatDelimitedClause, SetClause, ShowFunctionScope, ShowFunctionsClause,
+    ShowFunctionsPattern, SortColumn, SortColumnClause, SortColumnList, Statement,
+    TableColumnIdentityOption, TableColumnIdentityOptions, UpdateTableAlias, ViewColumn,
     ViewColumnList, ViewUsingClause,
 };
 use sail_sql_parser::tree::TreeText;
@@ -175,7 +176,44 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
         | Statement::CommentOnDatabase { .. }
         | Statement::CommentOnTable { .. }
         | Statement::CommentOnColumn { .. } => from_ast_utility_command(statement),
+        Statement::CallProcedure { .. } => from_ast_call_procedure(statement),
     }
+}
+
+/// Converts `CALL <catalog>.system.<procedure>(...)` into a
+/// [`spec::CommandNode::CallProcedure`] plan.
+fn from_ast_call_procedure(statement: Statement) -> SqlResult<spec::Plan> {
+    let Statement::CallProcedure {
+        call: _,
+        name,
+        arguments,
+    } = statement
+    else {
+        unreachable!()
+    };
+    let CallArgumentList {
+        left: _,
+        arguments,
+        right: _,
+    } = arguments;
+    let mut call_arguments: Vec<(Option<spec::Identifier>, spec::Expr)> = vec![];
+    if let Some(arguments) = arguments {
+        for argument in arguments.into_items() {
+            match argument {
+                FunctionArgument::Named(name, _, expr) => {
+                    call_arguments.push((Some(name.value.into()), from_ast_expression(expr)?));
+                }
+                FunctionArgument::Unnamed(expr) => {
+                    call_arguments.push((None, from_ast_expression(expr)?));
+                }
+            }
+        }
+    }
+    let node = spec::CommandNode::CallProcedure {
+        name: from_ast_object_name(name)?,
+        arguments: call_arguments,
+    };
+    Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
 }
 
 /// Handles database-related SQL commands (SET CATALOG, USE, CREATE/DROP/SHOW DATABASE, etc.).

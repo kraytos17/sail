@@ -3,10 +3,10 @@ use sail_sql_macro::{TreeParser, TreeSyntax, TreeText};
 
 use crate::ast;
 use crate::ast::data_type::DataType;
-use crate::ast::expression::{BooleanLiteral, Expr, OrderDirection};
+use crate::ast::expression::{BooleanLiteral, Expr, FunctionArgument, OrderDirection};
 use crate::ast::identifier::{Ident, ObjectName, table_ident};
 use crate::ast::keywords::{
-    Add, After, All, Alter, Always, Analyze, And, As, Buckets, By, Cache, Cascade, Catalog,
+    Add, After, All, Alter, Always, Analyze, And, As, Buckets, By, Cache, Call, Cascade, Catalog,
     Catalogs, Change, Check, Clear, Cluster, Clustered, Codegen, Collection, Column, Columns,
     Comment, Compute, Constraint, Cost, Create, Data, Database, Databases, Dbproperties, Default,
     Defined, Delete, Delimited, Desc, Describe, Directory, Distributed, Drop, Escaped, Evolution,
@@ -359,6 +359,12 @@ pub enum Statement {
         is: Is,
         value: CommentValue,
     },
+    CallProcedure {
+        call: Call,
+        name: ObjectName,
+        #[parser(function = |(_, _, e, _), o| compose(e, o))]
+        arguments: CallArgumentList,
+    },
 }
 
 #[derive(Debug, Clone, TreeParser, TreeSyntax, TreeText)]
@@ -402,6 +408,17 @@ pub enum PropertyValue {
     String(StringLiteral),
     Number(Option<Either<Plus, Minus>>, NumberLiteral),
     Boolean(BooleanLiteral),
+}
+
+/// Argument list for `CALL <procedure>(...)`, supporting both positional
+/// arguments and named `name => value` arguments.
+#[derive(Debug, Clone, TreeParser, TreeSyntax, TreeText)]
+#[parser(dependency = "Expr")]
+pub struct CallArgumentList {
+    pub left: LeftParenthesis,
+    #[parser(function = |e, o| sequence(compose(e, o), unit(o)).or_not())]
+    pub arguments: Option<Sequence<FunctionArgument, Comma>>,
+    pub right: RightParenthesis,
 }
 
 #[derive(Debug, Clone, TreeParser, TreeSyntax, TreeText)]

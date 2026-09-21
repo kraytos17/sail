@@ -150,6 +150,48 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_call_procedure() -> SqlResult<()> {
+        // Shape emitted by heimdall `snapshot-cleanup`.
+        let statement = parse_one_statement(
+            "CALL testcat.system.expire_snapshots('stg.gl_balances', TIMESTAMP '2026-09-22T00:00:00')",
+        )?;
+        assert!(matches!(statement, Statement::CallProcedure { .. }));
+        // Named-argument form must parse as well.
+        let statement = parse_one_statement(
+            "CALL testcat.system.expire_snapshots(table => 'stg.gl_balances', retain_last => 3)",
+        )?;
+        assert!(matches!(statement, Statement::CallProcedure { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_analyze_call_procedure() -> SqlResult<()> {
+        use sail_common::spec;
+
+        use crate::statement::from_ast_statement;
+
+        let statement = parse_one_statement(
+            "CALL testcat.system.expire_snapshots('stg.gl_balances', TIMESTAMP '2026-09-22T00:00:00')",
+        )?;
+        let plan = from_ast_statement(statement)?;
+        let spec::Plan::Command(command) = plan else {
+            return Err(crate::error::SqlError::invalid(
+                "CALL should produce a command plan",
+            ));
+        };
+        let spec::CommandNode::CallProcedure { name, arguments } = &command.node else {
+            return Err(crate::error::SqlError::invalid(
+                "CALL should produce a CallProcedure node",
+            ));
+        };
+        let parts: Vec<String> = name.clone().into();
+        assert_eq!(parts, vec!["testcat", "system", "expire_snapshots"]);
+        assert_eq!(arguments.len(), 2);
+        assert!(arguments[0].0.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn test_unparse() -> SqlResult<()> {
         assert_eq!(
             parse_one_statement("/* */ SELECT 1+1")?.text(),
