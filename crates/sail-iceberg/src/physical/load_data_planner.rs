@@ -36,11 +36,6 @@ use crate::table_format::{
 use crate::utils::partition_transform::catalog_partition_field_from_iceberg;
 use crate::utils::{get_object_store_from_session, url_to_object_path};
 
-/// Target chunk size for splitting large files (256MB).
-/// Files larger than this are split into multiple read operations
-/// to improve parallelism and reduce memory pressure.
-const TARGET_CHUNK_SIZE: u64 = 256 * 1024 * 1024;
-
 pub async fn plan_load_data(
     session_state: &SessionState,
     node: &LoadDataNode,
@@ -175,12 +170,7 @@ pub async fn plan_load_data(
     for (format, files) in group_by_format(&fallback_files) {
         let scan =
             build_fallback_scan(session_state, &files, format.as_str(), &table_arrow_schema)?;
-        // Colocate partition values like the canonical write path so each
-        // writer task owns a stable slice of partitions.
-        let scan = crate::physical_plan::plan_builder::repartition_for_iceberg_write(
-            scan,
-            &partition_columns,
-        )?;
+        let scan = repartition_scan_for_load(scan, &partition_columns)?;
 
         let writer: Arc<dyn ExecutionPlan> = Arc::new(IcebergWriterExec::new(
             scan,
@@ -234,6 +224,25 @@ fn group_by_format(files: &[(String, u64)]) -> Vec<(String, Vec<(String, u64)>)>
         .collect()
 }
 
+/// Colocate the fallback scan for the write only when the table is partitioned.
+///
+/// Unpartitioned tables skip the extra repartition: `build_fallback_scan` already
+/// tiles source bytes across `target_partitions` via DataFusion's
+/// `FileGroupPartitioner`, so each writer task reads a balanced slice without a
+/// full shuffle collapsing write parallelism. Partitioned tables keep the
+/// canonical hash repartition so each writer task owns a stable slice of
+/// partition values.
+fn repartition_scan_for_load(
+    scan: Arc<dyn ExecutionPlan>,
+    partition_columns: &[CatalogPartitionField],
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    if partition_columns.is_empty() {
+        Ok(scan)
+    } else {
+        crate::physical_plan::plan_builder::repartition_for_iceberg_write(scan, partition_columns)
+    }
+}
+
 fn build_fallback_scan(
     session_state: &SessionState,
     files: &[(String, u64)],
@@ -246,38 +255,20 @@ fn build_fallback_scan(
     let object_store_url = ObjectStoreUrl::parse(store_url_str)
         .map_err(|e| DataFusionError::Plan(format!("invalid object store URL: {e}")))?;
 
-    // Split large files into chunks to improve parallelism and reduce memory pressure.
-    // Each chunk becomes a separate file group, enabling more parallel readers.
+    // One file group per source file. Byte-range splitting for parallelism is
+    // left to DataFusion's `FileGroupPartitioner` (via `repartitioned` below):
+    // it tiles total bytes across `target_partitions`, declines compressed or
+    // unsplittable sources, and splits each file at most once. Pre-splitting
+    // here would only multiply `calculate_range` probes, and for compressed
+    // files the surviving ranges would fail at read time
+    // ("Reading compressed .csv in parallel is not supported").
     let file_groups: Vec<Vec<PartitionedFile>> = files
         .iter()
-        .flat_map(|(path, size)| {
-            let parsed = match url::Url::parse(path) {
-                Ok(p) => p,
-                Err(e) => {
-                    return vec![Err(DataFusionError::Plan(format!("invalid file URL: {e}")))];
-                }
-            };
-            let key = match url_to_object_path(&parsed) {
-                Ok(k) => k,
-                Err(e) => return vec![Err(e)],
-            };
-
-            if *size > TARGET_CHUNK_SIZE {
-                // Split large files into chunks
-                let num_chunks = size.div_ceil(TARGET_CHUNK_SIZE);
-                (0..num_chunks)
-                    .map(move |i| {
-                        let start = i * TARGET_CHUNK_SIZE;
-                        let end = std::cmp::min((i + 1) * TARGET_CHUNK_SIZE, *size);
-                        Ok(vec![
-                            PartitionedFile::new(key.to_string(), *size)
-                                .with_range(start as i64, end as i64),
-                        ])
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                vec![Ok(vec![PartitionedFile::new(key.to_string(), *size)])]
-            }
+        .map(|(path, size)| {
+            let parsed = url::Url::parse(path)
+                .map_err(|e| DataFusionError::Plan(format!("invalid file URL: {e}")))?;
+            let key = url_to_object_path(&parsed)?;
+            Ok(vec![PartitionedFile::new(key.to_string(), *size)])
         })
         .collect::<DFResult<_>>()?;
 
@@ -360,4 +351,160 @@ fn infer_source_compression(path: &str) -> CompressionTypeVariant {
         }
     }
     CompressionTypeVariant::UNCOMPRESSED
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::execution::runtime_env::RuntimeEnv;
+    use datafusion::execution::{SessionState, SessionStateBuilder};
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+    use datafusion::prelude::SessionConfig;
+    use datafusion_datasource::file_scan_config::FileScanConfig;
+    use sail_common_datafusion::catalog::CatalogPartitionField;
+
+    use super::*;
+
+    fn test_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("p", DataType::Utf8, true),
+            Field::new("v", DataType::Utf8, true),
+        ])
+    }
+
+    fn test_session_state(target_partitions: usize) -> SessionState {
+        let config = SessionConfig::new().with_target_partitions(target_partitions);
+        SessionStateBuilder::new()
+            .with_config(config)
+            .with_runtime_env(Arc::new(RuntimeEnv::default()))
+            .build()
+    }
+
+    fn csv_files(prefix: &str, ext: &str, sizes: &[u64]) -> Vec<(String, u64)> {
+        sizes
+            .iter()
+            .enumerate()
+            .map(|(i, size)| (format!("memory:///{prefix}/f{i}{ext}"), *size))
+            .collect()
+    }
+
+    /// Clone the fallback scan's `FileScanConfig` out for grouping inspection.
+    fn scan_config(scan: &Arc<dyn ExecutionPlan>) -> FileScanConfig {
+        use std::any::Any;
+
+        let exec = scan
+            .downcast_ref::<DataSourceExec>()
+            .expect("fallback scan is a DataSourceExec");
+        let source = exec.data_source().as_ref() as &dyn Any;
+        source
+            .downcast_ref::<FileScanConfig>()
+            .expect("fallback data source is a FileScanConfig")
+            .clone()
+    }
+
+    #[test]
+    fn small_csv_files_keep_one_group_per_file() {
+        let state = test_session_state(4);
+        let files = csv_files("small", ".csv", &[1_000_000, 2_000_000, 3_000_000]);
+        let scan = build_fallback_scan(&state, &files, "csv", &test_schema())
+            .expect("scan planning succeeds");
+
+        // Below the partitioner floor: no tiling, one task per file.
+        assert_eq!(scan.output_partitioning().partition_count(), 3);
+        let config = scan_config(&scan);
+        assert_eq!(config.file_groups.len(), 3);
+        for group in &config.file_groups {
+            assert_eq!(group.len(), 1);
+            for file in group.iter() {
+                assert!(file.range.is_none(), "small files must not be range-split");
+            }
+        }
+    }
+
+    #[test]
+    fn large_compressed_csv_files_are_not_range_split() {
+        let state = test_session_state(16);
+        let files = csv_files("compressed", ".csv.gz", &[300_000_000, 300_000_000]);
+        let scan = build_fallback_scan(&state, &files, "csv", &test_schema())
+            .expect("scan planning succeeds");
+
+        // Compressed sources decline byte-range splitting; each file stays a
+        // single whole-file group. (Ranges here would fail at read time.)
+        assert_eq!(scan.output_partitioning().partition_count(), 2);
+        let config = scan_config(&scan);
+        assert_eq!(config.file_groups.len(), 2);
+        for group in &config.file_groups {
+            for file in group.iter() {
+                assert!(
+                    file.range.is_none(),
+                    "compressed files must not be range-split"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn large_uncompressed_csv_files_tile_to_target_partitions() {
+        let state = test_session_state(4);
+        let files = csv_files(
+            "large",
+            ".csv",
+            &[1_000_000_000, 1_000_000_000, 1_000_000_000],
+        );
+        let scan = build_fallback_scan(&state, &files, "csv", &test_schema())
+            .expect("scan planning succeeds");
+
+        // DataFusion's FileGroupPartitioner tiles total bytes across the
+        // target partitions with exact, contiguous coverage.
+        assert_eq!(scan.output_partitioning().partition_count(), 4);
+        let config = scan_config(&scan);
+        let mut covered: u64 = 0;
+        for group in &config.file_groups {
+            for file in group.iter() {
+                let len = match &file.range {
+                    Some(range) => (range.end - range.start) as u64,
+                    None => file.object_meta.size,
+                };
+                covered += len;
+            }
+        }
+        assert_eq!(covered, 3_000_000_000);
+    }
+
+    #[test]
+    fn unpartitioned_load_skips_write_repartition() {
+        let state = test_session_state(4);
+        let files = csv_files("unpart", ".csv", &[1_000_000]);
+        let scan = build_fallback_scan(&state, &files, "csv", &test_schema())
+            .expect("scan planning succeeds");
+        let partitions = scan.output_partitioning().partition_count();
+
+        let planned = repartition_scan_for_load(scan, &[]).expect("helper succeeds");
+        assert!(
+            planned.downcast_ref::<RepartitionExec>().is_none(),
+            "unpartitioned LOAD must not introduce a RepartitionExec shuffle"
+        );
+        assert_eq!(planned.output_partitioning().partition_count(), partitions);
+    }
+
+    #[test]
+    fn partitioned_load_keeps_hash_repartition() {
+        let state = test_session_state(4);
+        let files = csv_files("part", ".csv", &[1_000_000]);
+        let scan = build_fallback_scan(&state, &files, "csv", &test_schema())
+            .expect("scan planning succeeds");
+
+        let partition_columns = vec![CatalogPartitionField {
+            column: "p".to_string(),
+            transform: None,
+        }];
+        let planned = repartition_scan_for_load(scan, &partition_columns).expect("helper succeeds");
+        assert!(
+            planned.downcast_ref::<RepartitionExec>().is_some(),
+            "partitioned LOAD must keep the hash repartition for partition colocation"
+        );
+    }
 }
