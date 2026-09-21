@@ -15,10 +15,11 @@ use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::projection::{ProjectionOpener, SplitProjection};
-use datafusion_datasource::{PartitionedFile, RangeCalculation, TableSchema, calculate_range};
+use datafusion_datasource::{PartitionedFile, RangeCalculation, TableSchema};
 use futures::{StreamExt, TryStreamExt};
 use object_store::{GetOptions, GetResultPayload, ObjectStore};
 
+use crate::formats::range::calculate_range_bounded;
 use crate::formats::text;
 use crate::formats::text::reader::{Format, ReaderBuilder};
 
@@ -201,7 +202,7 @@ impl FileOpener for TextOpener {
 
         Ok(Box::pin(async move {
             // Current partition contains bytes [start_byte, end_byte) (might contain incomplete lines at boundaries)
-            let calculated_range = calculate_range(&file, &store, line_sep).await?;
+            let calculated_range = calculate_range_bounded(&file, &store, line_sep).await?;
             let range = match calculated_range {
                 RangeCalculation::Range(None) => None,
                 RangeCalculation::Range(Some(range)) => Some(range.into()),

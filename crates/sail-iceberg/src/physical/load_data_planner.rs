@@ -392,29 +392,30 @@ mod tests {
     }
 
     /// Clone the fallback scan's `FileScanConfig` out for grouping inspection.
-    fn scan_config(scan: &Arc<dyn ExecutionPlan>) -> FileScanConfig {
+    fn scan_config(scan: &Arc<dyn ExecutionPlan>) -> DFResult<FileScanConfig> {
         use std::any::Any;
 
-        let exec = scan
-            .downcast_ref::<DataSourceExec>()
-            .expect("fallback scan is a DataSourceExec");
+        let exec = scan.downcast_ref::<DataSourceExec>().ok_or_else(|| {
+            DataFusionError::Plan("fallback scan is not a DataSourceExec".to_string())
+        })?;
         let source = exec.data_source().as_ref() as &dyn Any;
         source
             .downcast_ref::<FileScanConfig>()
-            .expect("fallback data source is a FileScanConfig")
-            .clone()
+            .ok_or_else(|| {
+                DataFusionError::Plan("fallback data source is not a FileScanConfig".to_string())
+            })
+            .cloned()
     }
 
     #[test]
-    fn small_csv_files_keep_one_group_per_file() {
+    fn small_csv_files_keep_one_group_per_file() -> DFResult<()> {
         let state = test_session_state(4);
         let files = csv_files("small", ".csv", &[1_000_000, 2_000_000, 3_000_000]);
-        let scan = build_fallback_scan(&state, &files, "csv", &test_schema())
-            .expect("scan planning succeeds");
+        let scan = build_fallback_scan(&state, &files, "csv", &test_schema())?;
 
         // Below the partitioner floor: no tiling, one task per file.
         assert_eq!(scan.output_partitioning().partition_count(), 3);
-        let config = scan_config(&scan);
+        let config = scan_config(&scan)?;
         assert_eq!(config.file_groups.len(), 3);
         for group in &config.file_groups {
             assert_eq!(group.len(), 1);
@@ -422,19 +423,19 @@ mod tests {
                 assert!(file.range.is_none(), "small files must not be range-split");
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn large_compressed_csv_files_are_not_range_split() {
+    fn large_compressed_csv_files_are_not_range_split() -> DFResult<()> {
         let state = test_session_state(16);
         let files = csv_files("compressed", ".csv.gz", &[300_000_000, 300_000_000]);
-        let scan = build_fallback_scan(&state, &files, "csv", &test_schema())
-            .expect("scan planning succeeds");
+        let scan = build_fallback_scan(&state, &files, "csv", &test_schema())?;
 
         // Compressed sources decline byte-range splitting; each file stays a
         // single whole-file group. (Ranges here would fail at read time.)
         assert_eq!(scan.output_partitioning().partition_count(), 2);
-        let config = scan_config(&scan);
+        let config = scan_config(&scan)?;
         assert_eq!(config.file_groups.len(), 2);
         for group in &config.file_groups {
             for file in group.iter() {
@@ -444,23 +445,23 @@ mod tests {
                 );
             }
         }
+        Ok(())
     }
 
     #[test]
-    fn large_uncompressed_csv_files_tile_to_target_partitions() {
+    fn large_uncompressed_csv_files_tile_to_target_partitions() -> DFResult<()> {
         let state = test_session_state(4);
         let files = csv_files(
             "large",
             ".csv",
             &[1_000_000_000, 1_000_000_000, 1_000_000_000],
         );
-        let scan = build_fallback_scan(&state, &files, "csv", &test_schema())
-            .expect("scan planning succeeds");
+        let scan = build_fallback_scan(&state, &files, "csv", &test_schema())?;
 
         // DataFusion's FileGroupPartitioner tiles total bytes across the
         // target partitions with exact, contiguous coverage.
         assert_eq!(scan.output_partitioning().partition_count(), 4);
-        let config = scan_config(&scan);
+        let config = scan_config(&scan)?;
         let mut covered: u64 = 0;
         for group in &config.file_groups {
             for file in group.iter() {
@@ -472,39 +473,40 @@ mod tests {
             }
         }
         assert_eq!(covered, 3_000_000_000);
+        Ok(())
     }
 
     #[test]
-    fn unpartitioned_load_skips_write_repartition() {
+    fn unpartitioned_load_skips_write_repartition() -> DFResult<()> {
         let state = test_session_state(4);
         let files = csv_files("unpart", ".csv", &[1_000_000]);
-        let scan = build_fallback_scan(&state, &files, "csv", &test_schema())
-            .expect("scan planning succeeds");
+        let scan = build_fallback_scan(&state, &files, "csv", &test_schema())?;
         let partitions = scan.output_partitioning().partition_count();
 
-        let planned = repartition_scan_for_load(scan, &[]).expect("helper succeeds");
+        let planned = repartition_scan_for_load(scan, &[])?;
         assert!(
             planned.downcast_ref::<RepartitionExec>().is_none(),
             "unpartitioned LOAD must not introduce a RepartitionExec shuffle"
         );
         assert_eq!(planned.output_partitioning().partition_count(), partitions);
+        Ok(())
     }
 
     #[test]
-    fn partitioned_load_keeps_hash_repartition() {
+    fn partitioned_load_keeps_hash_repartition() -> DFResult<()> {
         let state = test_session_state(4);
         let files = csv_files("part", ".csv", &[1_000_000]);
-        let scan = build_fallback_scan(&state, &files, "csv", &test_schema())
-            .expect("scan planning succeeds");
+        let scan = build_fallback_scan(&state, &files, "csv", &test_schema())?;
 
         let partition_columns = vec![CatalogPartitionField {
             column: "p".to_string(),
             transform: None,
         }];
-        let planned = repartition_scan_for_load(scan, &partition_columns).expect("helper succeeds");
+        let planned = repartition_scan_for_load(scan, &partition_columns)?;
         assert!(
             planned.downcast_ref::<RepartitionExec>().is_some(),
             "partitioned LOAD must keep the hash repartition for partition colocation"
         );
+        Ok(())
     }
 }

@@ -19,14 +19,13 @@ use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::projection::{ProjectionOpener, SplitProjection};
-use datafusion_datasource::{
-    FileRange, PartitionedFile, RangeCalculation, TableSchema, calculate_range,
-};
+use datafusion_datasource::{FileRange, PartitionedFile, RangeCalculation, TableSchema};
 use futures::{StreamExt, TryStreamExt};
 use object_store::{GetOptions, GetResultPayload, ObjectStore};
 
 use super::decoder::{LossyUtf8Reader, decode_utf8_lossy_stream};
 use super::projected::{DecoderBatchReader, ProjectedCsvDecoder, ProjectedCsvOptions};
+use crate::formats::range::calculate_range_bounded;
 
 type CsvBatchReader = Box<dyn Iterator<Item = std::result::Result<RecordBatch, ArrowError>> + Send>;
 
@@ -259,7 +258,7 @@ impl FileOpener for CsvOpener {
 
         Ok(Box::pin(async move {
             let calculated_range =
-                calculate_range(&partitioned_file, &object_store, terminator).await?;
+                calculate_range_bounded(&partitioned_file, &object_store, terminator).await?;
             let range = match calculated_range {
                 RangeCalculation::Range(None) => None,
                 RangeCalculation::Range(Some(range)) => Some(range.into()),

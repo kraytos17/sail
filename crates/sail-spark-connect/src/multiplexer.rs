@@ -271,12 +271,13 @@ fn validate_observed_server_side_session_id(
     canonical_session_id: &str,
     observed_server_side_session_id: Option<&str>,
 ) -> Result<(), Status> {
-    if let Some(observed) = observed_server_side_session_id {
-        if !observed.is_empty() && observed != canonical_session_id {
-            return Err(Status::failed_precondition(
-                "session no longer valid; create a new session",
-            ));
-        }
+    if let Some(observed) = observed_server_side_session_id
+        && !observed.is_empty()
+        && observed != canonical_session_id
+    {
+        return Err(Status::failed_precondition(
+            "session no longer valid; create a new session",
+        ));
     }
     Ok(())
 }
@@ -353,13 +354,14 @@ impl SparkConnectService for MultiplexedSparkConnectServer {
         // observed server session diverges from the canonical one is stale, but
         // rejecting the request would kill its session. Instead, proceed and let
         // the response's `server_side_session_id` re-sync the client.
-        if let Some(observed) = request.client_observed_server_side_session_id.as_deref() {
-            if !observed.is_empty() && observed != self.canonical_session_id {
-                warn!(
-                    "client observed server session {observed} differs from canonical {}; re-syncing",
-                    self.canonical_session_id
-                );
-            }
+        if let Some(observed) = request.client_observed_server_side_session_id.as_deref()
+            && !observed.is_empty()
+            && observed != self.canonical_session_id
+        {
+            warn!(
+                "client observed server session {observed} differs from canonical {}; re-syncing",
+                self.canonical_session_id
+            );
         }
         let client_id = self.stamp(&mut request.session_id, None)?;
         let mut response = self.inner.config(Request::new(request)).await?.into_inner();
@@ -729,9 +731,13 @@ mod tests {
 
     #[test]
     fn divergent_observed_session_is_rejected() {
-        let err = validate_observed_server_side_session_id("canonical", Some("stale")).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(err.message().contains("create a new session"));
+        let mut rejected = false;
+        if let Err(err) = validate_observed_server_side_session_id("canonical", Some("stale")) {
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+            assert!(err.message().contains("create a new session"));
+            rejected = true;
+        }
+        assert!(rejected, "divergent session must be rejected");
     }
 
     #[test]

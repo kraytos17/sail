@@ -7,6 +7,7 @@ pub mod json;
 pub mod noop;
 pub mod parquet;
 pub mod python;
+pub mod range;
 pub mod rate;
 pub mod socket;
 pub mod text;
