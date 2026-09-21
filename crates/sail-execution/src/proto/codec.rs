@@ -293,6 +293,7 @@ use sail_python_udf::udf::pyspark_map_iter_udf::{PySparkMapIterKind, PySparkMapI
 use sail_python_udf::udf::pyspark_udaf::{PySparkGroupAggKind, PySparkGroupAggregateUDF};
 use sail_python_udf::udf::pyspark_udf::{PySparkUDF, PySparkUdfKind};
 use sail_python_udf::udf::pyspark_udtf::{PySparkUDTF, PySparkUdtfKind};
+use sail_rhai_udf::rhai_eval_udf;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use url::Url;
@@ -3059,6 +3060,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
             "try_url_decode" => Ok(Arc::new(ScalarUDF::from(TryUrlDecode::new()))),
             "url_decode" => Ok(Arc::new(ScalarUDF::from(UrlDecode::new()))),
             "url_encode" => Ok(Arc::new(ScalarUDF::from(UrlEncode::new()))),
+            "rhai_eval" => Ok(Arc::new(rhai_eval_udf())),
             _ => plan_err!("could not find scalar function: {name}"),
         }
     }
@@ -3188,6 +3190,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
             || node.name() == "json_as_text"
             || node.name() == "json_len"
             || node.name() == "json_length"
+            || node.name() == "rhai_eval"
         {
             UdfKind::Standard(r#gen::StandardUdf {})
         } else if let Some(func) = node_inner.downcast_ref::<SparkMapFromArrays>() {

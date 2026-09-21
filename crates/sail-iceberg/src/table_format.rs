@@ -16,9 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema};
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{
-    DataFusionError, Result, TableReference, ToDFSchema, not_impl_err, plan_err,
-};
+use datafusion::common::{DataFusionError, Result, TableReference, not_impl_err, plan_err};
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{LogicalPlan, TableScan, TableSource};
@@ -189,7 +187,6 @@ impl TableFormat for IcebergTableFormat {
                 .map(|snapshot| snapshot.snapshot_id()),
         );
         let table_source: Arc<dyn TableSource> = Arc::new(IcebergTableSource::new(provider));
-        let raw_input_schema = table_source.schema().to_dfschema_ref()?;
         let target_scan = LogicalPlan::TableScan(TableScan::try_new(
             table_reference_from_parts(&table_name),
             table_source,
@@ -198,21 +195,16 @@ impl TableFormat for IcebergTableFormat {
             None,
         )?);
 
-        let write_node = sail_logical_plan::merge::RowLevelWriteNode::new_delete(
-            Arc::new(target_scan),
-            raw_input_schema,
+        crate::logical::delete::expand_delete_node(
+            target_scan,
             condition,
             self.name().to_string(),
             path,
             table_name,
             options,
             lakehouse_table,
+            expected_snapshot_id,
         )
-        .with_expected_snapshot_id(expected_snapshot_id);
-
-        Ok(LogicalPlan::Extension(Extension {
-            node: Arc::new(write_node),
-        }))
     }
 
     async fn create_merger(

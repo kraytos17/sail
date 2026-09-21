@@ -72,7 +72,7 @@ pub fn expand_update_node(info: UpdateInfo) -> Result<LogicalPlan> {
 
 /// Walk the logical plan tree and enable the file-path metadata column on any
 /// `IcebergTableSource` found in `TableScan` nodes.
-fn ensure_update_metadata_columns(plan: LogicalPlan) -> Result<LogicalPlan> {
+pub(crate) fn ensure_update_metadata_columns(plan: LogicalPlan) -> Result<LogicalPlan> {
     use datafusion::common::tree_node::TreeNode;
 
     let result = plan.transform_up(|node| match node {

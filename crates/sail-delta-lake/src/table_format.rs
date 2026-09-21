@@ -440,6 +440,8 @@ impl TableFormat for DeltaTableFormat {
             )),
             Arc::new(DFSchema::empty()),
             condition,
+            None,
+            None,
             self.name().to_string(),
             path,
             table_name,

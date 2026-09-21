@@ -211,11 +211,15 @@ impl RowLevelWriteNode {
         self
     }
 
-    /// Create a DELETE write node carrying the condition for the physical planner.
+    /// Create a DELETE write node carrying the condition for the physical planner,
+    /// plus optional rewrite plans for copy-on-write execution.
+    #[expect(clippy::too_many_arguments)]
     pub fn new_delete(
         raw_target: Arc<LogicalPlan>,
         raw_input_schema: DFSchemaRef,
         condition: Option<ExprWithSource>,
+        write_plan: Option<Arc<LogicalPlan>>,
+        touched_files_plan: Option<Arc<LogicalPlan>>,
         format: String,
         location: String,
         table_name: Vec<String>,
@@ -227,8 +231,8 @@ impl RowLevelWriteNode {
             raw_target,
             raw_source: None,
             raw_input_schema,
-            write_plan: None,
-            touched_files_plan: None,
+            write_plan,
+            touched_files_plan,
             row_index_delete_plan: None,
             condition,
             merge_options: None,
@@ -1033,6 +1037,42 @@ pub fn expand_update(info: UpdateInfo, path_column: &str) -> Result<UpdateExpans
         write_plan,
         touched_files_plan,
         output_schema,
+    })
+}
+
+/// Result of expanding a DELETE into rewrite plans for copy-on-write execution.
+///
+/// - Conditionless DELETE yields `None`/`None` (planned as truncate downstream).
+/// - Otherwise `write_plan` retains surviving rows and `touched_files_plan`
+///   yields file paths containing matched rows.
+#[derive(Debug, Clone)]
+pub struct DeleteExpansion {
+    pub write_plan: Option<LogicalPlan>,
+    pub touched_files_plan: Option<LogicalPlan>,
+}
+
+pub fn expand_delete(
+    target: LogicalPlan,
+    condition: Option<ExprWithSource>,
+    path_column: &str,
+) -> Result<DeleteExpansion> {
+    let Some(cond) = condition else {
+        return Ok(DeleteExpansion {
+            write_plan: None,
+            touched_files_plan: None,
+        });
+    };
+    // Retain rows where the predicate is not true, so NULL-condition rows survive.
+    let write_plan = LogicalPlanBuilder::from(target.clone())
+        .filter(cond.expr.clone().is_not_true())?
+        .build()?;
+    let touched_files_plan = LogicalPlanBuilder::from(target)
+        .filter(cond.expr)?
+        .project(vec![Expr::Column(Column::new_unqualified(path_column))])?
+        .build()?;
+    Ok(DeleteExpansion {
+        write_plan: Some(write_plan),
+        touched_files_plan: Some(touched_files_plan),
     })
 }
 
@@ -2294,4 +2334,114 @@ fn all_placeholder_schema(schema: &DFSchemaRef, path_column: &str) -> bool {
         .filter(|name| *name != path_column)
         .collect();
     !non_path.is_empty() && non_path.iter().all(|name| name.starts_with('#'))
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use datafusion_expr::logical_plan::EmptyRelation;
+
+    use super::*;
+
+    const FILE_COLUMN: &str = "__sail_file_path";
+
+    fn delete_target() -> Result<LogicalPlan> {
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(FILE_COLUMN, DataType::Utf8, true),
+        ]);
+        let schema = Arc::new(DFSchema::try_from_qualified_schema(
+            TableReference::bare("t"),
+            &arrow_schema,
+        )?);
+        Ok(LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: false,
+            schema,
+        }))
+    }
+
+    fn delete_condition() -> ExprWithSource {
+        ExprWithSource::new(col("id").lt(lit(10i64)), None)
+    }
+
+    #[test]
+    fn expand_delete_without_condition_yields_no_plans() -> Result<()> {
+        let expansion = expand_delete(delete_target()?, None, FILE_COLUMN)?;
+        assert!(expansion.write_plan.is_none());
+        assert!(expansion.touched_files_plan.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn expand_delete_retains_rows_where_condition_is_not_true() -> Result<()> {
+        let expansion = expand_delete(delete_target()?, Some(delete_condition()), FILE_COLUMN)?;
+        let Some(write_plan) = expansion.write_plan else {
+            return plan_err!("expand_delete should produce a write plan");
+        };
+        let LogicalPlan::Filter(filter) = &write_plan else {
+            return plan_err!("write plan should be a filter, got: {write_plan:?}");
+        };
+        assert!(
+            matches!(filter.predicate, Expr::IsNotTrue(_)),
+            "retention predicate should be NULL-safe, got: {:?}",
+            filter.predicate
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expand_delete_touched_plan_projects_only_file_column() -> Result<()> {
+        let expansion = expand_delete(delete_target()?, Some(delete_condition()), FILE_COLUMN)?;
+        let Some(touched) = expansion.touched_files_plan else {
+            return plan_err!("expand_delete should produce a touched-files plan");
+        };
+        let LogicalPlan::Projection(projection) = &touched else {
+            return plan_err!("touched plan should be a projection, got: {touched:?}");
+        };
+        assert_eq!(projection.expr.len(), 1);
+        let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+            return plan_err!(
+                "touched plan should filter before projecting, got: {:?}",
+                projection.input
+            );
+        };
+        let Expr::BinaryExpr(datafusion_expr::BinaryExpr { left, op, right }) = &filter.predicate
+        else {
+            return plan_err!(
+                "touched plan should filter on the condition, got: {:?}",
+                filter.predicate
+            );
+        };
+        assert_eq!(*op, Operator::Lt);
+        assert!(matches!(left.as_ref(), Expr::Column(_)));
+        assert!(matches!(right.as_ref(), Expr::Literal(_, _)));
+        Ok(())
+    }
+
+    #[test]
+    fn new_delete_carries_rewrite_plans_through_inputs() -> Result<()> {
+        let target = delete_target()?;
+        let raw_input_schema = target.schema().clone();
+        let expansion = expand_delete(target.clone(), Some(delete_condition()), FILE_COLUMN)?;
+        let node = RowLevelWriteNode::new_delete(
+            Arc::new(target),
+            raw_input_schema,
+            Some(delete_condition()),
+            expansion.write_plan.map(Arc::new),
+            expansion.touched_files_plan.map(Arc::new),
+            "iceberg".to_string(),
+            "s3://bucket/table".to_string(),
+            vec!["t".to_string()],
+            vec![],
+            None,
+        );
+        assert!(node.write_plan().is_some());
+        assert!(node.touched_files_plan().is_some());
+        let inputs: Vec<LogicalPlan> = node.inputs().into_iter().cloned().collect();
+        assert_eq!(inputs.len(), 2);
+        let roundtripped = node.with_exprs_and_inputs(vec![], inputs)?;
+        assert!(roundtripped.write_plan().is_some());
+        assert!(roundtripped.touched_files_plan().is_some());
+        Ok(())
+    }
 }

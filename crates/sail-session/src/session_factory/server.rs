@@ -19,6 +19,7 @@ use sail_common_datafusion::session::job::{JobRunner, JobService};
 use sail_common_datafusion::session::repartition::RepartitionBufferConfig;
 use sail_delta_lake::session_extension::DeltaTableCache;
 use sail_physical_optimizer::{PhysicalOptimizerOptions, get_physical_optimizers};
+use sail_rhai_udf::register_rhai_functions;
 use sail_telemetry::telemetry::global_system_event_reader;
 
 use crate::catalog::create_catalog_manager;
@@ -95,6 +96,7 @@ impl SessionFactory<ServerSessionInfo> for ServerSessionFactory {
             .state_ref()
             .write()
             .register_udaf(first_value_udaf())?;
+        register_rhai_functions(&context)?;
 
         Ok(context)
     }

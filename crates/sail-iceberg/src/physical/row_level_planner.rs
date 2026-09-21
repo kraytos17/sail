@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use datafusion::arrow::array::StringArray;
@@ -22,6 +22,7 @@ use log::debug;
 use sail_common_datafusion::datasource::{MERGE_FILE_COLUMN, PhysicalSinkMode, RowLevelCommand};
 use sail_data_source::options::ResolveOptions;
 use sail_logical_plan::merge::RowLevelWriteNode;
+use url::Url;
 
 use crate::operations::SnapshotUpdateKind;
 use crate::options::r#gen::IcebergWriteOptions;
@@ -44,7 +45,9 @@ pub(crate) async fn plan_iceberg_row_level_write(
     physical_inputs: &[Arc<dyn ExecutionPlan>],
 ) -> Result<Arc<dyn ExecutionPlan>> {
     match node.command() {
-        RowLevelCommand::Delete => plan_iceberg_delete(session_state, planner, node).await,
+        RowLevelCommand::Delete => {
+            plan_iceberg_delete(session_state, planner, node, physical_inputs).await
+        }
         RowLevelCommand::Update => {
             plan_iceberg_update(session_state, planner, node, physical_inputs).await
         }
@@ -115,16 +118,12 @@ async fn plan_iceberg_delete(
     session_state: &SessionState,
     planner: &dyn PhysicalPlanner,
     node: &RowLevelWriteNode,
+    physical_inputs: &[Arc<dyn ExecutionPlan>],
 ) -> Result<Arc<dyn ExecutionPlan>> {
     // TRUNCATE TABLE (and conditionless DELETE) removes every row.
     if node.condition().is_none() {
         return plan_iceberg_truncate(session_state, node).await;
     }
-    let condition = node.condition().ok_or_else(|| {
-        DataFusionError::Plan(
-            "Iceberg equality-delete MOR DELETE requires a WHERE condition".to_string(),
-        )
-    })?;
 
     let table_url =
         IcebergTableFormat::parse_table_url(vec![node.target_location().to_string()]).await?;
@@ -138,6 +137,25 @@ async fn plan_iceberg_delete(
     )
     .await?;
     ensure_current_row_level_mode(&table, RowLevelCommand::Delete)?;
+    if delete_mode_is_merge_on_read(&table) {
+        return plan_iceberg_delete_mor(session_state, planner, node, &table, &table_url).await;
+    }
+    plan_iceberg_delete_cow(session_state, node, physical_inputs, &table, &table_url).await
+}
+
+async fn plan_iceberg_delete_mor(
+    session_state: &SessionState,
+    planner: &dyn PhysicalPlanner,
+    node: &RowLevelWriteNode,
+    table: &Table,
+    table_url: &Url,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let condition = node.condition().ok_or_else(|| {
+        DataFusionError::Plan(
+            "Iceberg equality-delete MOR DELETE requires a WHERE condition".to_string(),
+        )
+    })?;
+
     let current_schema = table.metadata().current_schema().ok_or_else(|| {
         DataFusionError::Plan("Iceberg table metadata is missing current schema".to_string())
     })?;
@@ -151,11 +169,11 @@ async fn plan_iceberg_delete(
         .await?;
 
     let writer_options = resolve_row_level_writer_options(session_state, node)?;
-    let partition_columns = IcebergTableFormat::partition_columns_from_metadata(&table)?;
+    let partition_columns = IcebergTableFormat::partition_columns_from_metadata(table)?;
     let current_arrow_schema =
         crate::datasource::type_converter::iceberg_schema_to_arrow(current_schema)?;
     let write_context = prepare_iceberg_write_context(
-        &table_url,
+        table_url,
         Some(table.metadata()),
         &writer_options,
         &partition_columns,
@@ -178,9 +196,68 @@ async fn plan_iceberg_delete(
     Ok(Arc::new(
         IcebergCommitExec::new(
             Arc::new(CoalescePartitionsExec::new(delete_writer)),
-            table_url,
+            table_url.clone(),
             writer_options.lakehouse_table.clone(),
             SnapshotUpdateKind::RowDelta,
+        )
+        .with_expected_snapshot_id(node.expected_snapshot_id()),
+    ))
+}
+
+/// Plans copy-on-write `DELETE` by rewriting all surviving rows and committing
+/// a full overwrite.
+///
+/// The overwrite drops every parent manifest, so retained rows from untouched
+/// files must be rewritten too — the write plan already carries the full
+/// retained set (NULL-safe retention predicate from the logical expansion).
+/// This matches Spark's copy-on-write DELETE (dynamic overwrite) semantics.
+async fn plan_iceberg_delete_cow(
+    session_state: &SessionState,
+    node: &RowLevelWriteNode,
+    physical_inputs: &[Arc<dyn ExecutionPlan>],
+    table: &Table,
+    table_url: &Url,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let write_plan = physical_inputs.first().cloned().ok_or_else(|| {
+        DataFusionError::Internal("Iceberg DELETE missing write plan input".to_string())
+    })?;
+
+    let current_schema = table.metadata().current_schema().ok_or_else(|| {
+        DataFusionError::Plan("Iceberg table metadata is missing current schema".to_string())
+    })?;
+    let current_arrow_schema =
+        crate::datasource::type_converter::iceberg_schema_to_arrow(current_schema)?;
+
+    let writer_options = resolve_row_level_writer_options(session_state, node)?;
+    let partition_columns = IcebergTableFormat::partition_columns_from_metadata(table)?;
+    let write_context = prepare_iceberg_write_context(
+        table_url,
+        Some(table.metadata()),
+        &writer_options,
+        &partition_columns,
+        &PhysicalSinkMode::Append,
+        &current_arrow_schema,
+    )?;
+
+    // The write plan still carries the internal file-path column; strip it
+    // before writing.
+    let writer_input = strip_internal_columns(write_plan, &current_arrow_schema)?;
+    let writer: Arc<dyn ExecutionPlan> = Arc::new(IcebergWriterExec::new(
+        writer_input,
+        table_url.clone(),
+        partition_columns,
+        PhysicalSinkMode::Append,
+        true,
+        writer_options.clone(),
+        write_context,
+    )?);
+
+    Ok(Arc::new(
+        IcebergCommitExec::new(
+            writer,
+            table_url.clone(),
+            writer_options.lakehouse_table.clone(),
+            SnapshotUpdateKind::FullOverwrite,
         )
         .with_expected_snapshot_id(node.expected_snapshot_id()),
     ))
@@ -260,17 +337,27 @@ async fn plan_iceberg_truncate(
 }
 
 fn ensure_current_row_level_mode(table: &Table, command: RowLevelCommand) -> Result<()> {
+    check_row_level_mode(&table.metadata().properties, command)
+}
+
+fn check_row_level_mode(
+    properties: &HashMap<String, String>,
+    command: RowLevelCommand,
+) -> Result<()> {
     let (operation, property) = match command {
         RowLevelCommand::Delete => ("DELETE", "write.delete.mode"),
         RowLevelCommand::Merge => ("MERGE", "write.merge.mode"),
         RowLevelCommand::Update => ("UPDATE", "write.update.mode"),
     };
-    let mode = table
-        .metadata()
-        .properties
+    let mode = properties
         .get(property)
         .map_or("copy-on-write", String::as_str);
     if mode.eq_ignore_ascii_case("merge-on-read") {
+        return Ok(());
+    }
+    // Copy-on-write DELETE rewrites surviving data files; UPDATE/MERGE
+    // copy-on-write is not supported yet.
+    if matches!(command, RowLevelCommand::Delete) && mode.eq_ignore_ascii_case("copy-on-write") {
         return Ok(());
     }
     if mode.eq_ignore_ascii_case("copy-on-write") {
@@ -281,6 +368,18 @@ fn ensure_current_row_level_mode(table: &Table, command: RowLevelCommand) -> Res
     plan_err!(
         "Unknown Iceberg row-level operation mode for `{property}`: {mode}; expected `copy-on-write` or `merge-on-read`"
     )
+}
+
+/// Whether conditional DELETE on this table uses merge-on-read equality deletes.
+/// Any other (or missing) `write.delete.mode` means copy-on-write.
+fn delete_mode_is_merge_on_read(table: &Table) -> bool {
+    is_delete_merge_on_read(&table.metadata().properties)
+}
+
+fn is_delete_merge_on_read(properties: &HashMap<String, String>) -> bool {
+    properties
+        .get("write.delete.mode")
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("merge-on-read"))
 }
 
 fn resolve_row_level_writer_options(
@@ -560,4 +659,83 @@ fn strip_internal_columns(
         })
         .collect();
     Ok(Arc::new(ProjectionExec::try_new(projections, input)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn properties(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn delete_defaults_to_copy_on_write_and_is_allowed() -> Result<()> {
+        check_row_level_mode(&properties(&[]), RowLevelCommand::Delete)?;
+        check_row_level_mode(
+            &properties(&[("write.delete.mode", "copy-on-write")]),
+            RowLevelCommand::Delete,
+        )?;
+        assert!(!is_delete_merge_on_read(&properties(&[])));
+        assert!(!is_delete_merge_on_read(&properties(&[(
+            "write.delete.mode",
+            "copy-on-write"
+        )])));
+        Ok(())
+    }
+
+    #[test]
+    fn delete_merge_on_read_is_allowed() -> Result<()> {
+        let props = properties(&[("write.delete.mode", "Merge-On-Read")]);
+        check_row_level_mode(&props, RowLevelCommand::Delete)?;
+        assert!(is_delete_merge_on_read(&props));
+        Ok(())
+    }
+
+    #[test]
+    fn delete_unknown_mode_is_rejected() -> Result<()> {
+        let err = match check_row_level_mode(
+            &properties(&[("write.delete.mode", "magic")]),
+            RowLevelCommand::Delete,
+        ) {
+            Ok(()) => return plan_err!("unknown delete mode should fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("write.delete.mode"));
+        Ok(())
+    }
+
+    #[test]
+    fn update_and_merge_copy_on_write_is_rejected() -> Result<()> {
+        for (command, property) in [
+            (RowLevelCommand::Update, "write.update.mode"),
+            (RowLevelCommand::Merge, "write.merge.mode"),
+        ] {
+            let err = match check_row_level_mode(&properties(&[]), command) {
+                Ok(()) => return plan_err!("CoW update/merge should fail"),
+                Err(e) => e,
+            };
+            assert!(
+                err.to_string().contains(property),
+                "unexpected error: {err}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn update_and_merge_merge_on_read_is_allowed() -> Result<()> {
+        check_row_level_mode(
+            &properties(&[("write.update.mode", "merge-on-read")]),
+            RowLevelCommand::Update,
+        )?;
+        check_row_level_mode(
+            &properties(&[("write.merge.mode", "merge-on-read")]),
+            RowLevelCommand::Merge,
+        )?;
+        Ok(())
+    }
 }
