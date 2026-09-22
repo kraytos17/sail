@@ -22,6 +22,7 @@ use datafusion_datasource::projection::{ProjectionOpener, SplitProjection};
 use datafusion_datasource::{FileRange, PartitionedFile, RangeCalculation, TableSchema};
 use futures::{StreamExt, TryStreamExt};
 use object_store::{GetOptions, GetResultPayload, ObjectStore};
+use regex::Regex;
 
 use super::decoder::{LossyUtf8Reader, decode_utf8_lossy_stream};
 use super::projected::{DecoderBatchReader, ProjectedCsvDecoder, ProjectedCsvOptions};
@@ -32,6 +33,7 @@ type CsvBatchReader = Box<dyn Iterator<Item = std::result::Result<RecordBatch, A
 #[derive(Debug, Clone)]
 pub struct CsvSource {
     options: CsvOptions,
+    null_regex: Option<Regex>,
     batch_size: Option<usize>,
     table_schema: TableSchema,
     projection: SplitProjection,
@@ -43,6 +45,7 @@ impl CsvSource {
         let table_schema = table_schema.into();
         Self {
             options: CsvOptions::default(),
+            null_regex: None,
             batch_size: None,
             projection: SplitProjection::unprojected(&table_schema),
             table_schema,
@@ -50,9 +53,22 @@ impl CsvSource {
         }
     }
 
-    pub fn with_csv_options(mut self, options: CsvOptions) -> Self {
+    pub fn with_csv_options(mut self, options: CsvOptions) -> Result<Self> {
+        if let Some(pattern) = &options.null_regex {
+            let regex = Regex::new(pattern.as_str()).map_err(|e| {
+                DataFusionError::External(
+                    crate::error::DataSourceError::InvalidOption {
+                        key: "null_regex".to_string(),
+                        value: pattern.clone(),
+                        cause: Some(e.to_string()),
+                    }
+                    .into(),
+                )
+            })?;
+            self.null_regex = Some(regex);
+        }
         self.options = options;
-        self
+        Ok(self)
     }
 
     pub fn options(&self) -> &CsvOptions {
@@ -125,6 +141,7 @@ impl CsvSource {
             has_header: self.has_header(),
             truncated_rows: self.truncate_rows(),
             batch_size: self.batch_size()?,
+            null_regex: self.null_regex.clone(),
         })?;
         Ok(Some(decoder))
     }
@@ -138,6 +155,9 @@ impl CsvSource {
             .with_truncated_rows(self.truncate_rows())
             .with_projection(self.projection.file_indices.clone());
 
+        if let Some(null_regex) = self.null_regex.clone() {
+            builder = builder.with_null_regex(null_regex);
+        }
         if let Some(terminator) = self.terminator() {
             builder = builder.with_terminator(terminator);
         }
@@ -320,5 +340,46 @@ impl FileOpener for CsvOpener {
                 }
             }
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::datatypes::Schema;
+
+    use super::*;
+
+    fn empty_table_schema() -> TableSchema {
+        TableSchema::new(Arc::new(Schema::empty()), vec![])
+    }
+
+    #[test]
+    fn test_with_csv_options_compiles_null_regex() -> Result<()> {
+        let csv = CsvOptions {
+            null_regex: Some("null".to_string()),
+            ..Default::default()
+        };
+        let source = CsvSource::new(empty_table_schema()).with_csv_options(csv)?;
+        assert!(source.null_regex.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_csv_options_leaves_null_regex_unset_by_default() -> Result<()> {
+        let source = CsvSource::new(empty_table_schema()).with_csv_options(CsvOptions::default())?;
+        assert!(source.null_regex.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_csv_options_rejects_invalid_null_regex() {
+        let csv = CsvOptions {
+            null_regex: Some("(".to_string()),
+            ..Default::default()
+        };
+        let result = CsvSource::new(empty_table_schema()).with_csv_options(csv);
+        assert!(result.is_err());
     }
 }

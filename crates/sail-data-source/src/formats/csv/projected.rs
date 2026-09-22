@@ -5,7 +5,9 @@
 //! to find record ends without a quote byte, then a SWAR (SIMD Within A Register) byte-equality
 //! scan (one 64-bit mask per 64-byte block) to visit delimiters through the largest projected col.
 //! Records containing quotes are delegated from their start to `csv_core`, arrow-csv's parser.
-//! Field-count validation, header skipping, truncated-row padding, and null handling follow arrow.
+//! Field-count validation, header skipping, and truncated-row padding follow arrow.
+//! Null handling follows arrow except that an empty field stays null even when a
+//! null regex is set (Sail's "empty values are null" default survives `nullValue`).
 //!
 //! It preserves Spark's comment handling in two departures from arrow-csv caused by `csv_core` DFA quirks:
 //! - Comments end at the record terminator: at a bare `\r` in the default mode, and at the
@@ -25,6 +27,7 @@ use datafusion::arrow::array::{
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::error::ArrowError;
 use datafusion_datasource::decoder::Decoder;
+use regex::Regex;
 
 const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
@@ -42,6 +45,7 @@ pub struct ProjectedCsvOptions {
     pub has_header: bool,
     pub truncated_rows: bool,
     pub batch_size: usize,
+    pub null_regex: Option<Regex>,
 }
 
 #[derive(Debug)]
@@ -55,6 +59,7 @@ pub struct ProjectedCsvDecoder {
     num_columns: usize,
     truncated_rows: bool,
     batch_size: usize,
+    null_regex: Option<Regex>,
     // `(file column, output column)` sorted by file column
     wanted: Vec<(usize, usize)>,
     builders: Vec<BinaryBuilder>,
@@ -91,6 +96,7 @@ impl ProjectedCsvDecoder {
             has_header,
             truncated_rows,
             batch_size,
+            null_regex,
         } = options;
         let projected = Arc::new(schema.project(&projection)?);
         let mut wanted: Vec<(usize, usize)> = projection
@@ -124,6 +130,7 @@ impl ProjectedCsvDecoder {
             num_columns: schema.fields().len(),
             truncated_rows,
             batch_size,
+            null_regex,
             builders: projection
                 .iter()
                 .map(|_| BinaryBuilder::with_capacity(batch_size, batch_size * 16))
@@ -260,13 +267,18 @@ impl ProjectedCsvDecoder {
             return Ok(());
         }
         for (w, &(column, output)) in self.wanted.iter().enumerate() {
-            // arrow `parse` (reader/mod.rs:823-830): an empty field is null
+            // arrow `parse` (reader/mod.rs:823-830): an empty field is null.
+            // Unlike arrow's `NullRegex` (which drops the empty check once a
+            // regex is set), an empty field stays null here so Sail's
+            // "empty values are null" default survives `nullValue`/`nullRegex`.
             let value = if column < num_fields {
                 field(w, column)
             } else {
                 &[]
             };
-            if value.is_empty() {
+
+            let is_null = value.is_empty() || self.is_null_value(value);
+            if is_null {
                 self.builders[output].append_null();
             } else {
                 self.builders[output].append_value(value);
@@ -274,6 +286,16 @@ impl ProjectedCsvDecoder {
         }
         self.rows += 1;
         Ok(())
+    }
+
+    /// Returns true when the raw field bytes match the configured null regex.
+    /// Non-UTF8 bytes never match; the lossy UTF-8 decoding upstream guarantees
+    /// this path only sees valid UTF-8 in practice.
+    #[inline]
+    fn is_null_value(&self, value: &[u8]) -> bool {
+        self.null_regex
+            .as_ref()
+            .is_some_and(|re| std::str::from_utf8(value).is_ok_and(|s| re.is_match(s)))
     }
 }
 
@@ -482,6 +504,7 @@ mod tests {
             has_header: true,
             truncated_rows: false,
             batch_size: 8192,
+            null_regex: None,
         }
     }
 
@@ -493,6 +516,9 @@ mod tests {
             .with_quote(o.quote)
             .with_truncated_rows(o.truncated_rows)
             .with_projection(o.projection.clone());
+        if let Some(null_regex) = o.null_regex.clone() {
+            builder = builder.with_null_regex(null_regex);
+        }
         if let Some(t) = o.terminator {
             builder = builder.with_terminator(t);
         }
@@ -833,6 +859,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_projected_decoder_null_regex() -> Result<(), ArrowError> {
+        let regex = || regex::Regex::new("null").map_err(|e| ArrowError::ParseError(e.to_string()));
+        // Parity with arrow-csv on inputs without empty fields: `null` and
+        // `nullable` (unanchored substring match, same as DataFusion) are null,
+        // `NULL` is not (case-sensitive).
+        assert_matches_arrow(
+            b"a,b\nnull,x\nNULL,y\nnullable,w\n",
+            ProjectedCsvOptions {
+                null_regex: Some(regex()?),
+                ..options(2, &[1, 0])
+            },
+        );
+        // Empty fields stay null in Sail even with a regex set. arrow-csv's
+        // `NullRegex` would return `""` here; Sail keeps its "empty values are
+        // null" default.
+        let options = ProjectedCsvOptions {
+            null_regex: Some(regex()?),
+            ..options(2, &[0, 1])
+        };
+        let schema = Arc::clone(&options.schema);
+        let decoder = ProjectedCsvDecoder::try_new(options)?;
+        let batches = run(decoder, b"a,b\nnull,x\nNULL,y\n,z\nnullable,w\n", 4096)
+            .map_err(ArrowError::CsvError)?;
+        let expected = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![
+                    None::<&str>,
+                    Some("NULL"),
+                    None,
+                    None,
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    Some("x"),
+                    Some("y"),
+                    Some("z"),
+                    Some("w"),
+                ])) as ArrayRef,
+            ],
+        )?;
+        assert_eq!(batches, vec![expected]);
+        Ok(())
     }
 
     #[test]

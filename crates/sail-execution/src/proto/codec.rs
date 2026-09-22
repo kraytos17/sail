@@ -569,7 +569,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 let options = try_decode_message::<gen_datafusion_common::CsvOptions>(&options)?;
                 let csv_options: CsvOptions = (&options).try_into()?;
                 let file_compression_type: FileCompressionType = csv_options.compression.into();
-                let source = CsvSource::new(table_schema).with_csv_options(csv_options);
+                let source = CsvSource::new(table_schema).with_csv_options(csv_options)?;
                 let source = parse_protobuf_file_scan_config(
                     &base_config,
                     &PhysicalPlanDecodeContext::new(ctx, self),
@@ -5340,7 +5340,7 @@ mod tests {
         };
         let mut expected_options = csv_options.clone();
         expected_options.compression = CompressionTypeVariant::GZIP;
-        let source = Arc::new(CsvSource::new(table_schema).with_csv_options(csv_options));
+        let source = Arc::new(CsvSource::new(table_schema).with_csv_options(csv_options)?);
         let file_scan = FileScanConfigBuilder::new(
             datafusion::execution::object_store::ObjectStoreUrl::local_filesystem(),
             source,

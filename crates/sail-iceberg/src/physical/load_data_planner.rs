@@ -282,7 +282,7 @@ fn build_fallback_scan(
                 datafusion_common::config::CsvOptions::default().with_has_header(has_header);
             Arc::new(
                 sail_data_source::formats::csv::CsvSource::new(Arc::new(table_schema.clone()))
-                    .with_csv_options(csv_options),
+                    .with_csv_options(csv_options)?,
             )
         }
         "json" => Arc::new(datafusion::datasource::physical_plan::JsonSource::new(
