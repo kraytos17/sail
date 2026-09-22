@@ -70,7 +70,7 @@ impl Default for IcebergWriterExecOptions {
             shred_variants_explicit: false,
             variant_inference_buffer_size: 100,
             variant_inference_buffer_size_explicit: false,
-            compression_codec: "zstd".to_string(),
+            compression_codec: "snappy".to_string(),
             target_file_size: 134_217_728,
             touched_file_paths: vec![],
             overwrite_predicate: None,
@@ -93,7 +93,7 @@ impl From<IcebergWriteOptions> for IcebergWriterExecOptions {
             variant_inference_buffer_size_explicit: false,
             compression_codec: options
                 .compression_codec
-                .unwrap_or_else(|| "zstd".to_string()),
+                .unwrap_or_else(|| "snappy".to_string()),
             target_file_size: options.target_file_size_bytes.unwrap_or(134_217_728),
             touched_file_paths: vec![],
             overwrite_predicate: None,
@@ -245,6 +245,14 @@ mod tests {
         assert_eq!(
             IcebergWriterExecOptions::default().target_file_size,
             DEFAULT_TARGET_FILE_SIZE
+        );
+    }
+
+    #[test]
+    fn default_compression_codec_is_snappy() {
+        assert_eq!(
+            IcebergWriterExecOptions::default().compression_codec,
+            "snappy"
         );
     }
 }

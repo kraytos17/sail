@@ -114,7 +114,7 @@ carry no Iceberg field IDs (LOAD DATA fast path).
 `IcebergWriterExecOptions` (Default) gains:
 
 ```rust
-compression_codec: String,      // default "zstd"
+compression_codec: String,      // default "snappy"
 target_file_size: u64,          // default 134_217_728 (128 MB)
 commit_operation: Option<Operation>,   // DELETE → Delete, MERGE → Overwrite, COMPACT → Replace
 touched_file_paths: Vec<String>,
@@ -147,7 +147,7 @@ previously used `..Default::default()` and silently dropped a user `compression-
 - `CommitMeta` now carries `touched_file_paths`, `overwrite_predicate` (from options) and the
   computed `overwrite_partition_values`.
 - Tests: `resolve_compression_codec_maps_codecs`,
-  `default_writer_properties_use_zstd`.
+  `default_compression_codec_is_snappy`, `from_preserves_compression_codec`.
 
 ---
 
@@ -226,21 +226,36 @@ requirements, table_properties, lakehouse_table). Its proto round-trip is doc 03
    `allow_fast = !partitioned`; partitioned tables always rewrite.
 5. **All-fast**: `IcebergCommitExec(IcebergLoadDataFastExec(...))`.
 6. **Mixed/fallback**: fast branch (if any) + one writer branch **per source format group**
-   (`group_by_format` buckets csv/json/parquet; unknown ext defaults csv). Each writer is
-   `IcebergWriterExec` built **from the resolved `IcebergWriteOptions`**
+   (`group_by_format` buckets by `(extension, compression)`; unknown ext defaults csv). Each
+   writer is `IcebergWriterExec` built **from the resolved `IcebergWriteOptions`**
    (preserves user `compression-codec`/`write.data.path`; only `commit_operation`,
    `lakehouse_table`, `table_properties` overridden). Branches are unioned, coalesced, then
-   committed by one `IcebergCommitExec`. No extra repartition — `build_fallback_scan` byte-range
-   repartitions large files to `target_partitions`, small files stay one task each.
-7. `build_fallback_scan`: one `FileGroup` per file with real sizes; per-format `FileSource`
-   (CSV `with_has_header(true)`, JSON, Parquet) over the table schema; compression inferred by
-   `infer_source_compression` from the extension (`gz/bz2/xz/zst`, case-insensitive); then
-   `DataSourceExec::repartitioned(target_partitions, config)` (FileGroupPartitioner splits
-   large files first; declines compressed/small/unsplittable → one task/file).
+   committed by one `IcebergCommitExec`. No extra repartition — `build_fallback_scan` chunks
+   large files at plan time and caps scan parallelism, small files stay one task each.
+7. `build_fallback_scan`: explicit plan-time chunking. Uncompressed files are split into
+   `LOAD_TARGET_CHUNK_SIZE` (512 MB) `PartitionedFile` groups with `with_range`, so every read
+   is a bounded `GetRange`; compressed files (and files at or below the chunk size) stay one
+   whole-file group, since a byte range inside a compressed stream cannot be decoded
+   ("Reading compressed .csv in parallel is not supported"). Per-format `FileSource`
+   (CSV via Sail's `CsvSource` with `has_header` from the session catalog config, JSON,
+   Parquet with cached footer reader + schema-evolution adapter) over the table schema.
+   Compression comes from the bucket key, **not** from `files[0]`, so mixed-compression
+   directories cannot force one file's codec onto another. The scan is then
+   `DataSourceExec::repartitioned(clamp(target_partitions, 1, LOAD_SCAN_MAX_PARTITIONS), config)`:
+   the partitioner only balances the existing bounded chunks/files and cannot split further.
 
-Tests: `splits_large_csv_files_across_target_partitions`,
-`repartitioned_groups_tile_file_bytes_exactly` (chunks tile `[0,size)` exactly, in order),
-`keeps_single_partition_for_small_files`, `does_not_split_compressed_csv`,
+   **Why plan-time chunking is load-bearing**: leaving the split to `FileGroupPartitioner`
+   alone makes it carve ranges spanning hundreds of MB, and each range then probes the store
+   with a `start..file_size` GET at read time; MinIO/S3 tear those streams down mid-response
+   (`Generic S3 error: HTTP error: request or response body error`), failing the whole
+   `IcebergWriterExec`. `LOAD_SCAN_MAX_PARTITIONS` (16) additionally bounds concurrent streams —
+   32 concurrent readers is the configuration that originally reproduced the teardown.
+
+Tests: `small_csv_files_keep_one_group_per_file`,
+`compressed_csv_files_are_never_range_split`,
+`large_uncompressed_csv_files_chunk_to_target_size` (chunks are non-empty, within the file,
+at most `LOAD_TARGET_CHUNK_SIZE`, and cover the source exactly once),
+`fallback_scan_partitions_are_capped`, `mixed_compression_directory_splits_into_separate_scans`,
 `infers_compression_from_extension`, `load_data_table_properties_exclude_catalog_options`.
 
 ---

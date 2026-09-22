@@ -44,7 +44,7 @@ use crate::utils::{get_object_store_from_session, url_to_object_path};
 /// spanning hundreds of MB, and each such range then probes the store with a
 /// `start..file_size` GET at read time; object stores tear those streams down
 /// mid-response (`Generic S3 error: ... request or response body error`).
-const LOAD_TARGET_CHUNK_SIZE: u64 = 256 * 1024 * 1024;
+const LOAD_TARGET_CHUNK_SIZE: u64 = 512 * 1024 * 1024;
 
 /// Upper bound on scan parallelism for the LOAD fallback path.
 ///
@@ -57,7 +57,7 @@ const LOAD_TARGET_CHUNK_SIZE: u64 = 256 * 1024 * 1024;
 /// the session default cannot silently widen the LOAD fan-out again: 32
 /// concurrent readers is the configuration that originally tore down S3
 /// response bodies.
-const LOAD_SCAN_MAX_PARTITIONS: usize = 8;
+const LOAD_SCAN_MAX_PARTITIONS: usize = 16;
 
 pub async fn plan_load_data(
     session_state: &SessionState,

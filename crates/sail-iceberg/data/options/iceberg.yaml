@@ -578,10 +578,10 @@
 
 - key: compression_codec
   description: |
-    Override compression codec. Defaults to "zstd". Accepted values:
+    Override compression codec. Defaults to "snappy". Accepted values:
     zstd, snappy, gzip, lz4, brotli, uncompressed, none.
   default:
-    value: "zstd"
+    value: "snappy"
     parser: crate::options::parsers::parse_optional_string
   supported: true
   rust_type: "Option<String>"

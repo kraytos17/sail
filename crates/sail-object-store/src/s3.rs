@@ -17,15 +17,32 @@ use aws_smithy_runtime_api::client::runtime_components::{
 use aws_smithy_types::config_bag::ConfigBag;
 use datafusion_common::plan_datafusion_err;
 use log::debug;
-use object_store::CredentialProvider;
 use object_store::aws::{
     AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, resolve_bucket_region,
 };
 use object_store::client::{ClientConfigKey, ClientOptions};
+use object_store::{CredentialProvider, RetryConfig};
 use tokio::sync::OnceCell;
 use url::Url;
 
 static DEFAULT_AWS_CONFIG: OnceCell<SdkConfig> = OnceCell::const_new();
+
+/// Retry budget for S3 requests.
+///
+/// The object_store default gives up 3 minutes after the first attempt, which
+/// expires mid-transfer for multi-hundred-MB range reads against a degraded
+/// store: every retry restarts the range from byte 0, so a flaky stream can
+/// burn the whole budget re-downloading prefixes without ever finishing.
+/// 10 minutes covers a 512 MB chunk at ~1 MB/s degraded throughput with
+/// headroom. Safe to exceed the upstream <5min guidance here because MinIO
+/// uses static credentials that do not expire.
+fn s3_retry_config() -> RetryConfig {
+    RetryConfig {
+        max_retries: 10,
+        retry_timeout: std::time::Duration::from_secs(10 * 60),
+        backoff: Default::default(),
+    }
+}
 
 #[derive(Debug)]
 struct IdentityDataError;
@@ -135,7 +152,8 @@ pub async fn get_s3_object_store(url: &Url) -> object_store::Result<AmazonS3> {
         .with_config(
             AmazonS3ConfigKey::Client(ClientConfigKey::PoolMaxIdlePerHost),
             "64",
-        );
+        )
+        .with_retry(s3_retry_config());
     let config = DEFAULT_AWS_CONFIG
         .get_or_init(|| aws_config::defaults(BehaviorVersion::latest()).load())
         .await;
@@ -297,6 +315,16 @@ pub fn parse_s3_url(
 #[expect(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_retry_config_extends_budget_for_large_range_reads() {
+        let config = s3_retry_config();
+        assert_eq!(config.max_retries, 10);
+        assert_eq!(
+            config.retry_timeout,
+            std::time::Duration::from_secs(10 * 60)
+        );
+    }
 
     #[test]
     fn parse_oss_url_sets_bucket() {
