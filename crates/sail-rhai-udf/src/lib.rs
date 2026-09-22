@@ -8,7 +8,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_common::{ScalarValue, exec_err};
 use datafusion_expr::ScalarFunctionArgs;
 use datafusion_expr::registry::FunctionRegistry;
-use rhai::{Array as RhaiArray, Dynamic, Engine, FLOAT, INT, ImmutableString, Map, Scope};
+use rhai::{AST, Array as RhaiArray, Dynamic, Engine, FLOAT, INT, ImmutableString, Map, Scope};
 use sail_catalog::manager::CatalogManager;
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 
@@ -59,7 +59,10 @@ impl ScalarUDFImpl for RhaiEval {
             (_, ColumnarValue::Array(array)) => array.len(),
             _ => number_rows.max(1),
         };
-        let engine = Engine::new();
+        let engine = rhai_engine();
+        // Expressions are usually constant across rows, so compile once and
+        // recompile only when the expression text changes.
+        let mut compiled: Option<(String, AST)> = None;
         let mut values = Vec::with_capacity(row_count);
 
         for row in 0..row_count {
@@ -67,9 +70,21 @@ impl ScalarUDFImpl for RhaiEval {
                 values.push(None);
                 continue;
             };
+            let expr = expr.trim().to_string();
+            if compiled.as_ref().is_none_or(|(cached, _)| *cached != expr) {
+                let ast = engine.compile(expr.as_str()).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "`rhai_eval` failed to evaluate expression `{expr}`: {e}",
+                    ))
+                })?;
+                compiled = Some((expr.clone(), ast));
+            }
+            let Some((_, ast)) = compiled.as_ref() else {
+                return exec_err!("`rhai_eval` failed to compile expression");
+            };
             let mut scope = build_scope(vars_arg, row)?;
             let value = engine
-                .eval_expression_with_scope::<Dynamic>(&mut scope, expr.trim())
+                .eval_ast_with_scope::<Dynamic>(&mut scope, ast)
                 .map_err(|e| {
                     DataFusionError::Execution(format!(
                         "`rhai_eval` failed to evaluate expression `{expr}`: {e}",
@@ -99,6 +114,18 @@ pub fn register_rhai_functions(context: &SessionContext) -> Result<()> {
 
 pub fn rhai_eval_udf() -> ScalarUDF {
     ScalarUDF::new_from_impl(RhaiEval::new())
+}
+
+/// Builds the Rhai engine for `rhai_eval`.
+///
+/// SQL `NULL` binds as Rhai unit (`()`) — see `scalar_value_to_dynamic` — so
+/// null checks spell as `YEAR != ()` or `type_of(YEAR) == "()"`. The `is_null`
+/// / `is_not_null` helpers below offer the same check under a Spark-like name.
+fn rhai_engine() -> Engine {
+    let mut engine = Engine::new();
+    engine.register_fn("is_null", |value: Dynamic| value.is_unit());
+    engine.register_fn("is_not_null", |value: Dynamic| !value.is_unit());
+    engine
 }
 
 fn extract_expression(arg: &ColumnarValue, row: usize) -> Result<Option<String>> {
@@ -376,6 +403,143 @@ mod tests {
             .iter()
             .collect::<Vec<_>>();
         assert_eq!(values, vec![Some("11"), Some("88"), Some("77")]);
+        Ok(())
+    }
+
+    fn year_vars() -> Result<(Fields, ArrayRef)> {
+        let fields = Fields::from(vec![
+            Arc::new(Field::new("SCENARIO", DataType::Utf8, true)),
+            Arc::new(Field::new("YEAR", DataType::Utf8, true)),
+        ]);
+        let vars = StructArray::try_new(
+            fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("A"), Some("B"), Some("C")])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("2024"), None, Some("")])) as ArrayRef,
+            ],
+            None,
+        )?;
+        Ok((fields, Arc::new(vars) as ArrayRef))
+    }
+
+    fn invoke_rhai(
+        expr: ColumnarValue,
+        vars: ArrayRef,
+        fields: Fields,
+        number_rows: usize,
+    ) -> Result<Vec<Option<String>>> {
+        let result = RhaiEval::new().invoke_with_args(ScalarFunctionArgs {
+            args: vec![expr, ColumnarValue::Array(vars)],
+            arg_fields: vec![
+                Arc::new(Field::new("expr", DataType::Utf8, false)),
+                Arc::new(Field::new("vars", DataType::Struct(fields), true)),
+            ],
+            number_rows,
+            return_field: Arc::new(Field::new("result", DataType::Utf8, true)),
+            config_options: Arc::new(ConfigOptions::default()),
+        })?;
+        let ColumnarValue::Array(array) = result else {
+            return exec_err!("expected array result from `rhai_eval`");
+        };
+        let values = array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("expected Utf8 output".to_string()))?
+            .iter()
+            .map(|v| v.map(str::to_string))
+            .collect::<Vec<_>>();
+        Ok(values)
+    }
+
+    fn utf8_expr(value: &str) -> ColumnarValue {
+        ColumnarValue::Scalar(ScalarValue::Utf8(Some(value.to_string())))
+    }
+
+    #[test]
+    fn test_rhai_eval_null_is_unit() -> Result<()> {
+        let (fields, vars) = year_vars()?;
+        let values = invoke_rhai(utf8_expr("YEAR != ()"), vars.clone(), fields.clone(), 3)?;
+        assert_eq!(
+            values,
+            vec![
+                Some("true".to_string()),
+                Some("false".to_string()),
+                Some("true".to_string())
+            ]
+        );
+        let values = invoke_rhai(utf8_expr("YEAR == ()"), vars.clone(), fields.clone(), 3)?;
+        assert_eq!(
+            values,
+            vec![
+                Some("false".to_string()),
+                Some("true".to_string()),
+                Some("false".to_string())
+            ]
+        );
+        let values = invoke_rhai(utf8_expr("type_of(YEAR) == \"()\""), vars, fields, 3)?;
+        assert_eq!(
+            values,
+            vec![
+                Some("false".to_string()),
+                Some("true".to_string()),
+                Some("false".to_string())
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rhai_eval_is_null_helpers() -> Result<()> {
+        let (fields, vars) = year_vars()?;
+        let values = invoke_rhai(utf8_expr("is_null(YEAR)"), vars.clone(), fields.clone(), 3)?;
+        assert_eq!(
+            values,
+            vec![
+                Some("false".to_string()),
+                Some("true".to_string()),
+                Some("false".to_string())
+            ]
+        );
+        let values = invoke_rhai(
+            utf8_expr("is_not_null(YEAR)"),
+            vars.clone(),
+            fields.clone(),
+            3,
+        )?;
+        assert_eq!(
+            values,
+            vec![
+                Some("true".to_string()),
+                Some("false".to_string()),
+                Some("true".to_string())
+            ]
+        );
+        let values = invoke_rhai(utf8_expr("YEAR ?? \"N/A\""), vars, fields, 3)?;
+        assert_eq!(
+            values,
+            vec![
+                Some("2024".to_string()),
+                Some("N/A".to_string()),
+                Some(String::new())
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_rhai_eval_varying_expressions() -> Result<()> {
+        let (fields, vars) = year_vars()?;
+        let exprs = StringArray::from(vec![Some("YEAR != ()"), Some("is_null(YEAR)")]);
+        let values = invoke_rhai(
+            ColumnarValue::Array(Arc::new(exprs) as ArrayRef),
+            vars,
+            fields,
+            2,
+        )?;
+        assert_eq!(
+            values,
+            vec![Some("true".to_string()), Some("true".to_string())]
+        );
         Ok(())
     }
 }
