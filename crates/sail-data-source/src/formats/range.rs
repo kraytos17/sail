@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use datafusion_common::{Result, exec_datafusion_err};
 use datafusion_datasource::{FileRange, PartitionedFile, RangeCalculation};
-use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectStore};
 
@@ -39,35 +38,33 @@ pub async fn calculate_range_bounded(
                 .try_into()
                 .map_err(|_| exec_datafusion_err!("Expect end range to fit in u64, got {end}"))?;
 
-            let start_delta = if start != 0 {
-                find_first_newline_bounded(
-                    store,
-                    &file.object_meta.location,
-                    start - 1,
-                    file_size,
-                    newline,
-                )
-                .await?
-            } else {
-                0
-            };
+            let location = &file.object_meta.location;
+            // The start and end probes are independent GETs: search for both
+            // boundaries concurrently to halve probe round-trips per file.
+            let (start_delta, end_delta) = futures::join!(
+                async {
+                    if start != 0 {
+                        find_first_newline_bounded(store, location, start - 1, file_size, newline)
+                            .await
+                    } else {
+                        Ok(0)
+                    }
+                },
+                async {
+                    if end != file_size {
+                        find_first_newline_bounded(store, location, end - 1, file_size, newline)
+                            .await
+                    } else {
+                        Ok(0)
+                    }
+                }
+            );
+            let start_delta = start_delta?;
+            let end_delta = end_delta?;
 
             if start + start_delta > end {
                 return Ok(RangeCalculation::TerminateEarly);
             }
-
-            let end_delta = if end != file_size {
-                find_first_newline_bounded(
-                    store,
-                    &file.object_meta.location,
-                    end - 1,
-                    file_size,
-                    newline,
-                )
-                .await?
-            } else {
-                0
-            };
 
             let range = start + start_delta..end + end_delta;
 
@@ -100,21 +97,15 @@ async fn find_first_newline_bounded(
             range: Some(GetRange::Bounded(start + scanned..fetch_end)),
             ..Default::default()
         };
-        let result = object_store.get_opts(location, options).await?;
-        let mut stream = result.into_stream();
-        let mut consumed: u64 = 0;
-        let mut found = None;
-        while let Some(chunk) = stream.next().await.transpose()? {
-            if let Some(position) = chunk.iter().position(|&byte| byte == newline) {
-                found = Some(scanned + consumed + position as u64);
-                break;
-            }
-            consumed += chunk.len() as u64;
+        let bytes = object_store
+            .get_opts(location, options)
+            .await?
+            .bytes()
+            .await?;
+        if let Some(position) = memchr::memchr(newline, &bytes) {
+            return Ok(scanned + position as u64);
         }
-        if let Some(position) = found {
-            return Ok(position);
-        }
-        scanned += consumed;
+        scanned += bytes.len() as u64;
         if start + scanned < fetch_end {
             // Short read: the store returned fewer bytes than requested.
             // Treat as EOF, mirroring upstream (which returns bytes scanned).

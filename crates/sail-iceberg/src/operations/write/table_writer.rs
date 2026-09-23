@@ -56,6 +56,64 @@ struct PartitionWriter {
     state: PartitionWriterState,
 }
 
+/// Minimum file size uploaded as S3 multipart.
+///
+/// Below this everything (manifests, metadata, small and delete files) keeps
+/// the single-shot `put()`: one request is cheaper and cannot strand parts.
+/// At or above it the file goes up in `MULTIPART_PART_SIZE` parts, each
+/// retried independently, so a mid-upload reset re-sends one part instead of
+/// the whole file.
+const MULTIPART_PUT_THRESHOLD: u64 = 128 * 1024 * 1024;
+
+/// Part size for multipart uploads: far above S3's 5 MB minimum, so a
+/// 512 MB file completes in 8 parts with per-part restart on failure.
+const MULTIPART_PART_SIZE: usize = 64 * 1024 * 1024;
+
+fn use_multipart_put(size: u64) -> bool {
+    size >= MULTIPART_PUT_THRESHOLD
+}
+
+/// Uploads `bytes` to `location` as an S3 multipart upload.
+///
+/// Parts upload concurrently; completion happens only when every part is
+/// durable. Any part failure (or a failed completion) aborts the upload so
+/// no partial object or orphaned parts are left behind.
+async fn put_file_multipart(
+    store: &dyn object_store::ObjectStore,
+    location: &ObjectPath,
+    bytes: bytes::Bytes,
+    part_size: usize,
+) -> Result<(), String> {
+    if bytes.is_empty() {
+        return Err("multipart upload requires non-empty content".to_string());
+    }
+    let mut upload = store
+        .put_multipart_opts(location, object_store::PutMultipartOptions::default())
+        .await
+        .map_err(|e| e.to_string())?;
+    // Zero-copy slices: parts borrow the buffer, which outlives `complete()`.
+    let mut remaining = bytes;
+    let mut parts = Vec::with_capacity(remaining.len().div_ceil(part_size));
+    while !remaining.is_empty() {
+        let take = remaining.len().min(part_size);
+        let chunk = remaining.split_to(take);
+        // Part indices are assigned synchronously in call order; the returned
+        // futures then upload concurrently.
+        parts.push(upload.put_part(object_store::PutPayload::from(chunk)));
+    }
+    if let Err(e) = futures::future::try_join_all(parts).await {
+        let _ = upload.abort().await;
+        return Err(e.to_string());
+    }
+    match upload.complete().await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let _ = upload.abort().await;
+            Err(e.to_string())
+        }
+    }
+}
+
 pub struct IcebergTableWriter {
     pub store: Arc<dyn object_store::ObjectStore>,
     pub config: WriterConfig,
@@ -294,10 +352,14 @@ impl IcebergTableWriter {
         let (bytes, meta) = writer.close().await?;
         let (rel, full) = self.generator.with_partition_dir(Some(partition_dir));
         log::trace!("iceberg.table_writer.flush_partition.writing: {}", full);
-        self.store
-            .put(&full, object_store::PutPayload::from(bytes))
-            .await
-            .map_err(|e| e.to_string())?;
+        if use_multipart_put(bytes.len() as u64) {
+            put_file_multipart(self.store.as_ref(), &full, bytes, MULTIPART_PART_SIZE).await?;
+        } else {
+            self.store
+                .put(&full, object_store::PutPayload::from(bytes))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         log::trace!(
             "iceberg.table_writer.flush_partition.written: rel={} full={}",
             rel,
@@ -394,5 +456,231 @@ impl IcebergTableWriter {
             return Ok(Some(array));
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(clippy::expect_used)]
+
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use object_store::path::Path;
+    use object_store::{
+        GetOptions, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult,
+    };
+
+    use super::*;
+
+    fn test_bytes(len: usize) -> Vec<u8> {
+        // Deterministic pseudo-random content (xorshift64).
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 11) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn multipart_threshold_boundary() {
+        assert!(!use_multipart_put(MULTIPART_PUT_THRESHOLD - 1));
+        assert!(use_multipart_put(MULTIPART_PUT_THRESHOLD));
+        assert!(!use_multipart_put(0));
+    }
+
+    #[test]
+    fn multipart_put_round_trips_bytes_identically() {
+        futures::executor::block_on(async {
+            let store = object_store::memory::InMemory::new();
+            let path = Path::from("data/multipart.bin");
+            // 2.5 MB in 1 MB parts exercises multi-part completion.
+            let bytes = test_bytes(2_500_000);
+            put_file_multipart(&store, &path, bytes::Bytes::from(bytes.clone()), 1_000_000)
+                .await
+                .expect("multipart upload");
+            let back = store
+                .get(&path)
+                .await
+                .expect("object present")
+                .bytes()
+                .await
+                .expect("readable");
+            assert_eq!(back.as_ref(), bytes.as_slice());
+        });
+    }
+
+    #[test]
+    fn multipart_put_rejects_empty_content() {
+        futures::executor::block_on(async {
+            let store = object_store::memory::InMemory::new();
+            let err = put_file_multipart(
+                &store,
+                &Path::from("data/empty.bin"),
+                bytes::Bytes::new(),
+                1_000,
+            )
+            .await
+            .expect_err("empty upload must fail");
+            assert!(err.contains("non-empty"), "unexpected error: {err}");
+        });
+    }
+
+    /// `MultipartUpload` decorator that fails the second part and records
+    /// whether `abort()` was invoked.
+    #[derive(Debug)]
+    struct FailSecondPartUpload {
+        inner: Box<dyn MultipartUpload>,
+        parts: usize,
+        aborted: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl MultipartUpload for FailSecondPartUpload {
+        fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+            self.parts += 1;
+            if self.parts >= 2 {
+                return Box::pin(async move {
+                    Err(object_store::Error::Generic {
+                        store: "test",
+                        source: Box::new(std::io::Error::other("injected part failure")),
+                    })
+                });
+            }
+            self.inner.put_part(data)
+        }
+
+        async fn complete(&mut self) -> object_store::Result<PutResult> {
+            self.inner.complete().await
+        }
+
+        async fn abort(&mut self) -> object_store::Result<()> {
+            self.aborted.store(true, Ordering::SeqCst);
+            self.inner.abort().await
+        }
+    }
+
+    /// `ObjectStore` that delegates to memory except for multipart uploads,
+    /// which fail on the second part.
+    #[derive(Debug)]
+    struct FailSecondPartStore {
+        memory: Arc<object_store::memory::InMemory>,
+        aborted: Arc<AtomicBool>,
+    }
+
+    impl std::fmt::Display for FailSecondPartStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailSecondPartStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailSecondPartStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.memory.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            let inner = self.memory.put_multipart_opts(location, opts).await?;
+            Ok(Box::new(FailSecondPartUpload {
+                inner,
+                parts: 0,
+                aborted: Arc::clone(&self.aborted),
+            }))
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.memory.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &Path,
+            ranges: &[Range<u64>],
+        ) -> object_store::Result<Vec<Bytes>> {
+            self.memory.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.memory.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.memory.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.memory.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.memory.copy_opts(from, to, options).await
+        }
+    }
+
+    #[test]
+    fn multipart_put_aborts_on_part_failure() {
+        futures::executor::block_on(async {
+            let aborted = Arc::new(AtomicBool::new(false));
+            let store = FailSecondPartStore {
+                memory: Arc::new(object_store::memory::InMemory::new()),
+                aborted: Arc::clone(&aborted),
+            };
+            let path = Path::from("data/aborted.bin");
+            let err = put_file_multipart(
+                &store,
+                &path,
+                bytes::Bytes::from(test_bytes(2_500_000)),
+                1_000_000,
+            )
+            .await
+            .expect_err("part failure must fail the upload");
+            assert!(
+                err.contains("injected part failure"),
+                "unexpected error: {err}"
+            );
+            assert!(
+                aborted.load(Ordering::SeqCst),
+                "failed upload must call abort()"
+            );
+            assert!(
+                store.head(&path).await.is_err(),
+                "aborted upload must leave no object"
+            );
+        });
     }
 }

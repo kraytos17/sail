@@ -33,7 +33,7 @@ static DEFAULT_AWS_CONFIG: OnceCell<SdkConfig> = OnceCell::const_new();
 /// expires mid-transfer for multi-hundred-MB range reads against a degraded
 /// store: every retry restarts the range from byte 0, so a flaky stream can
 /// burn the whole budget re-downloading prefixes without ever finishing.
-/// 10 minutes covers a 512 MB chunk at ~1 MB/s degraded throughput with
+/// 10 minutes covers a 128 MB chunk at ~0.2 MB/s degraded throughput with
 /// headroom. Safe to exceed the upstream <5min guidance here because MinIO
 /// uses static credentials that do not expire.
 fn s3_retry_config() -> RetryConfig {

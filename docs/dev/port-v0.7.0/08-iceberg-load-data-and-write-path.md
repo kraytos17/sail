@@ -233,7 +233,7 @@ requirements, table_properties, lakehouse_table). Its proto round-trip is doc 03
    committed by one `IcebergCommitExec`. No extra repartition — `build_fallback_scan` chunks
    large files at plan time and caps scan parallelism, small files stay one task each.
 7. `build_fallback_scan`: explicit plan-time chunking. Uncompressed files are split into
-   `LOAD_TARGET_CHUNK_SIZE` (512 MB) `PartitionedFile` groups with `with_range`, so every read
+   `LOAD_TARGET_CHUNK_SIZE` (128 MB) `PartitionedFile` groups with `with_range`, so every read
    is a bounded `GetRange`; compressed files (and files at or below the chunk size) stay one
    whole-file group, since a byte range inside a compressed stream cannot be decoded
    ("Reading compressed .csv in parallel is not supported"). Per-format `FileSource`
