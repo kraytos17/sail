@@ -40,14 +40,27 @@ impl SessionManagerActor {
         user_id: String,
         result: oneshot::Sender<SessionResult<SessionContext>>,
     ) -> ActorAction {
-        let context = if let Some(session) = self.sessions.get(&session_id) {
-            if let ServerSessionState::Running { context, .. } = &session.state {
-                Ok(context.clone())
+        let running_context =
+            self.sessions
+                .get(&session_id)
+                .and_then(|session| match &session.state {
+                    ServerSessionState::Running { context, .. } => Some(context.clone()),
+                    ServerSessionState::Deleted | ServerSessionState::Failed => None,
+                });
+        if running_context.is_none() && self.sessions.contains_key(&session_id) {
+            let was_failed = matches!(
+                self.sessions.get(&session_id),
+                Some(session) if matches!(session.state, ServerSessionState::Failed)
+            );
+            self.sessions.shift_remove(&session_id);
+            if was_failed {
+                warn!("recreating session {session_id} after failure");
             } else {
-                Err(SessionError::invalid(format!(
-                    "session {session_id} is not running"
-                )))
+                info!("recreating session {session_id} after deleted");
             }
+        }
+        let context = if let Some(context) = running_context {
+            Ok(context)
         } else {
             // TODO: The session ID is used in various storage paths, so it is assumed to be unique
             //   across all session managers, and it should contain only valid characters for a
@@ -215,31 +228,66 @@ impl SessionManagerActor {
         session_id: String,
         result: oneshot::Sender<SessionResult<()>>,
     ) -> ActorAction {
-        let session = self.sessions.get_mut(&session_id);
-        let output = if let Some(session) = session {
-            if let ServerSessionState::Running { context, driver_id } = &mut session.state {
-                info!("removing session {session_id}");
-                Self::delete_session(ctx, session_id.clone(), context);
-                if let Some(driver_id) = *driver_id {
-                    self.drivers.remove(driver_id);
+        enum DeleteKind {
+            Running,
+            Terminal,
+            Missing,
+        }
+        let kind = match self.sessions.get(&session_id) {
+            Some(session) => match &session.state {
+                ServerSessionState::Running { .. } => DeleteKind::Running,
+                ServerSessionState::Deleted | ServerSessionState::Failed => DeleteKind::Terminal,
+            },
+            None => DeleteKind::Missing,
+        };
+        let output = match kind {
+            DeleteKind::Running => {
+                // `Some(true)` = torn down, `Some(false)` = state changed under
+                // us (unreachable single-threaded; free the ID), `None` = gone.
+                let outcome: Option<bool> = if let Some(session) =
+                    self.sessions.get_mut(&session_id)
+                {
+                    if let ServerSessionState::Running { context, driver_id } = &mut session.state {
+                        info!("removing session {session_id}");
+                        Self::delete_session(ctx, session_id.clone(), context);
+                        if let Some(driver_id) = *driver_id {
+                            self.drivers.remove(driver_id);
+                        }
+                        
+                        session.state = ServerSessionState::Deleted;
+                        let status = session.state.status().to_string();
+                        self.event_reporter.report(SystemEvent::SessionUpdated {
+                            session_id: session_id.clone(),
+                            status,
+                            updated_at: Utc::now(),
+                        });
+                        Some(true)
+                    } else {
+                        Some(false)
+                    }
+                } else {
+                    None
+                };
+                match outcome {
+                    Some(true) => Ok(()),
+                    Some(false) => {
+                        self.sessions.shift_remove(&session_id);
+                        Ok(())
+                    }
+                    None => Err(SessionError::invalid(format!(
+                        "session not found: {session_id}"
+                    ))),
                 }
-                session.state = ServerSessionState::Deleted;
-                let status = session.state.status().to_string();
-                self.event_reporter.report(SystemEvent::SessionUpdated {
-                    session_id: session_id.clone(),
-                    status,
-                    updated_at: Utc::now(),
-                });
-                Ok(())
-            } else {
-                Err(SessionError::invalid(format!(
-                    "session {session_id} is not running"
-                )))
             }
-        } else {
-            Err(SessionError::invalid(format!(
+            DeleteKind::Terminal => {
+                // Idempotent delete: `Deleted` and `Failed` hold no driver or
+                // resources (released when they transitioned), so just free the ID.
+                self.sessions.shift_remove(&session_id);
+                Ok(())
+            }
+            DeleteKind::Missing => Err(SessionError::invalid(format!(
                 "session not found: {session_id}"
-            )))
+            ))),
         };
         let _ = result.send(output);
         ActorAction::Continue

@@ -7,10 +7,11 @@ cd "${SCRIPT_DIR}"
 PROFILE="dev"
 PROFILE_EXPLICIT=false
 TAG=""
-RUST_VERSION="1.97.1"
+RUST_VERSION="1.98.0"
 PYSPARK_VERSION="4.2.0"
-PYTHON_IMAGE="python:3.14-slim"
+PYTHON_IMAGE="python:3.14-slim-bookworm"
 IMAGE=""
+TARGET=""
 NO_CACHE=false
 PLATFORM=""
 PUSH=false
@@ -33,8 +34,10 @@ Options:
   -t, --tag <tag>            GitHub release tag; builds from the tag via
                              docker/release/Dockerfile (forces release profile)
       --rust-version <ver>   Rust toolchain version (default: ${RUST_VERSION})
-      --pyspark-version <v>  pyspark[connect] version (default: ${PYSPARK_VERSION})
+      --pyspark-version <v>  pyspark-connect version (default: ${PYSPARK_VERSION})
       --python-image <img>   Python base image (default: ${PYTHON_IMAGE})
+      --target <stage>       Build only a Dockerfile stage, e.g. server
+                             (default image name gains a -<stage> suffix)
       --image <name>         Output image name (default: sail:dev, sail:release, or sail:<tag>)
       --platform <plat>      Target platform(s), e.g. linux/amd64 or linux/amd64,linux/arm64
                              (multiple platforms require --push)
@@ -83,6 +86,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --image)
             IMAGE="$2"
+            shift 2
+            ;;
+        --target)
+            TARGET="$2"
             shift 2
             ;;
         --platform)
@@ -163,6 +170,9 @@ if [[ -z "${IMAGE}" ]]; then
     else
         IMAGE="sail:${PROFILE}"
     fi
+    if [[ -n "${TARGET}" ]]; then
+        IMAGE="${IMAGE}-${TARGET}"
+    fi
 fi
 
 if [[ -n "${PLATFORM}" && "${PLATFORM}" == *","* && "${PUSH}" != true ]]; then
@@ -175,7 +185,6 @@ if [[ -n "${TAG}" ]]; then
     DOCKERFILE="docker/release/Dockerfile"
 fi
 
-# BuildKit availability: prefer `docker buildx build`; fall back to `docker build`.
 if command -v docker buildx >/dev/null 2>&1; then
     USE_BUILDX=true
 else
@@ -220,6 +229,9 @@ ARGS=(
 if [[ -n "${TAG}" ]]; then
     ARGS+=(--build-arg "RELEASE_TAG=${TAG}")
 fi
+if [[ -n "${TARGET}" ]]; then
+    ARGS+=(--target "${TARGET}")
+fi
 if [[ "${NO_CACHE}" == true ]]; then
     ARGS+=(--no-cache)
 fi
@@ -258,6 +270,7 @@ echo "  Profile:    ${PROFILE}"
 echo "  Rust:       ${RUST_VERSION}"
 echo "  PySpark:    ${PYSPARK_VERSION}"
 echo "  Python:     ${PYTHON_IMAGE}"
+[[ -n "${TARGET}" ]] && echo "  Target:     ${TARGET}"
 [[ -n "${PLATFORM}" ]] && echo "  Platform:   ${PLATFORM}"
 [[ "${USE_BUILDX}" == true ]] && echo "  Builder:    ${BUILDER:-<default>}"
 echo "  Output:     $([[ "${PUSH}" == true ]] && echo push || echo load)"
