@@ -53,11 +53,25 @@ RUN --mount=type=cache,target=/root/.cargo/registry/ \
 
 FROM ${PYTHON_IMAGE} AS server
 
+ENV TZ=UTC
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
+    echo $TZ > /etc/timezone && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /usr/local/bin/sail /usr/local/bin
 
 ENTRYPOINT ["/usr/local/bin/sail"]
 
 FROM ${PYTHON_IMAGE}
+
+ENV TZ=UTC
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
+    echo $TZ > /etc/timezone && \
+    rm -rf /var/lib/apt/lists/*
 
 ARG PYSPARK_VERSION
 
