@@ -30,7 +30,8 @@ RUN apt-get update && \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > /tmp/rustup-init && \
     chmod a+x /tmp/rustup-init && \
     /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain ${RUST_VERSION} && \
-    rm -f /tmp/rustup-init
+    rm -f /tmp/rustup-init && \
+    /root/.cargo/bin/rustup component add rustfmt clippy
 
 ENV PATH="/root/.cargo/bin:${PATH}"
 
