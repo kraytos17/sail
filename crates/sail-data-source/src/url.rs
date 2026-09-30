@@ -531,13 +531,24 @@ pub async fn resolve_listing_urls(
     ctx: &dyn Session,
     paths: Vec<String>,
 ) -> Result<Vec<ListingTableUrl>> {
+    // Parse serially (sync and cheap) so malformed paths still error in path order.
+    let mut parsed: Vec<Vec<GlobUrl>> = Vec::with_capacity(paths.len());
+    for path in &paths {
+        parsed.push(GlobUrl::parse(path)?);
+    }
+    // The per-URL directory probes are independent; overlap them.
+    // `join_all` preserves order, so output order still follows path order.
+    let rewritten = futures::future::join_all(
+        parsed
+            .into_iter()
+            .flatten()
+            .map(|url| rewrite_directory_url(url, ctx)),
+    )
+    .await;
     let mut urls = vec![];
-    for path in paths {
-        for url in GlobUrl::parse(&path)? {
-            let url = rewrite_directory_url(url, ctx).await?;
-            let url = attach_default_glob(url)?;
-            urls.push(url.try_into()?);
-        }
+    for url in rewritten {
+        let url = attach_default_glob(url?)?;
+        urls.push(url.try_into()?);
     }
     Ok(urls)
 }

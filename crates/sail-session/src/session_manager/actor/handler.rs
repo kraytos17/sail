@@ -253,7 +253,7 @@ impl SessionManagerActor {
                         if let Some(driver_id) = *driver_id {
                             self.drivers.remove(driver_id);
                         }
-                        
+
                         session.state = ServerSessionState::Deleted;
                         let status = session.state.status().to_string();
                         self.event_reporter.report(SystemEvent::SessionUpdated {

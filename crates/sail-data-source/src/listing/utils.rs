@@ -92,23 +92,26 @@ pub async fn sample_listing_files<'a>(
     urls: &'a [ListingTableUrl],
     path_glob_filter: Option<&'a PathGlobFilter>,
 ) -> Result<Vec<ListingFileSample<'a>>> {
-    let mut samples = vec![];
-    for url in urls {
+    // Per-URL listings are independent; overlap them while preserving URL order.
+    let samples = futures::future::join_all(urls.iter().map(|url| async move {
         let store = ctx.runtime_env().object_store(url)?;
-        let objects: Vec<_> = list_all_files(url, ctx, store.as_ref(), path_glob_filter)
+        // Sampling only needs a handful of files; skip cache population here
+        // and let the execution path populate it with the full listing.
+        let objects: Vec<_> = list_all_files(url, ctx, store.as_ref(), path_glob_filter, false)
             .await?
             // Empty files can't contribute to schema / partition inference and may error when read.
             .try_filter(|meta| futures::future::ready(meta.size > 0))
             .take(10)
             .try_collect()
             .await?;
-        samples.push(ListingFileSample {
+        Ok::<_, DataFusionError>(ListingFileSample {
             url,
             store,
             objects,
-        });
-    }
-    Ok(samples)
+        })
+    }))
+    .await;
+    samples.into_iter().collect()
 }
 
 pub fn validate_partitions(
@@ -201,26 +204,42 @@ pub async fn list_all_files<'a>(
     ctx: &'a dyn Session,
     store: &'a dyn ObjectStore,
     path_glob_filter: Option<&'a PathGlobFilter>,
+    populate_cache: bool,
 ) -> Result<BoxStream<'a, Result<ObjectMeta>>> {
     let exec_options = &ctx.config_options().execution;
     let ignore_subdirectory = exec_options.listing_table_ignore_subdirectory;
+    // Narrow the LIST prefix with the literal run of the glob remainder.
+    let list_prefix = listing_prefix(url);
     // If the prefix is a file, use a head request, otherwise use a list request.
     let list = match url.is_collection() {
         true => match ctx.runtime_env().cache_manager.get_list_files_cache() {
-            None => store.list(Some(url.prefix())),
+            None => store.list(Some(&list_prefix)),
             Some(cache) => {
+                // Key by the narrowed prefix: different globs narrow differently,
+                // and a subset listing must never satisfy a wider cache key.
                 let key = TableScopedPath {
                     table: None,
-                    path: url.prefix().clone(),
+                    path: list_prefix.clone(),
                 };
                 if let Some(res) = cache.get(&key) {
                     debug!("Hit list all files cache");
-                    futures::stream::iter(res.files.as_ref().clone().into_iter().map(Ok)).boxed()
-                } else {
-                    let list_res = store.list(Some(url.prefix()));
+                    stream_cached_list(res.files)
+                } else if populate_cache {
+                    let list_res = store.list(Some(&list_prefix));
                     let vec = list_res.try_collect::<Vec<ObjectMeta>>().await?;
-                    cache.put(&key, CachedFileList::new(vec.clone()));
-                    futures::stream::iter(vec.into_iter().map(Ok)).boxed()
+                    let files = Arc::new(vec);
+                    cache.put(
+                        &key,
+                        CachedFileList {
+                            files: Arc::clone(&files),
+                        },
+                    );
+                    stream_cached_list(files)
+                } else {
+                    // Sampling only needs a handful of files; stream without
+                    // paying a full enumeration plus a full allocation for the
+                    // cache. The execution path populates the cache instead.
+                    store.list(Some(&list_prefix))
                 }
             }
         },
@@ -236,6 +255,52 @@ pub async fn list_all_files<'a>(
         })
         .map_err(|e| DataFusionError::ObjectStore(Box::new(e)))
         .boxed())
+}
+
+/// Extend a listing prefix with the leading literal run of the glob remainder.
+///
+/// Every file matching the glob starts with these bytes, so listing under the
+/// extended prefix returns exactly the same matches with fewer keys scanned
+/// (e.g. `dt=2024-*` narrows `b` to `b/dt=2024-`, `part-*` narrows `b` to
+/// `b/part-`). Both the prefix (`Path`) and the compiled pattern live in
+/// percent-decoded space, so concatenation is exact. Stopping at the first
+/// `*`, `?`, or `[` without tracking escapes or bracket nesting can only
+/// yield a shorter run, which prunes less but is never wrong.
+///
+/// Note the run never contains `/`: the remainder starts at the first segment
+/// holding a wildcard, so any `/` inside the run would close a fully literal
+/// segment that `split_glob_path` would already have folded into the prefix.
+fn listing_prefix(url: &ListingTableUrl) -> Path {
+    let run = url
+        .get_glob()
+        .as_ref()
+        .map(|glob| {
+            let pattern = glob.as_str();
+            let end = pattern.find(['*', '?', '[']).unwrap_or(pattern.len());
+            &pattern[..end]
+        })
+        .unwrap_or("");
+    if run.is_empty() {
+        url.prefix().clone()
+    } else {
+        // `Path` strips trailing delimiters, so re-add the separator here.
+        let base = url.prefix().as_ref().trim_end_matches('/');
+        if base.is_empty() {
+            Path::from(run)
+        } else {
+            Path::from(format!("{base}/{run}"))
+        }
+    }
+}
+
+/// Stream an `Arc`-held file list as owned items without cloning the backing
+/// allocation. Short-circuiting consumers (`take(n)`) stop cloning early.
+fn stream_cached_list(
+    files: Arc<Vec<ObjectMeta>>,
+) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+    futures::stream::iter(0..files.len())
+        .map(move |i| Ok(files[i].clone()))
+        .boxed()
 }
 
 pub fn matches_path_glob_filter(
@@ -274,6 +339,36 @@ pub fn can_be_evaluated_for_partition_pruning(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_listing_prefix_extends_static_prefix_with_literal_run() {
+        use sail_common_datafusion::utils::items::ItemTaker;
+
+        use crate::url::GlobUrl;
+
+        // Build through Sail's own glob pipeline (`GlobUrl`), which is what
+        // `resolve_listing_urls` feeds into `ListingTableUrl`.
+        let prefix_of = |url: &str| {
+            let glob_url = GlobUrl::parse(url).unwrap().one().unwrap();
+            let url = ListingTableUrl::try_from(glob_url).unwrap();
+            listing_prefix(&url).as_ref().to_string()
+        };
+
+        // Literal runs narrow the LIST prefix; matching is unchanged.
+        // (`Path` strips trailing delimiters, so `b/` parses to prefix `b`.)
+        assert_eq!(prefix_of("file:///b/dt=2024-*/*.parquet"), "b/dt=2024-");
+        assert_eq!(prefix_of("file:///b/part-*.parquet"), "b/part-");
+        assert_eq!(
+            prefix_of("file:///b/year=2024/month=0?/*.parquet"),
+            "b/year=2024/month=0"
+        );
+        // No literal run: prefix untouched.
+        assert_eq!(prefix_of("file:///b/*.parquet"), "b");
+        assert_eq!(prefix_of("file:///b/[ab]*.parquet"), "b");
+        // No glob at all: prefix untouched.
+        assert_eq!(prefix_of("file:///b/"), "b");
+        assert_eq!(prefix_of("file:///b/f.parquet"), "b/f.parquet");
+    }
 
     #[test]
     fn test_has_hidden_path_component() {
