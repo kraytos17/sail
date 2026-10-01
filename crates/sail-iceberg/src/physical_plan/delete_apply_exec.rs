@@ -1,11 +1,9 @@
 use std::collections::HashSet;
 use std::fmt;
-use std::ops::Range;
 use std::sync::Arc;
 
 use async_stream::try_stream;
 use async_trait::async_trait;
-use bytes::Bytes;
 use datafusion::arrow::array::{Array, ArrayRef, RecordBatch, StructArray, make_array};
 use datafusion::arrow::buffer::NullBuffer;
 use datafusion::arrow::compute::filter_record_batch;
@@ -27,20 +25,17 @@ use datafusion::physical_plan::{
 };
 use datafusion_common::stats::Precision;
 use datafusion_common::{DataFusionError, Result};
-use futures::future::BoxFuture;
 use futures::stream::TryStreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
-use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
-use parquet::errors::{ParquetError, Result as ParquetResult};
-use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::schema::types::SchemaDescriptor;
 use roaring::RoaringTreemap;
 use url::Url;
 
 use crate::io::StoreContext;
+use crate::operations::parquet_utils::ObjectStoreParquetReader;
 use crate::physical_plan::merge_metadata_exec::IcebergMergeMetadataExec;
 use crate::spec::Schema as IcebergSchema;
 use crate::spec::delete_index::{DeleteFileRef, PositionDeleteFile};
@@ -160,60 +155,6 @@ fn select_live_parquet_rows(
     Ok(Some(Arc::new(
         scan.clone().with_data_source(Arc::new(config)),
     )))
-}
-
-#[derive(Clone)]
-struct ObjectStoreParquetReader {
-    store: Arc<dyn ObjectStore>,
-    path: ObjectPath,
-    size: u64,
-}
-
-impl ObjectStoreParquetReader {
-    fn new(store: Arc<dyn ObjectStore>, path: ObjectPath, size: u64) -> Self {
-        Self { store, path, size }
-    }
-}
-
-impl AsyncFileReader for ObjectStoreParquetReader {
-    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
-        Box::pin(async move {
-            self.store
-                .get_range(&self.path, range)
-                .await
-                .map_err(parquet_object_store_error)
-        })
-    }
-
-    fn get_byte_ranges(
-        &mut self,
-        ranges: Vec<Range<u64>>,
-    ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
-        Box::pin(async move {
-            self.store
-                .get_ranges(&self.path, &ranges)
-                .await
-                .map_err(parquet_object_store_error)
-        })
-    }
-
-    fn get_metadata<'a>(
-        &'a mut self,
-        options: Option<&'a ArrowReaderOptions>,
-    ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
-        let size = self.size;
-        Box::pin(async move {
-            let metadata = ParquetMetaDataReader::new()
-                .with_arrow_reader_options(options)
-                .load_and_finish(self, size)
-                .await?;
-            Ok(Arc::new(metadata))
-        })
-    }
-}
-
-fn parquet_object_store_error(error: object_store::Error) -> ParquetError {
-    ParquetError::External(Box::new(error))
 }
 
 #[derive(Debug, Clone)]
@@ -916,6 +857,7 @@ mod tests {
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::Statistics;
+    use object_store::ObjectStoreExt;
     use object_store::memory::InMemory;
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
