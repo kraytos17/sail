@@ -54,6 +54,7 @@ impl PyIcebergRestCatalogProvider {
                     IcebergRestCatalogOptions {
                         credentials: Arc::new(EmptyCatalogCredentials),
                         properties,
+                        access_delegation: Default::default(),
                     },
                 ))
             },

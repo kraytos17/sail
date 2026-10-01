@@ -28,6 +28,7 @@ use sail_catalog::provider::{
     DropDatabaseOptions, DropTableOptions, DropViewOptions, Namespace, PartitionTransform,
 };
 use sail_catalog::utils::{get_property, quote_name_if_needed, quote_namespace_if_needed};
+use sail_common::config::IcebergRestAccessDelegation;
 use sail_common::utils::http::SAIL_USER_AGENT;
 use sail_common_datafusion::catalog::managed::METADATA_LOCATION_KEY;
 use sail_common_datafusion::catalog::{
@@ -121,6 +122,7 @@ impl CatalogConfig<'_> {
 pub struct IcebergRestCatalogOptions {
     pub credentials: Arc<dyn CatalogCredentials>,
     pub properties: HashMap<String, String>,
+    pub access_delegation: IcebergRestAccessDelegation,
 }
 
 /// Provider for Apache Iceberg REST Catalog.
@@ -1442,12 +1444,15 @@ impl CatalogProvider for IcebergRestCatalogProvider {
             purpose: _,
         } = request;
         let catalog_config = self.resolved_catalog_config().await?;
+        let access_delegation = match self.options.access_delegation {
+            IcebergRestAccessDelegation::VendedCredentials => {
+                Some(REST_ACCESS_DELEGATION_VENDED_CREDENTIALS)
+            }
+            IcebergRestAccessDelegation::None => None,
+        };
+
         let result = self
-            .load_table_result(
-                database,
-                table,
-                Some(REST_ACCESS_DELEGATION_VENDED_CREDENTIALS),
-            )
+            .load_table_result(database, table, access_delegation)
             .await?;
         // TODO: Convert preserved REST table-session credentials into operation-scoped
         // FileIO/object-store access instead of only fingerprinting the session.
@@ -2110,6 +2115,13 @@ mod tests {
 
     impl TestContext {
         async fn new(name: Option<&str>) -> Self {
+            Self::with_access_delegation(name, Default::default()).await
+        }
+
+        async fn with_access_delegation(
+            name: Option<&str>,
+            access_delegation: IcebergRestAccessDelegation,
+        ) -> Self {
             let server = MockServer::start().await;
 
             Mock::given(method("GET"))
@@ -2125,8 +2137,9 @@ mod tests {
 
             let name_str = name.unwrap_or("");
             let props = HashMap::from([(REST_CATALOG_PROP_URI.to_string(), server.uri())]);
-            let catalog =
-                IcebergRestCatalogProvider::new(name_str.to_string(), test_options(props));
+            let mut options = test_options(props);
+            options.access_delegation = access_delegation;
+            let catalog = IcebergRestCatalogProvider::new(name_str.to_string(), options);
 
             Self {
                 name: name_str.to_string(),
@@ -2182,6 +2195,7 @@ mod tests {
         IcebergRestCatalogOptions {
             credentials: Arc::new(EmptyCatalogCredentials),
             properties,
+            access_delegation: Default::default(),
         }
     }
 
@@ -3680,6 +3694,94 @@ mod tests {
         assert!(!serialized.contains("storage-secret"));
     }
 
+    /// With delegation disabled, the load-table request omits the header, so a
+    /// catalog that rejects it still serves the table.
+    #[tokio::test]
+    async fn begin_table_access_omits_delegation_header_when_disabled() {
+        let ctx =
+            TestContext::with_access_delegation(Some("test"), IcebergRestAccessDelegation::None)
+                .await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        // The same load-table call would 404 here if the header were sent.
+        Mock::given(method("GET"))
+            .and(path(ctx.path("/namespaces/db1/tables/table1")))
+            .and(header(
+                "X-Iceberg-Access-Delegation",
+                REST_ACCESS_DELEGATION_VENDED_CREDENTIALS,
+            ))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&ctx.server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(ctx.path("/namespaces/db1/tables/table1")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata-location": "s3://bucket/table/metadata/v1.metadata.json",
+                "metadata": {
+                    "format-version": 2,
+                    "table-uuid": "12345678-1234-1234-1234-123456789012",
+                    "location": "s3://bucket/table",
+                    "last-updated-ms": 0,
+                    "last-column-id": 0,
+                    "schema": {
+                        "type": "struct",
+                        "schema-id": 0,
+                        "fields": []
+                    },
+                    "schemas": [{
+                        "type": "struct",
+                        "schema-id": 0,
+                        "fields": []
+                    }],
+                    "current-schema-id": 0,
+                    "partition-spec": [],
+                    "partition-specs": [{
+                        "spec-id": 0,
+                        "fields": []
+                    }],
+                    "default-spec-id": 0,
+                    "last-partition-id": 0,
+                    "properties": {},
+                    "current-snapshot-id": -1,
+                    "snapshots": [],
+                    "snapshot-log": [],
+                    "metadata-log": []
+                }
+            })))
+            .mount(&ctx.server)
+            .await;
+
+        let context = LakehouseExecutionContext::catalog_table_context(
+            CatalogProviderId(ctx.name.clone()),
+            vec![ctx.name.clone(), "db1".to_string(), "table1".to_string()],
+            CatalogTableIdentity {
+                table_id: None,
+                table_uri: Some("s3://bucket/table".to_string()),
+            },
+            LakehouseOperation::Read,
+            LakehouseFormat::Iceberg,
+            LakehouseAuthority::CatalogAuthoritative {
+                lifecycle: TableLifecycle::External,
+                pointer: MetadataPointerAuthority::IcebergRest,
+                commit: CommitAuthority::IcebergRestCommit,
+            },
+            ScanAuthority::ClientLakeSource,
+        );
+        let session = ctx
+            .catalog
+            .begin_table_access(
+                &namespace,
+                "table1",
+                BeginTableAccessRequest {
+                    context,
+                    purpose: TableAccessPurpose::DataRead,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.context.scan, ScanAuthority::ClientLakeSource);
+    }
+
     async fn test_get_view_impl(name: Option<&str>) {
         let ctx = TestContext::new(name).await;
         let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
@@ -4097,6 +4199,7 @@ mod tests {
             IcebergRestCatalogOptions {
                 credentials: Arc::new(FileCatalogCredentials::new(&token_path)),
                 properties,
+                access_delegation: Default::default(),
             },
         );
 
@@ -4245,6 +4348,7 @@ mod tests {
         let options = IcebergRestCatalogOptions {
             credentials: Arc::new(FileCatalogCredentials::new(&token_path)),
             properties: props,
+            access_delegation: Default::default(),
         };
         let catalog = IcebergRestCatalogProvider::new(String::new(), options);
 
