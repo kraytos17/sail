@@ -8,12 +8,14 @@ use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext
 use datafusion::logical_expr::{LogicalPlan, TableScan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
+use sail_logical_plan::load_data::LoadDataNode;
 use sail_logical_plan::merge::MergeCardinalityCheckNode;
 use sail_logical_plan::row_level::RowLevelWriteNode;
 use sail_physical_plan::merge_cardinality_check::MergeCardinalityCheckExec;
 
 use crate::lake_source::{IcebergWriteNode, plan_iceberg_write};
 use crate::logical::IcebergTableSource;
+use crate::physical::load_data_planner::plan_load_data;
 use crate::physical::row_level_planner::plan_iceberg_row_level_write;
 
 pub struct IcebergPhysicalPlanner;
@@ -67,6 +69,13 @@ impl ExtensionPlanner for IcebergPhysicalPlanner {
             return plan_iceberg_row_level_write(session, planner, node, physical_inputs)
                 .await
                 .map(Some);
+        }
+
+        if let Some(node) = node.as_any().downcast_ref::<LoadDataNode>() {
+            if !node.target_format().eq_ignore_ascii_case("iceberg") {
+                return Ok(None);
+            }
+            return plan_load_data(session, node).await.map(Some);
         }
 
         Ok(None)

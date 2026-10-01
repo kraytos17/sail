@@ -71,6 +71,7 @@ message ExtendedPhysicalPlanNode {
     IcebergEqualityDeleteWriterExecNode iceberg_equality_delete_writer = 56;
     PartitionedTopKExecNode partitioned_top_k = 57;
     IcebergMetadataScanExecNode iceberg_metadata_scan = 58;
+    IcebergLoadDataFastExecNode iceberg_load_data_fast = 59;
   }
 }
 
@@ -1080,6 +1081,18 @@ message IcebergScanByDataFilesExecNode {
 
 message IcebergMetadataScanExecNode {
   bytes input = 1;
+}
+
+message IcebergLoadDataFastExecNode {
+  // Pre-built Iceberg data files (from parquet footers), serialized as JSON.
+  string data_files_json = 1;
+  string table_url = 2;
+  // Iceberg table requirements, serialized as JSON.
+  string requirements_json = 3;
+  // Table properties as JSON array of [key, value] pairs.
+  string table_properties_json = 4;
+  // Iceberg lakehouse execution context, serialized as JSON (empty = None).
+  string lakehouse_table_json = 5;
 }
 
 message IcebergDeleteApplyExecNode {

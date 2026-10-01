@@ -1,3 +1,4 @@
+mod load_data_planner;
 mod row_level_planner;
 pub mod table_scan_planner;
 
