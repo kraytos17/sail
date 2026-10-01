@@ -305,6 +305,7 @@ use sail_python_udf::udf::pyspark_udaf::{
 };
 use sail_python_udf::udf::pyspark_udf::{PySparkUDF, PySparkUdfKind};
 use sail_python_udf::udf::pyspark_udtf::{PySparkUDTF, PySparkUdtfKind};
+use sail_rhai_udf::rhai_eval_udf;
 use sail_system_store::catalog::SystemTable;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -3471,6 +3472,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
             "url_decode" => Ok(Arc::new(ScalarUDF::from(UrlDecode::new()))),
             "url_encode" => Ok(Arc::new(ScalarUDF::from(UrlEncode::new()))),
             "delta_decode_path" => Ok(Arc::new(ScalarUDF::from(DeltaDecodePath::default()))),
+            "rhai_eval" => Ok(Arc::new(rhai_eval_udf())),
             _ => plan_err!("could not find scalar function: {name}"),
         }
     }
@@ -3610,6 +3612,7 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
             || node.name() == "json_as_text"
             || node.name() == "json_len"
             || node.name() == "json_length"
+            || node.name() == "rhai_eval"
         {
             UdfKind::Standard(r#gen::StandardUdf {})
         } else if let Some(func) = node_inner.downcast_ref::<SparkMapFromArrays>() {
@@ -6558,6 +6561,13 @@ mod tests {
                 .try_encode_expr(&unknown, &mut Vec::new(), &encode_context)
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_round_trip_rhai_eval_udf() -> Result<()> {
+        let decoded = round_trip_udf(rhai_eval_udf())?;
+        assert_eq!(decoded.name(), "rhai_eval");
         Ok(())
     }
 

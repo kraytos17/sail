@@ -1,0 +1,21 @@
+[package]
+name = "sail-rhai-udf"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+sail-catalog = { path = "../sail-catalog" }
+sail-common-datafusion = { path = "../sail-common-datafusion" }
+
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+moka = { workspace = true }
+regex = { workspace = true }
+rhai = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

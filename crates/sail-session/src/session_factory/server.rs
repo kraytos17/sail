@@ -20,6 +20,7 @@ use sail_common_datafusion::session::job::{JobRunner, JobService};
 use sail_common_datafusion::session::repartition::RepartitionBufferConfig;
 use sail_delta_lake::session_extension::DeltaTableCache;
 use sail_physical_optimizer::{PhysicalOptimizerOptions, get_physical_optimizers};
+use sail_rhai_udf::register_rhai_functions;
 use sail_telemetry::telemetry::global_system_store_reader;
 
 use crate::catalog::create_catalog_manager;
@@ -84,7 +85,6 @@ impl SessionFactory<ServerSessionInfo> for ServerSessionFactory {
     fn create(&mut self, mut info: ServerSessionInfo) -> Result<SessionContext> {
         let state = self.create_session_state(&mut info)?;
         let context = SessionContext::new_with_state(state);
-
         // Register the `first_value` UDAF since the `replace_distinct_aggregate` optimizer rule
         // assumes that this UDAF is available in the function registry.
         // This is a hidden assumption made by the optimizer rule.
@@ -97,6 +97,7 @@ impl SessionFactory<ServerSessionInfo> for ServerSessionFactory {
             .write()
             .register_udaf(first_value_udaf())?;
 
+        register_rhai_functions(&context)?;
         Ok(context)
     }
 }

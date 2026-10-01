@@ -136,6 +136,8 @@ wiremock = "0.6.5"
 secrecy = { version = "0.10.3", features = ["serde"] }
 tempfile = "3.27.0"
 readonly = "0.2.13"
+proptest = "1.11.0"
+rhai = { version = "1.26.1", features = ["sync"] }
 toml = "0.8"
 bitflags = "2.12.1"
 libloading = "0.8.9"
