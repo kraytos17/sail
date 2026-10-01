@@ -65,7 +65,10 @@ use crate::table::metadata_loader::{
     metadata_file_version_from_path, metadata_location_to_object_path_string, write_version_hint,
 };
 use crate::utils::get_object_store_from_context;
-use crate::utils::metadata::metadata_files_for_version;
+use crate::utils::metadata::{
+    get_metadata_file_timestamp, is_stale_metadata_file, metadata_files_for_version,
+};
+
 const MAX_COMMIT_RETRIES: usize = 5;
 
 fn commit_count_batch(schema: SchemaRef, row_count: u64) -> Result<RecordBatch> {
@@ -1107,16 +1110,24 @@ impl ExecutionPlan for IcebergCommitExec {
                     metadata_files_for_version(&store_ctx, next_version).await?
                 };
                 if !existing_for_next.is_empty() {
-                    log::warn!(
-                        "Detected existing metadata files for version {}: {:?}. Retrying attempt {}",
-                        next_version,
-                        existing_for_next,
-                        attempt
-                    );
-                    if attempt >= MAX_COMMIT_RETRIES {
-                        return Err(commit_conflict_error());
+                    // Stale leftovers (e.g. from a previous table instance after
+                    // DROP+CREATE) are ignored; only real concurrent writes conflict.
+                    let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+                    let has_real_conflict = existing_for_next
+                        .iter()
+                        .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
+                    if has_real_conflict {
+                        log::warn!(
+                            "Detected existing metadata files for version {}: {:?}. Retrying attempt {}",
+                            next_version,
+                            existing_for_next,
+                            attempt
+                        );
+                        if attempt >= MAX_COMMIT_RETRIES {
+                            return Err(commit_conflict_error());
+                        }
+                        continue;
                     }
-                    continue;
                 }
 
                 // Build transaction and action based on the snapshot update algorithm.
@@ -1350,7 +1361,20 @@ impl ExecutionPlan for IcebergCommitExec {
                 } else {
                     metadata_files_for_version(&store_ctx, next_version).await?
                 };
-                let conflict_after_write = version_files.iter().any(|path| path != &metadata_file);
+
+                // An empty listing proves there is no conflicting file, so the
+                // timestamp lookup (an extra object-store round-trip) is only
+                // needed when files were actually found. Collect is not needed
+                // because the filter over an empty list is trivially false.
+                let conflict_after_write = if version_files.is_empty() {
+                    false
+                } else {
+                    let current_ts = get_metadata_file_timestamp(&store_ctx, &latest_meta).await?;
+                    version_files
+                        .iter()
+                        .filter(|(_, ts)| !is_stale_metadata_file(*ts, current_ts))
+                        .any(|(path, _)| path != &metadata_file)
+                };
                 if conflict_after_write {
                     log::warn!(
                         "Concurrent metadata writes detected for version {}: {:?}. Retrying attempt {}",

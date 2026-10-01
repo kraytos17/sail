@@ -106,3 +106,4 @@ docs/.vitepress/.temp
 CLAUDE.md
 AGENTS.md
 .roborev/
+.beads.gate.lock

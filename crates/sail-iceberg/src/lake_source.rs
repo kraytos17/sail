@@ -63,7 +63,9 @@ use crate::table::metadata_loader::{
     metadata_file_version_from_path, metadata_location_to_object_path_string, write_version_hint,
 };
 use crate::table::{Table, find_latest_metadata_file};
-use crate::utils::metadata::metadata_files_for_version;
+use crate::utils::metadata::{
+    get_metadata_file_timestamp, is_stale_metadata_file, metadata_files_for_version,
+};
 use crate::utils::partition_transform::{
     catalog_partition_field_from_iceberg, format_partition_expr, format_partition_exprs,
     iceberg_transform_from_partition_field, partition_field_name,
@@ -615,16 +617,23 @@ impl IcebergLakeSource {
             let next_version = current_version + 1;
             let next_version_files = metadata_files_for_version(&store_ctx, next_version).await?;
             if !next_version_files.is_empty() {
-                log::warn!(
-                    "Detected existing Iceberg metadata files for version {}: {:?}. Retrying attempt {}",
-                    next_version,
-                    next_version_files,
-                    attempt
-                );
-                if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
-                    return Err(alter_table_properties_conflict_error());
+                let current_ts =
+                    get_metadata_file_timestamp(&store_ctx, &latest_metadata_file).await?;
+                let has_real_conflict = next_version_files
+                    .iter()
+                    .any(|(_, ts)| !is_stale_metadata_file(*ts, current_ts));
+                if has_real_conflict {
+                    log::warn!(
+                        "Detected existing Iceberg metadata files for version {}: {:?}. Retrying attempt {}",
+                        next_version,
+                        next_version_files,
+                        attempt
+                    );
+                    if attempt >= MAX_ALTER_TABLE_PROPERTIES_COMMIT_RETRIES {
+                        return Err(alter_table_properties_conflict_error());
+                    }
+                    continue;
                 }
-                continue;
             }
 
             let previous_metadata_timestamp_ms = table_meta.last_updated_ms;
@@ -670,7 +679,19 @@ impl IcebergLakeSource {
             }
 
             let version_files = metadata_files_for_version(&store_ctx, next_version).await?;
-            let conflict_after_write = version_files.iter().any(|path| path != &metadata_file);
+            // An empty listing proves there is no conflicting file, so the
+            // timestamp lookup (an extra object-store round-trip) is only
+            // needed when files were actually found.
+            let conflict_after_write = if version_files.is_empty() {
+                false
+            } else {
+                let current_ts =
+                    get_metadata_file_timestamp(&store_ctx, &latest_metadata_file).await?;
+                version_files
+                    .iter()
+                    .filter(|(_, ts)| !is_stale_metadata_file(*ts, current_ts))
+                    .any(|(path, _)| path != &metadata_file)
+            };
             if conflict_after_write {
                 log::warn!(
                     "Concurrent Iceberg metadata writes detected for version {}: {:?}. Retrying attempt {}",
