@@ -33,6 +33,7 @@ type CsvBatchReader = Box<dyn Iterator<Item = std::result::Result<RecordBatch, A
 #[derive(Debug, Clone)]
 pub struct CsvSource {
     options: CsvOptions,
+    null_regex: Option<regex::Regex>,
     batch_size: Option<usize>,
     table_schema: TableSchema,
     projection: SplitProjection,
@@ -44,6 +45,7 @@ impl CsvSource {
         let table_schema = table_schema.into();
         Self {
             options: CsvOptions::default(),
+            null_regex: None,
             batch_size: None,
             projection: SplitProjection::unprojected(&table_schema),
             table_schema,
@@ -51,9 +53,22 @@ impl CsvSource {
         }
     }
 
-    pub fn with_csv_options(mut self, options: CsvOptions) -> Self {
+    pub fn with_csv_options(mut self, options: CsvOptions) -> Result<Self> {
+        // Compile the null pattern here, not at read time: a malformed
+        // user-supplied regex must surface as an option error, never a panic
+        // during query execution (DataFusion itself `expect`s here).
+        if let Some(pattern) = &options.null_regex {
+            let regex = regex::Regex::new(pattern).map_err(|e| {
+                DataFusionError::from(crate::error::DataSourceError::InvalidOption {
+                    key: "null_regex".to_string(),
+                    value: pattern.clone(),
+                    cause: Some(e.to_string()),
+                })
+            })?;
+            self.null_regex = Some(regex);
+        }
         self.options = options;
-        self
+        Ok(self)
     }
 
     pub fn options(&self) -> &CsvOptions {
@@ -126,6 +141,7 @@ impl CsvSource {
             has_header: self.has_header(),
             truncated_rows: self.truncate_rows(),
             batch_size: self.batch_size()?,
+            null_regex: self.null_regex.clone(),
         })?;
         Ok(Some(decoder))
     }
@@ -147,6 +163,9 @@ impl CsvSource {
         }
         if let Some(comment) = self.comment() {
             builder = builder.with_comment(comment);
+        }
+        if let Some(regex) = &self.null_regex {
+            builder = builder.with_null_regex(regex.clone());
         }
 
         Ok(builder)

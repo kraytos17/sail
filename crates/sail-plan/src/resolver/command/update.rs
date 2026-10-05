@@ -256,6 +256,9 @@ impl PlanResolver<'_> {
             .map_err(PlanError::from)
     }
 
+    // `async_recursion` expands to a `#[must_use]` function returning an
+    // already-`#[must_use]` boxed future (new `double_must_use` lint in Rust 1.99).
+    #[expect(clippy::double_must_use)]
     #[async_recursion::async_recursion]
     async fn resolve_update_assignment_value(
         &self,

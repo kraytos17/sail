@@ -563,7 +563,7 @@ pub fn resolve_listing_writer_url(path: String) -> Result<Url> {
 /// `.` or `_` (commit/_SUCCESS markers, `.crc` checksum files, etc.).
 /// Matches Spark's `HiddenFileFilter` semantics so users migrating from
 /// Spark see the same set of files included in directory reads.
-fn attach_default_glob(mut url: GlobUrl) -> Result<GlobUrl> {
+pub fn attach_default_glob(mut url: GlobUrl) -> Result<GlobUrl> {
     if url.glob.is_none() && url.base.path().ends_with(object_store::path::DELIMITER) {
         let pattern = Pattern::new("[!._]*")
             .map_err(|e| plan_datafusion_err!("default hidden-file glob: {e}"))?;

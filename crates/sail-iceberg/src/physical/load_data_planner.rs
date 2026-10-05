@@ -21,14 +21,13 @@ use sail_logical_plan::load_data::LoadDataNode;
 
 use crate::lake_source::{
     IcebergLakeSource, catalog_managed_iceberg_from_options, metadata_location_from_options,
-    resolve_iceberg_metadata_location,
+    resolve_iceberg_metadata_location, split_iceberg_write_options_and_table_properties,
 };
 use crate::operations::SnapshotUpdateKind;
 use crate::physical::load_classifier::classify_source_files;
 use crate::physical_plan::{IcebergCommitExec, IcebergLoadDataFastExec};
 use crate::spec::TableRequirement;
 use crate::table::Table;
-use crate::utils::get_object_store_from_session;
 
 pub(crate) async fn plan_load_data(
     session: &dyn Session,
@@ -39,6 +38,11 @@ pub(crate) async fn plan_load_data(
 
     let metadata_location = metadata_location_from_options(node.target_options());
     let catalog_managed_table = catalog_managed_iceberg_from_options(node.target_options());
+    // Split off table properties for the commit (metadata-location key lookup,
+    // managed-table detection, catalog commit mode). The remaining write options
+    // belong to the fallback-scan writer in a later stage.
+    let (_clean_options, table_properties) =
+        split_iceberg_write_options_and_table_properties(node.target_options().to_vec())?;
     let metadata_location_for_load = resolve_iceberg_metadata_location(
         node.target_lakehouse_table(),
         metadata_location,
@@ -73,20 +77,8 @@ pub(crate) async fn plan_load_data(
     let spec_id = default_spec.map(|s| s.spec_id()).unwrap_or(0);
     let partitioned = default_spec.is_some_and(|spec| !spec.fields().is_empty());
 
-    // The listing prefix is everything before the first glob, so the store can
-    // be resolved without parsing the pattern itself.
-    let glob_cut = node.location().find('*').unwrap_or(node.location().len());
-    let source_url = url::Url::parse(&node.location()[..glob_cut]).map_err(|e| {
-        DataFusionError::Plan(format!(
-            "invalid source location '{}': {e}",
-            node.location()
-        ))
-    })?;
-    let source_store = get_object_store_from_session(session, &source_url)?;
-
     let classified = classify_source_files(
-        source_store,
-        &source_url,
+        session,
         node.location(),
         table_schema,
         &table_arrow_schema,
@@ -112,8 +104,7 @@ pub(crate) async fn plan_load_data(
         classified.fast_files,
         table_url.clone(),
         requirements,
-        // Table properties are applied only when bootstrapping new metadata.
-        Vec::new(),
+        table_properties,
         node.target_lakehouse_table().cloned(),
     ));
 

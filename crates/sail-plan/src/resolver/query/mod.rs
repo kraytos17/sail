@@ -47,6 +47,9 @@ pub(super) use missing_input::{MissingInputBoundaries, MissingInputResolution};
 impl PlanResolver<'_> {
     /// Resolve query plan.
     /// No hidden fields are kept in the resolved plan.
+    // `async_recursion` expands to a `#[must_use]` function returning an
+    // already-`#[must_use]` boxed future (new `double_must_use` lint in Rust 1.99).
+    #[expect(clippy::double_must_use)]
     #[async_recursion]
     pub(super) async fn resolve_query_plan(
         &self,
@@ -63,6 +66,9 @@ impl PlanResolver<'_> {
     /// The resolved plan may contain hidden fields.
     /// If the hidden fields cannot be handled,
     /// [`Self::resolve_query_plan`] should be used instead,
+    // `async_recursion` expands to a `#[must_use]` function returning an
+    // already-`#[must_use]` boxed future (new `double_must_use` lint in Rust 1.99).
+    #[expect(clippy::double_must_use)]
     #[async_recursion]
     async fn resolve_query_plan_with_hidden_fields(
         &self,

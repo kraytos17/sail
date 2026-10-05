@@ -48,6 +48,8 @@ def test_iceberg_load_data_assigns_v3_row_lineage(spark, tmp_path, overwrite):
 
     try:
         spark.sql(f"ALTER TABLE {table_name} SET TBLPROPERTIES ('format-version' = '3')")
+        # Read after the upgrade: V2 metadata may not carry the key yet, which
+        # would make the lower-bound assertion below vacuous.
         start_row_id = _first_row_id_of(location, table_name)
 
         # Two files with different row counts, written into one directory so a

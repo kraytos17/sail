@@ -9,6 +9,9 @@ use crate::resolver::PlanResolver;
 use crate::resolver::state::PlanResolverState;
 
 impl PlanResolver<'_> {
+    // `async_recursion` expands to a `#[must_use]` function returning an
+    // already-`#[must_use]` boxed future (new `double_must_use` lint in Rust 1.99).
+    #[expect(clippy::double_must_use)]
     #[async_recursion]
     pub(super) async fn resolve_command_explain(
         &self,

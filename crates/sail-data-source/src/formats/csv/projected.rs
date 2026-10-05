@@ -42,6 +42,7 @@ pub struct ProjectedCsvOptions {
     pub has_header: bool,
     pub truncated_rows: bool,
     pub batch_size: usize,
+    pub null_regex: Option<regex::Regex>,
 }
 
 #[derive(Debug)]
@@ -55,6 +56,7 @@ pub struct ProjectedCsvDecoder {
     num_columns: usize,
     truncated_rows: bool,
     batch_size: usize,
+    null_regex: Option<regex::Regex>,
     // `(file column, output column)` sorted by file column
     wanted: Vec<(usize, usize)>,
     builders: Vec<BinaryBuilder>,
@@ -91,6 +93,7 @@ impl ProjectedCsvDecoder {
             has_header,
             truncated_rows,
             batch_size,
+            null_regex,
         } = options;
         let projected = Arc::new(schema.project(&projection)?);
         let mut wanted: Vec<(usize, usize)> = projection
@@ -124,6 +127,7 @@ impl ProjectedCsvDecoder {
             num_columns: schema.fields().len(),
             truncated_rows,
             batch_size,
+            null_regex,
             builders: projection
                 .iter()
                 .map(|_| BinaryBuilder::with_capacity(batch_size, batch_size * 16))
@@ -266,7 +270,15 @@ impl ProjectedCsvDecoder {
             } else {
                 &[]
             };
-            if value.is_empty() {
+            // `is_empty` is tested first so the no-regex case never pays for a
+            // match. A configured regex extends the empty-field rule, matching
+            // `csv.null_regex` (Spark `nullRegex`) semantics.
+            let is_null = value.is_empty()
+                || self
+                    .null_regex
+                    .as_ref()
+                    .is_some_and(|regex| regex.is_match(std::str::from_utf8(value).unwrap_or("")));
+            if is_null {
                 self.builders[output].append_null();
             } else {
                 self.builders[output].append_value(value);
@@ -482,6 +494,7 @@ mod tests {
             has_header: true,
             truncated_rows: false,
             batch_size: 8192,
+            null_regex: None,
         }
     }
 

@@ -92,6 +92,9 @@ impl NamedExpr {
 }
 
 impl PlanResolver<'_> {
+    // `async_recursion` expands to a `#[must_use]` function returning an
+    // already-`#[must_use]` boxed future (new `double_must_use` lint in Rust 1.99).
+    #[expect(clippy::double_must_use)]
     #[async_recursion]
     /// Resolves a Sail spec expression into a named expression.
     ///

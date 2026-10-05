@@ -5,4 +5,4 @@ pub mod options;
 mod url;
 mod utils;
 
-pub use url::resolve_listing_urls;
+pub use url::{GlobUrl, attach_default_glob, resolve_listing_urls, rewrite_directory_url};

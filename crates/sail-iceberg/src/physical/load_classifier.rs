@@ -14,13 +14,16 @@
 //! and fallback (scan + rewrite) paths.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use datafusion::arrow::datatypes::Schema as ArrowSchema;
+use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result as DFResult};
-use futures::stream::{self, StreamExt};
-use object_store::{ObjectStore, ObjectStoreExt};
-use url::Url;
+use datafusion::datasource::listing::ListingTableUrl;
+use datafusion::execution::object_store::ObjectStoreUrl;
+use futures::stream::{self, StreamExt, TryStreamExt};
+use object_store::ObjectStoreExt;
+use sail_data_source::listing::utils::list_all_files;
+use sail_data_source::{GlobUrl, attach_default_glob, rewrite_directory_url};
 
 use crate::operations::parquet_utils::{ParquetFooterInfo, read_parquet_footer};
 use crate::operations::write::base_writer::data_file_writer::aggregate_from_parquet_metadata_with_field_map;
@@ -35,8 +38,7 @@ pub(crate) struct ClassifiedFiles {
 /// Split the source files into files that can be registered as-is (schema
 /// compatible parquet) and files that must be scanned and rewritten.
 pub(crate) async fn classify_source_files(
-    object_store: Arc<dyn ObjectStore>,
-    source_url: &Url,
+    ctx: &dyn Session,
     location: &str,
     table_schema: &Schema,
     table_arrow_schema: &ArrowSchema,
@@ -49,7 +51,7 @@ pub(crate) async fn classify_source_files(
         .map(|f| (f.name.clone(), f.id))
         .collect();
 
-    let files = resolve_source_files(object_store.as_ref(), source_url, location).await?;
+    let files = resolve_source_files(ctx, location).await?;
     if files.is_empty() {
         return Ok(ClassifiedFiles {
             fast_files: vec![],
@@ -72,12 +74,18 @@ pub(crate) async fn classify_source_files(
     let max_concurrency = std::thread::available_parallelism()
         .map(|n| n.get() * 4)
         .unwrap_or(16);
-    let tasks = fast_paths.into_iter().map(|(key, url, size)| {
-        let store = Arc::clone(&object_store);
-        async move {
-            let footer = read_parquet_footer(&store, &key, size).await;
-            (key, url, size, footer)
-        }
+    let tasks = fast_paths.into_iter().map(|(key, url, size)| async move {
+        // The URLs above came out of our own listing, so parsing cannot fail
+        // in practice; a failure still routes the file to rewriting, never to
+        // an error, matching the handling of unreadable footers below.
+        let footer = match ObjectStoreUrl::parse(&url) {
+            Ok(store_url) => match ctx.runtime_env().object_store(&store_url) {
+                Ok(store) => read_parquet_footer(&store, &key, size).await,
+                Err(e) => Err(format!("failed to resolve object store for {url}: {e}")),
+            },
+            Err(e) => Err(format!("invalid source file URL '{url}': {e}")),
+        };
+        (key, url, size, footer)
     });
     let mut results = stream::iter(tasks).buffer_unordered(max_concurrency);
 
@@ -112,46 +120,50 @@ pub(crate) async fn classify_source_files(
     })
 }
 
-/// Resolve the source location to `(key, url, size)` triples.
+/// Resolve the source location to `(key, url, size)` triples, sorted by key.
 ///
-/// A concrete path is probed with a single `head`; a directory or glob is
-/// listed under its static prefix and filtered by the trailing suffix.
+/// A concrete path is probed with a single `head`, erroring when it does not
+/// exist. Directories and globs go through the shared [`GlobUrl`] machinery —
+/// `?`, `[...]` and `{a,b}` patterns, percent-decoding, and Spark
+/// hidden-file filtering — so `LOAD DATA` sees exactly the files any other
+/// listing read would see.
 async fn resolve_source_files(
-    store: &dyn ObjectStore,
-    source_url: &Url,
+    ctx: &dyn Session,
     location: &str,
 ) -> DFResult<Vec<(String, String, u64)>> {
-    if !location.ends_with('/') && !location.contains('*') {
-        let key = url_to_object_path(source_url)?;
-        match store.head(&key).await {
-            Ok(meta) => {
-                return Ok(vec![(key.to_string(), source_url.to_string(), meta.size)]);
-            }
-            Err(e) => {
-                return Err(DataFusionError::External(Box::new(std::io::Error::other(
-                    format!("source path does not exist: {location}: {e}"),
-                ))));
-            }
-        }
-    }
-
-    let (prefix, suffix_filter) = split_glob(location);
-    let prefix_url = url::Url::parse(&prefix)
-        .map_err(|e| DataFusionError::Plan(format!("invalid source location '{prefix}': {e}")))?;
-    let prefix_key = url_to_object_path(&prefix_url)?;
-
     let mut out = Vec::new();
-    let mut stream = store.list(Some(&prefix_key));
-    while let Some(item) = stream.next().await {
-        let meta = item.map_err(|e| {
-            DataFusionError::External(Box::new(std::io::Error::other(e.to_string())))
-        })?;
-        let key = meta.location.to_string();
-        if suffix_filter
-            .as_deref()
-            .is_none_or(|sfx| key.ends_with(sfx))
-        {
-            let url = prefix_url.join(&format!("/{key}")).map_err(|e| {
+    for url in GlobUrl::parse(location)? {
+        // A concrete file path is probed with a single `head`, erroring when
+        // it does not exist. Anything else (an explicit glob, or a bare path
+        // ending in `/`) goes through listing, mirroring the previous split
+        // between the head-probe branch and the list branch.
+        if url.glob.is_none() && !url.base.path().ends_with(object_store::path::DELIMITER) {
+            let store = ctx.runtime_env().object_store(&url)?;
+            let key = url_to_object_path(&url.base)?;
+            match store.head(&key).await {
+                Ok(meta) => {
+                    out.push((key.to_string(), url.base.to_string(), meta.size));
+                }
+                Err(e) => {
+                    return Err(DataFusionError::External(Box::new(std::io::Error::other(
+                        format!("source path does not exist: {location}: {e}"),
+                    ))));
+                }
+            }
+            continue;
+        }
+        let url = rewrite_directory_url(url, ctx).await?;
+        let url = attach_default_glob(url)?;
+        let base = url.base.clone();
+        let listing_url = ListingTableUrl::try_from(url)?;
+        let store = ctx.runtime_env().object_store(&listing_url)?;
+        let metas = list_all_files(&listing_url, ctx, store.as_ref(), None)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        for meta in metas {
+            let key = meta.location.to_string();
+            let url = base.join(&format!("/{key}")).map_err(|e| {
                 DataFusionError::Plan(format!("failed to resolve source URL for {key}: {e}"))
             })?;
             out.push((key, url.to_string(), meta.size));
@@ -159,29 +171,6 @@ async fn resolve_source_files(
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
-}
-
-/// Split a glob location into the static listing prefix and the literal
-/// suffix that follows it (`s3://b/data/*.parquet` → `s3://b/data/`, `.parquet`).
-fn split_glob(location: &str) -> (String, Option<String>) {
-    if let Some(pos) = location.find('*') {
-        let head = &location[..pos];
-        let cut = head.rfind('/').map(|i| i + 1).unwrap_or(0);
-        let prefix = location[..cut].to_string();
-        let suffix = location[pos..].trim_start_matches('*').to_string();
-        let suffix = if suffix.is_empty() {
-            None
-        } else {
-            Some(suffix)
-        };
-        (prefix, suffix)
-    } else {
-        let mut prefix = location.to_string();
-        if !prefix.ends_with('/') {
-            prefix.push('/');
-        }
-        (prefix, None)
-    }
 }
 
 /// Every table column must exist in the file with the same Arrow type for the
@@ -237,4 +226,157 @@ fn build_data_file(
         content_offset: None,
         content_size_in_bytes: None,
     })
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::execution::SessionState;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use object_store::PutPayload;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use url::Url;
+
+    use super::*;
+
+    /// Seeds an in-memory store and returns a session resolving
+    /// `memory://bucket/` to it, plus each key's byte size.
+    async fn fixture(keys: &[&str]) -> (SessionState, std::collections::HashMap<String, u64>) {
+        let ctx = SessionContext::new_with_config(SessionConfig::new());
+        let store = Arc::new(InMemory::new());
+        ctx.register_object_store(&Url::parse("memory://bucket/").unwrap(), store.clone());
+        let mut sizes = std::collections::HashMap::new();
+        for (i, key) in keys.iter().enumerate() {
+            let bytes = vec![i as u8; 10 + i];
+            sizes.insert((*key).to_string(), bytes.len() as u64);
+            store
+                .put(&Path::from(*key), PutPayload::from(bytes))
+                .await
+                .unwrap();
+        }
+        (ctx.state(), sizes)
+    }
+
+    fn keys_of(files: &[(String, String, u64)]) -> Vec<&str> {
+        files.iter().map(|(key, _, _)| key.as_str()).collect()
+    }
+
+    fn triple(
+        sizes: &std::collections::HashMap<String, u64>,
+        key: &str,
+        url: &str,
+    ) -> (String, String, u64) {
+        (key.to_string(), url.to_string(), sizes[key])
+    }
+
+    #[tokio::test]
+    async fn test_resolve_star_glob() {
+        let (state, sizes) = fixture(&[
+            "data/a.parquet",
+            "data/b.parquet",
+            "data/c.csv",
+            "data/_temporary/x.parquet",
+        ])
+        .await;
+        let files = resolve_source_files(&state, "memory://bucket/data/*.parquet")
+            .await
+            .unwrap();
+        // `_temporary/x.parquet` is hidden: the shared listing machinery
+        // excludes it where the old suffix filter kept it.
+        assert_eq!(
+            files,
+            vec![
+                triple(&sizes, "data/a.parquet", "memory://bucket/data/a.parquet"),
+                triple(&sizes, "data/b.parquet", "memory://bucket/data/b.parquet"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_question_mark_glob() {
+        let (state, _) = fixture(&["data-1.parquet", "data-12.parquet", "data-1.csv"]).await;
+        let files = resolve_source_files(&state, "memory://bucket/data-?.parquet")
+            .await
+            .unwrap();
+        assert_eq!(keys_of(&files), vec!["data-1.parquet"]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_character_class_glob() {
+        let (state, _) = fixture(&["a.parquet", "a.csv", "ab.parquet", "a.txt"]).await;
+        let files = resolve_source_files(&state, "memory://bucket/a.[pc]*")
+            .await
+            .unwrap();
+        assert_eq!(keys_of(&files), vec!["a.csv", "a.parquet"]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_alternation_glob() {
+        let (state, _) = fixture(&["a.parquet", "b.parquet", "c.parquet"]).await;
+        let files = resolve_source_files(&state, "memory://bucket/{a,b}.parquet")
+            .await
+            .unwrap();
+        assert_eq!(keys_of(&files), vec!["a.parquet", "b.parquet"]);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_bare_directory_excludes_hidden_files() {
+        let (state, _) = fixture(&[
+            "data/a.parquet",
+            "data/_SUCCESS",
+            "data/.hidden",
+            "data/_temporary/x.parquet",
+            "data/sub/b.parquet",
+        ])
+        .await;
+        let files = resolve_source_files(&state, "memory://bucket/data/")
+            .await
+            .unwrap();
+        assert_eq!(
+            keys_of(&files),
+            vec!["data/a.parquet", "data/sub/b.parquet"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_bare_file() {
+        let (state, sizes) = fixture(&["a.parquet"]).await;
+        let files = resolve_source_files(&state, "memory://bucket/a.parquet")
+            .await
+            .unwrap();
+        assert_eq!(
+            files,
+            vec![triple(&sizes, "a.parquet", "memory://bucket/a.parquet")]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_missing_bare_path_errors() {
+        let (state, _) = fixture(&["a.parquet"]).await;
+        let error = resolve_source_files(&state, "memory://bucket/nope.parquet")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("source path does not exist"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_percent_encoded_names() {
+        let (state, sizes) = fixture(&["my dir/a.parquet", "my dir/b.csv"]).await;
+        let files = resolve_source_files(&state, "memory://bucket/my%20dir/*.parquet")
+            .await
+            .unwrap();
+        assert_eq!(keys_of(&files), vec!["my dir/a.parquet"]);
+        assert_eq!(files[0].2, sizes["my dir/a.parquet"]);
+        assert!(
+            files[0].1.contains("my%20dir/a.parquet"),
+            "unexpected URL: {}",
+            files[0].1
+        );
+    }
 }

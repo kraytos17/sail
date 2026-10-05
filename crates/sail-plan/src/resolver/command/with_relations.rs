@@ -16,6 +16,9 @@ impl PlanResolver<'_> {
     /// This is used when a command (e.g., `MERGE INTO`) references DataFrames passed as named
     /// arguments via `spark.sql("MERGE INTO t USING {df}", df=dataframe)`. PySpark wraps the
     /// DataFrame in a `SubqueryAlias` within a `WithRelations` node whose root is the command.
+    // `async_recursion` expands to a `#[must_use]` function returning an
+    // already-`#[must_use]` boxed future (new `double_must_use` lint in Rust 1.99).
+    #[expect(clippy::double_must_use)]
     #[async_recursion]
     pub(super) async fn resolve_command_with_relations(
         &self,
