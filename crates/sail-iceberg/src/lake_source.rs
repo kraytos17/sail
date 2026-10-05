@@ -92,6 +92,12 @@ impl DataSource for IcebergLakeSource {
         ctx: &dyn Session,
         info: SourceInfo,
     ) -> Result<Arc<dyn TableSource>> {
+        // A `MetadataTable` option layer turns this read into an Iceberg
+        // metadata table (`snapshots`, `refs`) rather than the table's data.
+        if let Some(metadata_type) = metadata_table_type_from_options(&info.options) {
+            let provider = build_metadata_table_provider(ctx, &info, metadata_type).await?;
+            return Ok(datafusion::datasource::provider_as_source(provider));
+        }
         let scan = build_iceberg_scan(ctx, info).await?;
         Ok(Arc::new(IcebergTableSource::new(scan)))
     }
@@ -769,18 +775,60 @@ async fn build_iceberg_scan(ctx: &dyn Session, info: SourceInfo) -> Result<Arc<I
         read_case_sensitive: _,
     } = info;
 
-    validate_iceberg_read_lakehouse_context(lakehouse_table.as_ref())?;
-    let table_url = IcebergLakeSource::parse_table_url(paths).await?;
-    let metadata_location = metadata_location_from_options(&options);
-    let catalog_managed_table = catalog_managed_iceberg_from_options(&options);
+    let table = load_iceberg_table(ctx, &paths, lakehouse_table.as_ref(), &options).await?;
     let iceberg_options = IcebergReadOptions::resolve(ctx, options)?;
+    Ok(Arc::new(table.new_scan(&iceberg_options)?))
+}
+
+/// Loads the Iceberg table for a read, resolving the metadata pointer the same
+/// way for data scans and metadata-table reads.
+async fn load_iceberg_table(
+    ctx: &dyn Session,
+    paths: &[String],
+    lakehouse_table: Option<&LakehouseExecutionContext>,
+    options: &[OptionLayer],
+) -> Result<Table> {
+    validate_iceberg_read_lakehouse_context(lakehouse_table)?;
+    let table_url = IcebergLakeSource::parse_table_url(paths.to_vec()).await?;
+    let metadata_location = metadata_location_from_options(options);
+    let catalog_managed_table = catalog_managed_iceberg_from_options(options);
     let metadata_location = resolve_iceberg_metadata_location(
-        lakehouse_table.as_ref(),
+        lakehouse_table,
         metadata_location,
         catalog_managed_table,
     )?;
-    let table = Table::load_with_metadata_location(ctx, table_url, metadata_location).await?;
-    Ok(Arc::new(table.new_scan(&iceberg_options)?))
+    Table::load_with_metadata_location(ctx, table_url, metadata_location).await
+}
+
+/// Extracts the Iceberg metadata-table request from the option layers, if any.
+fn metadata_table_type_from_options(
+    options: &[OptionLayer],
+) -> Option<sail_common_datafusion::catalog::iceberg::IcebergMetadataTableType> {
+    options.iter().rev().find_map(|layer| match layer {
+        OptionLayer::MetadataTable { table_type } => Some(*table_type),
+        _ => None,
+    })
+}
+
+/// Builds an Iceberg metadata-table provider from a read `SourceInfo`.
+async fn build_metadata_table_provider(
+    ctx: &dyn Session,
+    info: &SourceInfo,
+    metadata_type: sail_common_datafusion::catalog::iceberg::IcebergMetadataTableType,
+) -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
+    let table = load_iceberg_table(
+        ctx,
+        &info.paths,
+        info.lakehouse_table.as_ref(),
+        &info.options,
+    )
+    .await?;
+    Ok(Arc::new(
+        crate::datasource::metadata_table::IcebergMetadataTableProvider::new(
+            table.metadata().clone(),
+            metadata_type,
+        ),
+    ))
 }
 
 fn validate_iceberg_read_lakehouse_context(

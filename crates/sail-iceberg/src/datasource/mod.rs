@@ -12,6 +12,7 @@
 
 pub(crate) mod copy_on_write;
 pub mod expressions;
+pub(crate) mod metadata_table;
 pub(crate) mod parquet;
 pub(crate) mod partition_defaults;
 pub(crate) mod predicate;

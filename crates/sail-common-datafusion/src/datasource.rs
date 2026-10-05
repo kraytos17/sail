@@ -60,6 +60,11 @@ pub enum OptionLayer {
     AsOfIntegerVersion { value: i64 },
     /// Time travel: read data as of a specific string version (e.g. a branch or tag name).
     AsOfStringVersion { value: String },
+    /// Read an Iceberg metadata table (e.g. `snapshots`, `refs`) instead of the
+    /// table's data.
+    MetadataTable {
+        table_type: crate::catalog::iceberg::IcebergMetadataTableType,
+    },
 }
 
 impl OptionLayer {
@@ -83,7 +88,8 @@ impl OptionLayer {
             OptionLayer::TableLocation { .. }
             | OptionLayer::AsOfTimestamp { .. }
             | OptionLayer::AsOfIntegerVersion { .. }
-            | OptionLayer::AsOfStringVersion { .. } => HashMap::new(),
+            | OptionLayer::AsOfStringVersion { .. }
+            | OptionLayer::MetadataTable { .. } => HashMap::new(),
         }
     }
 }

@@ -11,6 +11,7 @@ use datafusion_expr::{
 use rand::{RngExt, rng};
 use sail_catalog::manager::CatalogManager;
 use sail_common::spec;
+use sail_common_datafusion::catalog::iceberg::IcebergMetadataTableType;
 use sail_common_datafusion::catalog::{LakehouseOperation, TableColumnStatus, TableKind};
 use sail_common_datafusion::datasource::{DataSourceRegistry, OptionLayer, SourceInfo};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
@@ -90,6 +91,41 @@ impl PlanResolver<'_> {
         }
 
         let reference: Vec<String> = name.clone().into();
+        // `<table>.refs` / `<table>.snapshots`: Iceberg metadata tables. The
+        // trailing component names the metadata table; resolve the parent table
+        // and serve a metadata-table source instead of a catalog lookup for the
+        // full name.
+        if let Some((parent, metadata_type)) = split_metadata_table_reference(&reference) {
+            match self
+                .ctx
+                .extension::<CatalogManager>()?
+                .get_table_or_view(&parent)
+                .await
+            {
+                Ok(status) => {
+                    let plan = self
+                        .resolve_iceberg_metadata_table(
+                            status,
+                            &parent,
+                            metadata_type,
+                            &table_reference,
+                            temporal,
+                            sample,
+                            options,
+                            state,
+                        )
+                        .await?;
+                    return Ok(plan);
+                }
+                // No parent table: fall through so the full name reports the
+                // usual TABLE_OR_VIEW_NOT_FOUND error. The lookup below is
+                // intentional and not redundant: `<parent>.<suffix>` can itself
+                // be a real table name (e.g. a table literally named `refs`), so
+                // the full name must still be resolved against the catalog.
+                Err(sail_catalog::error::CatalogError::NotFound(_, _)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         let status = self
             .ctx
             .extension::<CatalogManager>()?
@@ -510,6 +546,86 @@ impl PlanResolver<'_> {
         )
     }
 
+    /// Resolves an Iceberg metadata table (`<table>.snapshots` / `<table>.refs`)
+    /// for a parent table resolved from the catalog.
+    #[expect(clippy::too_many_arguments)]
+    async fn resolve_iceberg_metadata_table(
+        &self,
+        status: sail_common_datafusion::catalog::TableStatus,
+        parent: &[String],
+        metadata_type: IcebergMetadataTableType,
+        table_reference: &TableReference,
+        temporal: Option<spec::TableTemporal>,
+        sample: Option<spec::TableSample>,
+        options: Vec<(String, String)>,
+        state: &mut PlanResolverState,
+    ) -> PlanResult<LogicalPlan> {
+        if temporal.is_some() {
+            return Err(PlanError::unsupported(
+                "SQL time travel is not supported for metadata tables",
+            ));
+        }
+        let TableKind::Table {
+            format,
+            location,
+            properties,
+            ..
+        } = status.kind
+        else {
+            return Err(PlanError::unsupported(format!(
+                "{metadata_type} metadata table is only supported for tables"
+            )));
+        };
+        if !format.eq_ignore_ascii_case("iceberg") {
+            return Err(PlanError::unsupported(format!(
+                "{metadata_type} metadata table is only supported for Iceberg tables"
+            )));
+        }
+        let info = SourceInfo {
+            paths: location.map(|x| vec![x]).unwrap_or_default(),
+            lakehouse_table: Some(
+                self.resolve_lakehouse_table_context(
+                    parent,
+                    LakehouseOperation::Read,
+                    Some(&format),
+                    vec![],
+                )
+                .await?,
+            ),
+            schema: None,
+            constraints: Default::default(),
+            partition_by: vec![],
+            bucket_by: None,
+            sort_order: vec![],
+            options: vec![
+                OptionLayer::TablePropertyList { items: properties },
+                OptionLayer::OptionList { items: options },
+                OptionLayer::MetadataTable {
+                    table_type: metadata_type,
+                },
+            ],
+            read_case_sensitive: self.config.case_sensitive,
+        };
+        let registry = self.ctx.extension::<DataSourceRegistry>()?;
+        let table_source = registry
+            .get_data_source(&format)?
+            .create_source(&self.ctx.state(), info)
+            .await?;
+        let plan = self.resolve_table_source_with_rename(
+            table_source,
+            table_reference.clone(),
+            None,
+            vec![],
+            None,
+            state,
+        )?;
+        if let Some(table_sample) = sample {
+            self.apply_table_sample(plan, table_sample, state).await
+        } else {
+            Ok(plan)
+        }
+    }
+
     pub(super) fn resolve_table_provider_with_rename(
         &self,
         table_provider: Arc<dyn TableProvider>,
@@ -578,5 +694,62 @@ impl PlanResolver<'_> {
         } else {
             Ok(table_scan)
         }
+    }
+}
+
+/// Splits a dotted table reference like `db.tbl.snapshots` into the parent table
+/// and the Iceberg metadata-table type. Returns `None` when the trailing
+/// component is not a supported metadata table.
+fn split_metadata_table_reference(
+    reference: &[String],
+) -> Option<(Vec<String>, IcebergMetadataTableType)> {
+    let [parent @ .., suffix] = reference else {
+        return None;
+    };
+    if parent.is_empty() {
+        return None;
+    }
+    let metadata_type = IcebergMetadataTableType::from_name(suffix)?;
+    Some((parent.to_vec(), metadata_type))
+}
+
+#[cfg(test)]
+mod metadata_table_reference_tests {
+    use sail_common_datafusion::catalog::iceberg::IcebergMetadataTableType;
+
+    use super::split_metadata_table_reference;
+
+    fn reference(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn splits_refs_and_snapshots_suffix() {
+        assert_eq!(
+            split_metadata_table_reference(&reference(&["db", "tbl", "refs"])),
+            Some((reference(&["db", "tbl"]), IcebergMetadataTableType::Refs))
+        );
+        assert_eq!(
+            split_metadata_table_reference(&reference(&["db", "tbl", "snapshots"])),
+            Some((
+                reference(&["db", "tbl"]),
+                IcebergMetadataTableType::Snapshots
+            ))
+        );
+    }
+
+    #[test]
+    fn metadata_table_suffix_is_case_insensitive() {
+        assert_eq!(
+            split_metadata_table_reference(&reference(&["db", "tbl", "REFS"])),
+            Some((reference(&["db", "tbl"]), IcebergMetadataTableType::Refs))
+        );
+    }
+
+    #[test]
+    fn non_metadata_names_are_not_split() {
+        assert!(split_metadata_table_reference(&reference(&["db", "tbl", "files"])).is_none());
+        assert!(split_metadata_table_reference(&reference(&["db", "tbl"])).is_none());
+        assert!(split_metadata_table_reference(&reference(&["refs"])).is_none());
     }
 }

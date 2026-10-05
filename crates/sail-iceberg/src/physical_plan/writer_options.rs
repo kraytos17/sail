@@ -234,7 +234,8 @@ impl IcebergWriterExecOptions {
                 OptionLayer::TableLocation { .. }
                 | OptionLayer::AsOfTimestamp { .. }
                 | OptionLayer::AsOfIntegerVersion { .. }
-                | OptionLayer::AsOfStringVersion { .. } => {}
+                | OptionLayer::AsOfStringVersion { .. }
+                | OptionLayer::MetadataTable { .. } => {}
             }
         }
         presence

@@ -347,6 +347,8 @@ fn generate_build_partial_options_impl(
                 quote! { sail_common_datafusion::datasource::OptionLayer::AsOfStringVersion { .. } },
             );
         }
+        fallback_patterns
+            .push(quote! { sail_common_datafusion::datasource::OptionLayer::MetadataTable { .. } });
         quote! { #(#fallback_patterns)|* => {} }
     } else {
         quote! {}
