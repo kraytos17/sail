@@ -4,8 +4,9 @@ ARG RUST_PROFILE=release
 ARG RUSTFLAGS=""
 ARG PYSPARK_VERSION=4.2.0
 ARG PYTHON_VERSION=3.14
+ARG PYTHON_IMAGE=python:${PYTHON_VERSION}-slim-bookworm
 
-FROM python:${PYTHON_VERSION}-slim AS builder
+FROM ${PYTHON_IMAGE} AS builder
 
 ARG RELEASE_TAG
 ARG RUST_VERSION
@@ -23,11 +24,14 @@ RUN apt-get update && \
         libprotobuf-dev \
         curl \
         git \
-        pkg-config
+        pkg-config && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > /tmp/rustup-init && \
     chmod a+x /tmp/rustup-init && \
-    /tmp/rustup-init -y --no-modify-path --profile default --default-toolchain ${RUST_VERSION}
+    /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain ${RUST_VERSION} && \
+    rm -f /tmp/rustup-init && \
+    /root/.cargo/bin/rustup component add rustfmt clippy
 
 ENV PATH="/root/.cargo/bin:${PATH}"
 
@@ -44,15 +48,33 @@ RUN --mount=type=cache,target=/root/.cargo/registry/ \
         *) echo "${RUST_PROFILE}" ;; \
     esac) && \
     cargo build -p sail-cli --profile ${RUST_PROFILE} --bins && \
+    strip --strip-debug /app/target/${RUST_TARGET_SUBDIR}/sail && \
     cp /app/target/${RUST_TARGET_SUBDIR}/sail /usr/local/bin
 
-FROM python:${PYTHON_VERSION}-slim
+FROM ${PYTHON_IMAGE} AS server
 
-ARG PYSPARK_VERSION
-
+ENV TZ=UTC
 RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata libreadline8 && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
+    echo $TZ > /etc/timezone && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/sail /usr/local/bin
+
+ENTRYPOINT ["/usr/local/bin/sail"]
+
+FROM ${PYTHON_IMAGE}
+
+ENV TZ=UTC
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tzdata libreadline8 && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
+    echo $TZ > /etc/timezone && \
     apt-get upgrade -y && \
     rm -rf /var/lib/apt/lists/*
+
+ARG PYSPARK_VERSION
 
 RUN python3 -m pip install --no-cache-dir "pyspark-client==${PYSPARK_VERSION}"
 
