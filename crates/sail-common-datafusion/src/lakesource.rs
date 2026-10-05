@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::LogicalPlan;
@@ -90,6 +91,22 @@ pub enum LakeSourceAlterTableOperation {
     },
     /// Adds a CHECK constraint after the caller has validated existing rows.
     AddCheckConstraint { name: String, expression: String },
+}
+
+/// A catalog-managed table procedure (`CALL`) operation.
+#[derive(Debug, Clone)]
+pub enum LakeSourceProcedureOperation {
+    RollbackToSnapshot {
+        snapshot_id: i64,
+    },
+    SetCurrentSnapshot {
+        snapshot_id: Option<i64>,
+        r#ref: Option<String>,
+    },
+    ExpireSnapshots {
+        older_than_ms: Option<i64>,
+        retain_last: Option<i32>,
+    },
 }
 
 /// A lakehouse data source with table metadata, DML, and DDL semantics.
@@ -226,6 +243,26 @@ pub trait LakeSource: DataSource {
         let _ = (runtime_env, path, column_path, default);
         not_impl_err!(
             "Column default alteration not supported for lake source '{}'",
+            self.name()
+        )
+    }
+
+    /// Executes a catalog-managed table procedure (`CALL`).
+    ///
+    /// `lakehouse_table` carries the catalog-coordinated commit context for
+    /// tables whose commit authority is not the filesystem (e.g. Iceberg
+    /// REST); non-filesystem commits are not yet supported and are rejected
+    /// (mirroring `ALTER TABLE` on catalog-managed tables).
+    async fn call_procedure(
+        &self,
+        runtime_env: Arc<RuntimeEnv>,
+        path: &str,
+        operation: LakeSourceProcedureOperation,
+        lakehouse_table: Option<LakehouseExecutionContext>,
+    ) -> Result<RecordBatch> {
+        let _ = (runtime_env, path, operation, lakehouse_table);
+        not_impl_err!(
+            "CALL procedures are not supported for lake source '{}'",
             self.name()
         )
     }

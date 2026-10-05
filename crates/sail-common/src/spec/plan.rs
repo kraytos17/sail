@@ -558,6 +558,10 @@ pub enum CommandNode {
         column: ObjectName,
         value: Option<String>,
     },
+    CallProcedure {
+        name: ObjectName,
+        arguments: Vec<(Option<Identifier>, Expr)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

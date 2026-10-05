@@ -13,9 +13,11 @@
 pub mod action;
 pub mod append;
 pub mod bootstrap;
+pub mod expire_snapshots_gc;
 pub mod helpers;
 pub mod overwrite;
 pub(crate) mod parquet_utils;
+pub mod procedure;
 pub mod snapshot;
 pub mod write;
 
@@ -23,6 +25,7 @@ pub use action::*;
 pub use append::*;
 pub use bootstrap::*;
 pub use overwrite::*;
+pub use procedure::*;
 pub use snapshot::*;
 
 use crate::spec::{FormatVersion, Snapshot};

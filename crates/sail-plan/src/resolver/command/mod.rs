@@ -12,6 +12,7 @@ use crate::function::list_built_in_function_statuses;
 use crate::resolver::PlanResolver;
 use crate::resolver::state::PlanResolverState;
 
+mod call;
 mod catalog;
 mod checkpoint;
 mod delete;
@@ -381,6 +382,10 @@ impl PlanResolver<'_> {
             }
             CommandNode::CommentOnColumn { .. } => {
                 Err(PlanError::todo("CommandNode::CommentOnColumn"))
+            }
+            CommandNode::CallProcedure { name, arguments } => {
+                self.resolve_command_call_procedure(name, arguments, state)
+                    .await
             }
         }
     }
