@@ -195,6 +195,13 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_truncate_table() -> SqlResult<()> {
+        let tree = parse_one_statement("TRUNCATE TABLE t")?;
+        assert!(matches!(tree, Statement::TruncateTable { .. }));
+        Ok(())
+    }
+
+    #[test]
     fn test_unparse() -> SqlResult<()> {
         assert_eq!(
             parse_one_statement("/* */ SELECT 1+1")?.text(),
@@ -227,6 +234,10 @@ mod tests {
         assert_eq!(
             parse_one_statement("DESCRIBE TABLE t c")?.text(),
             "DESCRIBE TABLE t c "
+        );
+        assert_eq!(
+            parse_one_statement("TRUNCATE TABLE t")?.text(),
+            "TRUNCATE TABLE t "
         );
         Ok(())
     }

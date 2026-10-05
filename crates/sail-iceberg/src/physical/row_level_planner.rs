@@ -5,6 +5,7 @@ use datafusion::common::{DataFusionError, Result, not_impl_err, plan_err};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_planner::PhysicalPlanner;
 use sail_common_datafusion::datasource::{PhysicalSinkMode, RowLevelCommand, RowLevelWriteMode};
 use sail_data_source::options::ResolveOptions;
@@ -104,6 +105,11 @@ async fn plan_iceberg_delete(
     node: &RowLevelWriteNode,
     physical_inputs: &[Arc<dyn ExecutionPlan>],
 ) -> Result<Arc<dyn ExecutionPlan>> {
+    // TRUNCATE TABLE (and conditionless DELETE) removes every row.
+    if node.condition().is_none() {
+        return plan_iceberg_truncate(session, node).await;
+    }
+
     let [delete_rows] = physical_inputs else {
         return plan_err!("Iceberg DELETE requires exactly one write-plan input");
     };
@@ -163,6 +169,77 @@ async fn plan_iceberg_delete(
             table_url,
             writer_options.lakehouse_table.clone(),
             SnapshotUpdateKind::RowDelta,
+        )
+        .with_expected_snapshot_id(node.expected_snapshot_id()),
+    ))
+}
+
+/// Empty full overwrite for `TRUNCATE TABLE` (and conditionless `DELETE`):
+/// `FullOverwrite` drops every parent manifest, so no row scan is needed.
+/// The empty snapshot assigns zero row IDs, so `advance_next_row_id(0)` in
+/// the commit preserves the table's V3 `next-row-id` counter (spec: the
+/// counter advances by at least the number of newly assigned row IDs).
+async fn plan_iceberg_truncate(
+    session: &dyn Session,
+    node: &RowLevelWriteNode,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let table_url =
+        IcebergLakeSource::parse_table_url(vec![node.target_location().to_string()]).await?;
+    let metadata_location = metadata_location_from_options(node.target_options());
+    let catalog_managed_table = catalog_managed_iceberg_from_options(node.target_options());
+    let metadata_location_for_load = resolve_iceberg_metadata_location(
+        node.target_lakehouse_table(),
+        metadata_location,
+        catalog_managed_table,
+    )?;
+    let table =
+        Table::load_with_metadata_location(session, table_url.clone(), metadata_location_for_load)
+            .await?;
+    let current_schema = table.metadata().current_schema().ok_or_else(|| {
+        DataFusionError::Plan("Iceberg table metadata is missing current schema".to_string())
+    })?;
+    let current_arrow_schema =
+        crate::datasource::type_converter::iceberg_schema_to_arrow(current_schema)?;
+
+    if table.metadata().current_snapshot().is_none() {
+        let empty: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(Arc::new(current_arrow_schema)));
+        return Ok(Arc::new(IcebergCommitExec::new(
+            empty,
+            table_url,
+            node.target_lakehouse_table().cloned(),
+            SnapshotUpdateKind::FastAppend,
+        )));
+    }
+
+    let writer_options = resolve_row_level_writer_options(session, node)?;
+    let partition_columns = IcebergLakeSource::partition_columns_from_metadata(&table)?;
+    let write_context = prepare_iceberg_write_context(
+        &table_url,
+        Some(table.metadata()),
+        &writer_options,
+        &partition_columns,
+        &PhysicalSinkMode::Append,
+        &current_arrow_schema,
+    )?;
+    let empty_input: Arc<dyn ExecutionPlan> =
+        Arc::new(EmptyExec::new(Arc::new(current_arrow_schema)));
+    let writer: Arc<dyn ExecutionPlan> = Arc::new(IcebergWriterExec::new(
+        empty_input,
+        table_url.clone(),
+        partition_columns,
+        PhysicalSinkMode::Append,
+        true,
+        writer_options.clone(),
+        write_context,
+    )?);
+
+    Ok(Arc::new(
+        IcebergCommitExec::new(
+            writer,
+            table_url,
+            writer_options.lakehouse_table.clone(),
+            SnapshotUpdateKind::FullOverwrite,
         )
         .with_expected_snapshot_id(node.expected_snapshot_id()),
     ))

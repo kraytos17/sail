@@ -6289,6 +6289,14 @@
               }
             },
             {
+              "name": "Keyword(Truncate)",
+              "node": {
+                "terminal": {
+                  "keyword": "TRUNCATE"
+                }
+              }
+            },
+            {
               "name": "Keyword(TryCast)",
               "node": {
                 "terminal": {
@@ -10195,6 +10203,19 @@
                       },
                       {
                         "nonTerminal": "Option(WhereClause)"
+                      }
+                    ]
+                  },
+                  {
+                    "sequence": [
+                      {
+                        "nonTerminal": "Keyword(Truncate)"
+                      },
+                      {
+                        "nonTerminal": "Keyword(Table)"
+                      },
+                      {
+                        "nonTerminal": "ObjectName"
                       }
                     ]
                   },
