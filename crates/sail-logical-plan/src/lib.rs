@@ -4,6 +4,7 @@ pub mod load_data;
 pub mod map_partitions;
 pub mod merge;
 pub mod monotonic_id;
+pub mod procedure;
 pub mod range;
 pub mod remote_checkpoint;
 pub mod repartition;

@@ -60,7 +60,8 @@ pub(crate) fn compute_procedure_updates(
         LakeSourceProcedureOperation::ExpireSnapshots {
             older_than_ms,
             retain_last,
-        } => expire_snapshot_updates(metadata, *older_than_ms, *retain_last),
+            snapshot_ids,
+        } => expire_snapshot_updates(metadata, *older_than_ms, *retain_last, snapshot_ids),
     }
 }
 
@@ -75,6 +76,7 @@ fn expire_snapshot_updates(
     metadata: &TableMetadata,
     older_than_ms: Option<i64>,
     retain_last: Option<i32>,
+    explicit_ids: &[i64],
 ) -> Result<Vec<TableUpdate>> {
     let now = crate::utils::timestamp::monotonic_timestamp_ms();
     let default_max_age_ms = metadata
@@ -92,12 +94,20 @@ fn expire_snapshot_updates(
 
     let (retained, _) = retained_snapshot_ids(metadata, older_than, retain_last);
 
-    let expired_ids: Vec<i64> = metadata
+    let mut expired_ids: Vec<i64> = metadata
         .snapshots
         .iter()
         .filter(|s| !retained.contains(&s.snapshot_id()))
         .map(|s| s.snapshot_id())
         .collect();
+    // Explicitly requested snapshots expire in addition to the policy set,
+    // except the current snapshot, which must never be dropped.
+    let current = metadata.current_snapshot_id;
+    for id in explicit_ids {
+        if Some(*id) != current && !expired_ids.contains(id) {
+            expired_ids.push(*id);
+        }
+    }
     if expired_ids.is_empty() {
         return Ok(vec![]);
     }
@@ -280,8 +290,7 @@ pub(crate) fn compute_procedure_output(
                 .refs
                 .get(MAIN_BRANCH)
                 .map(|r| r.snapshot_id)
-                .or(metadata.current_snapshot_id)
-                .unwrap_or(0);
+                .or(metadata.current_snapshot_id);
             let current = resolve_target_snapshot_id(procedure, metadata)?.unwrap_or(0);
             Ok(CallProcedureOutput::SnapshotRef {
                 previous_snapshot_id: previous,
@@ -305,7 +314,8 @@ pub(crate) fn compute_procedure_output(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallProcedureOutput {
     SnapshotRef {
-        previous_snapshot_id: i64,
+        /// `NULL` when the table had no current snapshot before the procedure.
+        previous_snapshot_id: Option<i64>,
         current_snapshot_id: i64,
     },
     ExpireSnapshots {
@@ -319,14 +329,18 @@ pub enum CallProcedureOutput {
 }
 
 impl CallProcedureOutput {
-    /// The fixed Arrow schema for this output.
-    pub fn schema(&self) -> SchemaRef {
-        let fields = match self {
-            Self::SnapshotRef { .. } => vec![
-                Field::new("previous_snapshot_id", DataType::Int64, true),
-                Field::new("current_snapshot_id", DataType::Int64, true),
+    /// The fixed Arrow schema for a procedure's output, from the operation alone.
+    pub fn schema_for(operation: &LakeSourceProcedureOperation) -> SchemaRef {
+        let fields = match operation {
+            LakeSourceProcedureOperation::RollbackToSnapshot { .. } => vec![
+                Field::new("previous_snapshot_id", DataType::Int64, false),
+                Field::new("current_snapshot_id", DataType::Int64, false),
             ],
-            Self::ExpireSnapshots { .. } => vec![
+            LakeSourceProcedureOperation::SetCurrentSnapshot { .. } => vec![
+                Field::new("previous_snapshot_id", DataType::Int64, true),
+                Field::new("current_snapshot_id", DataType::Int64, false),
+            ],
+            LakeSourceProcedureOperation::ExpireSnapshots { .. } => vec![
                 Field::new("deleted_data_files_count", DataType::Int64, true),
                 Field::new("deleted_position_delete_files_count", DataType::Int64, true),
                 Field::new("deleted_equality_delete_files_count", DataType::Int64, true),
@@ -338,6 +352,22 @@ impl CallProcedureOutput {
         Arc::new(Schema::new(fields))
     }
 
+    /// The fixed Arrow schema for this output.
+    pub fn schema(&self) -> SchemaRef {
+        let operation = match self {
+            Self::SnapshotRef { .. } => LakeSourceProcedureOperation::SetCurrentSnapshot {
+                snapshot_id: None,
+                r#ref: None,
+            },
+            Self::ExpireSnapshots { .. } => LakeSourceProcedureOperation::ExpireSnapshots {
+                older_than_ms: None,
+                retain_last: None,
+                snapshot_ids: vec![],
+            },
+        };
+        Self::schema_for(&operation)
+    }
+
     /// Builds the single-row result batch for this output.
     pub fn to_record_batch(&self) -> Result<RecordBatch> {
         let schema = self.schema();
@@ -347,7 +377,7 @@ impl CallProcedureOutput {
                 current_snapshot_id,
             } => vec![
                 Arc::new(Int64Array::from(vec![*previous_snapshot_id])),
-                Arc::new(Int64Array::from(vec![*current_snapshot_id])),
+                Arc::new(Int64Array::from(vec![Some(*current_snapshot_id)])),
             ],
             Self::ExpireSnapshots {
                 deleted_data_files_count,

@@ -8,14 +8,17 @@ use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext
 use datafusion::logical_expr::{LogicalPlan, TableScan, UserDefinedLogicalNode};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
+use sail_common_datafusion::catalog::CommitAuthority;
 use sail_logical_plan::load_data::LoadDataNode;
 use sail_logical_plan::merge::MergeCardinalityCheckNode;
+use sail_logical_plan::procedure::ProcedureNode;
 use sail_logical_plan::row_level::RowLevelWriteNode;
 use sail_physical_plan::merge_cardinality_check::MergeCardinalityCheckExec;
 
 use crate::lake_source::{IcebergWriteNode, plan_iceberg_write};
 use crate::logical::IcebergTableSource;
 use crate::physical::load_data_planner::plan_load_data;
+use crate::physical::procedure_exec::IcebergProcedureExec;
 use crate::physical::row_level_planner::plan_iceberg_row_level_write;
 
 pub struct IcebergPhysicalPlanner;
@@ -78,6 +81,13 @@ impl ExtensionPlanner for IcebergPhysicalPlanner {
             return plan_load_data(session, node).await.map(Some);
         }
 
+        if let Some(node) = node.as_any().downcast_ref::<ProcedureNode>() {
+            if !node.options().format.eq_ignore_ascii_case("iceberg") {
+                return Ok(None);
+            }
+            return plan_iceberg_procedure(session, node).await.map(Some);
+        }
+
         Ok(None)
     }
 
@@ -104,4 +114,27 @@ impl ExtensionPlanner for IcebergPhysicalPlanner {
             .await?;
         Ok(Some(plan))
     }
+}
+
+async fn plan_iceberg_procedure(
+    _session: &dyn Session,
+    node: &ProcedureNode,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let options = node.options().clone();
+    let commit_authority = options
+        .target_lakehouse_table
+        .as_ref()
+        .map(|context| context.commit)
+        .unwrap_or(CommitAuthority::Filesystem);
+    let catalog_table = options
+        .target_lakehouse_table
+        .as_ref()
+        .map(|context| context.catalog_table().to_vec())
+        .unwrap_or_default();
+    Ok(Arc::new(IcebergProcedureExec::new(
+        options,
+        commit_authority,
+        catalog_table,
+        node.options().target_lakehouse_table.clone(),
+    )))
 }

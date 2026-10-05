@@ -92,9 +92,10 @@ use prost::Message;
 use sail_catalog_system::physical_plan::SystemTableExec;
 use sail_common_datafusion::array::record_batch::{read_record_batches, write_record_batches};
 use sail_common_datafusion::catalog::{
-    CatalogPartitionField, LakehouseExecutionContext, PartitionTransform,
+    CatalogPartitionField, CommitAuthority, LakehouseExecutionContext, PartitionTransform,
 };
 use sail_common_datafusion::datasource::PhysicalSinkMode;
+use sail_common_datafusion::lakesource::LakeSourceProcedureOperation;
 use sail_common_datafusion::schema_evolution::{
     SchemaEvolutionCastColumnExpr, SchemaEvolutionDefaultExpr,
     SchemaEvolutionPhysicalExprAdapterFactoryWithMatching, SchemaEvolutionTimezoneMode,
@@ -266,6 +267,7 @@ use sail_function::scalar::xml::to_xml::SparkToXml;
 use sail_function::scalar::xml::xpath::Xpath;
 use sail_function::scalar::xml::xpath_typed::{XpathTyped, xpath_typed_name_to_kind};
 use sail_function::window::{SparkFirstLastValue, SparkFirstLastValueKind, SparkNtile};
+use sail_iceberg::physical::IcebergProcedureExec;
 use sail_iceberg::physical_plan::{
     IcebergCommitExec, IcebergDeleteApplyExec, IcebergDiscoveryExec,
     IcebergEqualityDeleteWriterExec, IcebergLoadDataFastExec, IcebergManifestScanExec,
@@ -274,6 +276,7 @@ use sail_iceberg::physical_plan::{
 };
 use sail_iceberg::spec::Transform as IcebergTransform;
 use sail_iceberg::{IcebergWriteContext, IcebergWriterExecOptions, SnapshotUpdateKind};
+use sail_logical_plan::procedure::ProcedureOptions;
 use sail_logical_plan::range::Range;
 use sail_logical_plan::show_string::{ShowStringFormat, ShowStringStyle};
 use sail_physical_plan::barrier::BarrierExec;
@@ -1725,6 +1728,43 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                     lakehouse_table,
                 )))
             }
+            NodeKind::IcebergProcedure(r#gen::IcebergProcedureExecNode {
+                kind,
+                operation,
+                procedure_name,
+                target_table,
+                target_path,
+                lakehouse_table_json,
+                format,
+            }) => {
+                let kind = r#gen::IcebergProcedureKind::try_from(kind)
+                    .map_err(|e| plan_datafusion_err!("invalid Iceberg procedure kind: {e}"))?;
+                let operation = Self::try_decode_procedure_operation(kind, operation)?;
+                let lakehouse_table = self.try_decode_lakehouse_table(&lakehouse_table_json)?;
+                let commit_authority = lakehouse_table
+                    .as_ref()
+                    .map(|context| context.commit)
+                    .unwrap_or(CommitAuthority::Filesystem);
+                let catalog_table = lakehouse_table
+                    .as_ref()
+                    .map(|context| context.catalog_table().to_vec())
+                    .unwrap_or_default();
+                let options = ProcedureOptions {
+                    format,
+                    procedure_name,
+                    operation,
+                    target_table: (!target_table.is_empty()).then_some(target_table),
+                    target_path: (!target_path.is_empty()).then_some(target_path),
+                    target_options: vec![],
+                    target_lakehouse_table: lakehouse_table.clone(),
+                };
+                Ok(Arc::new(IcebergProcedureExec::new(
+                    options,
+                    commit_authority,
+                    catalog_table,
+                    lakehouse_table,
+                )))
+            }
             NodeKind::IcebergDeleteApply(r#gen::IcebergDeleteApplyExecNode {
                 input,
                 data_file_path,
@@ -2875,6 +2915,20 @@ impl PhysicalExtensionCodec for RemoteExecutionCodec {
                 requirements_json,
                 table_properties_json,
                 lakehouse_table_json,
+            })
+        } else if let Some(procedure) = node.downcast_ref::<IcebergProcedureExec>() {
+            let options = procedure.options();
+            let (kind, operation) = Self::try_encode_procedure_operation(&options.operation);
+            let lakehouse_table_json =
+                self.try_encode_lakehouse_table(procedure.lakehouse_table())?;
+            NodeKind::IcebergProcedure(r#gen::IcebergProcedureExecNode {
+                kind: kind as i32,
+                operation: Some(operation),
+                procedure_name: options.procedure_name.clone(),
+                target_table: options.target_table.clone().unwrap_or_default(),
+                target_path: options.target_path.clone().unwrap_or_default(),
+                lakehouse_table_json,
+                format: options.format.clone(),
             })
         } else if let Some(delete_apply) = node.downcast_ref::<IcebergDeleteApplyExec>() {
             let input = try_encode_physical_plan_with_converter(
@@ -4773,6 +4827,80 @@ impl RemoteExecutionCodec {
         }) as i32)
     }
 
+    fn try_decode_procedure_operation(
+        kind: r#gen::IcebergProcedureKind,
+        operation: Option<r#gen::IcebergProcedureOperation>,
+    ) -> Result<LakeSourceProcedureOperation> {
+        let op = operation.unwrap_or_default();
+        Ok(match kind {
+            r#gen::IcebergProcedureKind::RollbackToSnapshot => {
+                LakeSourceProcedureOperation::RollbackToSnapshot {
+                    snapshot_id: op.snapshot_id,
+                }
+            }
+            r#gen::IcebergProcedureKind::SetCurrentSnapshot => {
+                LakeSourceProcedureOperation::SetCurrentSnapshot {
+                    snapshot_id: op.has_snapshot_id.then_some(op.snapshot_id),
+                    r#ref: op.has_ref.then_some(op.ref_name),
+                }
+            }
+            r#gen::IcebergProcedureKind::ExpireSnapshots => {
+                LakeSourceProcedureOperation::ExpireSnapshots {
+                    older_than_ms: op.has_older_than.then_some(op.older_than_ms),
+                    retain_last: op.has_retain_last.then_some(op.retain_last),
+                    snapshot_ids: op.snapshot_ids.clone(),
+                }
+            }
+            r#gen::IcebergProcedureKind::Unspecified => {
+                return plan_err!("missing Iceberg procedure kind");
+            }
+        })
+    }
+
+    fn try_encode_procedure_operation(
+        operation: &LakeSourceProcedureOperation,
+    ) -> (
+        r#gen::IcebergProcedureKind,
+        r#gen::IcebergProcedureOperation,
+    ) {
+        let mut op = r#gen::IcebergProcedureOperation::default();
+        let kind = match operation {
+            LakeSourceProcedureOperation::RollbackToSnapshot { snapshot_id } => {
+                op.snapshot_id = *snapshot_id;
+                op.has_snapshot_id = true;
+                r#gen::IcebergProcedureKind::RollbackToSnapshot
+            }
+            LakeSourceProcedureOperation::SetCurrentSnapshot { snapshot_id, r#ref } => {
+                if let Some(id) = snapshot_id {
+                    op.snapshot_id = *id;
+                    op.has_snapshot_id = true;
+                }
+                if let Some(name) = r#ref {
+                    op.ref_name = name.clone();
+                    op.has_ref = true;
+                }
+                r#gen::IcebergProcedureKind::SetCurrentSnapshot
+            }
+            LakeSourceProcedureOperation::ExpireSnapshots {
+                older_than_ms,
+                retain_last,
+                snapshot_ids,
+            } => {
+                if let Some(ms) = older_than_ms {
+                    op.older_than_ms = *ms;
+                    op.has_older_than = true;
+                }
+                if let Some(last) = retain_last {
+                    op.retain_last = *last;
+                    op.has_retain_last = true;
+                }
+                op.snapshot_ids = snapshot_ids.clone();
+                r#gen::IcebergProcedureKind::ExpireSnapshots
+            }
+        };
+        (kind, op)
+    }
+
     fn try_decode_iceberg_snapshot_update_kind(kind: i32) -> Result<SnapshotUpdateKind> {
         match r#gen::IcebergSnapshotUpdateKind::try_from(kind)
             .map_err(|_| plan_datafusion_err!("invalid Iceberg snapshot update kind"))?
@@ -6100,6 +6228,62 @@ mod tests {
             decoded_node.table_properties(),
             &[("key".to_string(), "value".to_string())]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_round_trip_iceberg_procedure_exec_preserves_operation() -> Result<()> {
+        for operation in [
+            LakeSourceProcedureOperation::RollbackToSnapshot { snapshot_id: 7 },
+            LakeSourceProcedureOperation::SetCurrentSnapshot {
+                snapshot_id: Some(9),
+                r#ref: None,
+            },
+            LakeSourceProcedureOperation::SetCurrentSnapshot {
+                snapshot_id: None,
+                r#ref: Some("tag".to_string()),
+            },
+            LakeSourceProcedureOperation::ExpireSnapshots {
+                older_than_ms: Some(123),
+                retain_last: Some(3),
+                snapshot_ids: vec![1, 2, 3],
+            },
+        ] {
+            let options = ProcedureOptions {
+                format: "iceberg".to_string(),
+                procedure_name: vec!["system".to_string(), operation.label().to_string()],
+                operation: operation.clone(),
+                target_table: Some(vec!["db".to_string(), "t".to_string()]),
+                target_path: Some("s3a://bucket/db/t".to_string()),
+                target_options: vec![],
+                target_lakehouse_table: None,
+            };
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(IcebergProcedureExec::new(
+                options,
+                CommitAuthority::Filesystem,
+                vec![],
+                None,
+            ));
+
+            let codec = RemoteExecutionCodec;
+            let bytes = try_encode_physical_plan(&codec, plan)?;
+            let decoded = try_decode_physical_plan(&TaskContext::default(), &codec, &bytes)?;
+            let decoded_node = decoded
+                .downcast_ref::<IcebergProcedureExec>()
+                .ok_or_else(|| plan_datafusion_err!("decoded plan is not IcebergProcedureExec"))?;
+
+            assert_eq!(decoded_node.options().operation, operation);
+            assert_eq!(decoded_node.options().format, "iceberg");
+            assert_eq!(
+                decoded_node.options().target_table.as_deref(),
+                Some(&["db".to_string(), "t".to_string()][..])
+            );
+            assert_eq!(
+                decoded_node.options().target_path.as_deref(),
+                Some("s3a://bucket/db/t")
+            );
+        }
 
         Ok(())
     }

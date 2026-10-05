@@ -72,6 +72,7 @@ message ExtendedPhysicalPlanNode {
     PartitionedTopKExecNode partitioned_top_k = 57;
     IcebergMetadataScanExecNode iceberg_metadata_scan = 58;
     IcebergLoadDataFastExecNode iceberg_load_data_fast = 59;
+    IcebergProcedureExecNode iceberg_procedure = 60;
   }
 }
 
@@ -1093,6 +1094,36 @@ message IcebergLoadDataFastExecNode {
   string table_properties_json = 4;
   // Iceberg lakehouse execution context, serialized as JSON (empty = None).
   string lakehouse_table_json = 5;
+}
+
+// A `CALL <catalog>.system.<procedure>(...)` operation against an Iceberg table.
+message IcebergProcedureOperation {
+  int64 snapshot_id = 1;
+  bool has_snapshot_id = 2;
+  string ref_name = 3;
+  bool has_ref = 4;
+  int64 older_than_ms = 5;
+  bool has_older_than = 6;
+  int32 retain_last = 7;
+  bool has_retain_last = 8;
+  repeated int64 snapshot_ids = 9;
+}
+
+enum IcebergProcedureKind {
+  ICEBERG_PROCEDURE_KIND_UNSPECIFIED = 0;
+  ICEBERG_PROCEDURE_KIND_ROLLBACK_TO_SNAPSHOT = 1;
+  ICEBERG_PROCEDURE_KIND_SET_CURRENT_SNAPSHOT = 2;
+  ICEBERG_PROCEDURE_KIND_EXPIRE_SNAPSHOTS = 3;
+}
+
+message IcebergProcedureExecNode {
+  IcebergProcedureKind kind = 1;
+  IcebergProcedureOperation operation = 2;
+  repeated string procedure_name = 3;
+  repeated string target_table = 4;
+  string target_path = 5;
+  string lakehouse_table_json = 6;
+  string format = 7;
 }
 
 message IcebergDeleteApplyExecNode {

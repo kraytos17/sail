@@ -1,14 +1,12 @@
-use std::sync::Arc;
-
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::SchemaRef;
 use sail_common_datafusion::array::serde::ArrowSerializer;
 use sail_common_datafusion::catalog::{FunctionStatus, LakehouseOperation};
 use sail_common_datafusion::datasource::{DataSourceRegistry, is_lakehouse_format};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
 use sail_common_datafusion::lakesource::{
     LakeSourceAlterTableOperation, LakeSourceCreateTableColumn, LakeSourceCreateTableInfo,
-    LakeSourceCreateTableResult, LakeSourceProcedureOperation,
+    LakeSourceCreateTableResult,
 };
 use sail_common_datafusion::session::plan::PlanService;
 use serde::{Deserialize, Serialize};
@@ -20,9 +18,9 @@ use crate::lakehouse::{
 use crate::manager::CatalogManager;
 use crate::manager::tracker::{CatalogFunctionId, CatalogLogicalPlanId};
 use crate::provider::{
-    AlterTableOptions, CallProcedureOptions, CreateDatabaseOptions, CreateTableOptions,
-    CreateTemporaryViewOptions, CreateViewOptions, DropDatabaseOptions, DropTableOptions,
-    DropTemporaryViewOptions, DropViewOptions,
+    AlterTableOptions, CreateDatabaseOptions, CreateTableOptions, CreateTemporaryViewOptions,
+    CreateViewOptions, DropDatabaseOptions, DropTableOptions, DropTemporaryViewOptions,
+    DropViewOptions,
 };
 use crate::utils::{quote_names_if_needed, quote_namespace_if_needed};
 
@@ -159,10 +157,6 @@ pub enum CatalogCommand {
         extended: bool,
         column: Option<String>,
     },
-    CallProcedure {
-        table: Vec<String>,
-        procedure: CallProcedureOptions,
-    },
     DescribeDatabase {
         database: Vec<String>,
         extended: bool,
@@ -212,7 +206,6 @@ impl CatalogCommand {
             CatalogCommand::CreateTemporaryView { .. } => "CreateTemporaryView",
             CatalogCommand::CreateView { .. } => "CreateView",
             CatalogCommand::DescribeTable { .. } => "DescribeTable",
-            CatalogCommand::CallProcedure { .. } => "CallProcedure",
             CatalogCommand::DescribeDatabase { .. } => "DescribeDatabase",
         }
     }
@@ -257,7 +250,6 @@ impl CatalogCommand {
             CatalogCommand::DescribeTable { .. } => {
                 ArrowSerializer::default().schema::<DescribeTableRow>()?
             }
-            CatalogCommand::CallProcedure { procedure, .. } => call_procedure_schema(procedure),
             CatalogCommand::DescribeDatabase { .. } => {
                 ArrowSerializer::default().schema::<DescribeDatabaseRow>()?
             }
@@ -658,60 +650,6 @@ impl CatalogCommand {
                 }
 
                 serializer.build_record_batch(&rows)?
-            }
-            CatalogCommand::CallProcedure { table, procedure } => {
-                let table_status = manager.get_table_or_view(&table).await?;
-                let (location, format) = match &table_status.kind {
-                    sail_common_datafusion::catalog::TableKind::Table {
-                        location: Some(loc),
-                        format,
-                        ..
-                    } => (Some(loc.clone()), Some(format.clone())),
-                    _ => (None, None),
-                };
-                let location = location.ok_or_else(|| {
-                    CatalogError::NotSupported(
-                        "CALL procedures are only supported for tables with a location".to_string(),
-                    )
-                })?;
-                let format = format.ok_or_else(|| {
-                    CatalogError::NotSupported(
-                        "CALL procedures are only supported on tables".to_string(),
-                    )
-                })?;
-                if !format.eq_ignore_ascii_case("iceberg") {
-                    return Err(CatalogError::NotSupported(format!(
-                        "CALL procedures are only supported for Iceberg tables, got '{format}'"
-                    )));
-                }
-                let registry = ctx.extension::<DataSourceRegistry>().map_err(|e| {
-                    CatalogError::External(format!(
-                        "missing DataSourceRegistry for CALL procedure on format '{format}': {e}"
-                    ))
-                })?;
-                let lake_source = registry.get_lake_source(&format).map_err(|e| {
-                    CatalogError::External(format!(
-                        "unknown lake source '{format}' for CALL procedure: {e}"
-                    ))
-                })?;
-                let lakehouse_table = manager
-                    .resolve_lakehouse_table_status(
-                        &table,
-                        &table_status,
-                        LakehouseOperation::Maintenance,
-                    )
-                    .await?
-                    .execution;
-                let operation = lake_source_procedure_operation(&procedure);
-                lake_source
-                    .call_procedure(
-                        ctx.runtime_env(),
-                        &location,
-                        operation,
-                        Some(lakehouse_table),
-                    )
-                    .await
-                    .map_err(|e| CatalogError::External(e.to_string()))?
             }
             CatalogCommand::FunctionExists { .. } => {
                 return Err(CatalogError::NotSupported("function exists".to_string()));
@@ -1173,48 +1111,6 @@ struct DescribeTableRow {
 struct ShowTblPropertiesRow {
     key: String,
     value: String,
-}
-
-fn call_procedure_schema(procedure: &CallProcedureOptions) -> SchemaRef {
-    let fields = match procedure {
-        CallProcedureOptions::RollbackToSnapshot { .. }
-        | CallProcedureOptions::SetCurrentSnapshot { .. } => vec![
-            Field::new("previous_snapshot_id", DataType::Int64, true),
-            Field::new("current_snapshot_id", DataType::Int64, true),
-        ],
-        CallProcedureOptions::ExpireSnapshots { .. } => vec![
-            Field::new("deleted_data_files_count", DataType::Int64, true),
-            Field::new("deleted_position_delete_files_count", DataType::Int64, true),
-            Field::new("deleted_equality_delete_files_count", DataType::Int64, true),
-            Field::new("deleted_manifest_files_count", DataType::Int64, true),
-            Field::new("deleted_manifest_lists_count", DataType::Int64, true),
-            Field::new("deleted_statistics_files_count", DataType::Int64, true),
-        ],
-    };
-    Arc::new(Schema::new(fields))
-}
-
-fn lake_source_procedure_operation(options: &CallProcedureOptions) -> LakeSourceProcedureOperation {
-    match options {
-        CallProcedureOptions::RollbackToSnapshot { snapshot_id } => {
-            LakeSourceProcedureOperation::RollbackToSnapshot {
-                snapshot_id: *snapshot_id,
-            }
-        }
-        CallProcedureOptions::SetCurrentSnapshot { snapshot_id, r#ref } => {
-            LakeSourceProcedureOperation::SetCurrentSnapshot {
-                snapshot_id: *snapshot_id,
-                r#ref: r#ref.clone(),
-            }
-        }
-        CallProcedureOptions::ExpireSnapshots {
-            older_than_ms,
-            retain_last,
-        } => LakeSourceProcedureOperation::ExpireSnapshots {
-            older_than_ms: *older_than_ms,
-            retain_last: *retain_last,
-        },
-    }
 }
 
 #[derive(Serialize, Deserialize)]

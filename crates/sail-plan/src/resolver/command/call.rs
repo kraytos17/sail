@@ -14,11 +14,15 @@ use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDateTime};
 use datafusion_common::{DFSchema, ScalarValue};
-use datafusion_expr::LogicalPlan;
-use sail_catalog::command::CatalogCommand;
-use sail_catalog::provider::CallProcedureOptions;
+use datafusion_expr::{Extension, LogicalPlan};
+use sail_catalog::manager::CatalogManager;
 use sail_common::spec;
+use sail_common_datafusion::catalog::{LakehouseOperation, TableKind};
+use sail_common_datafusion::datasource::OptionLayer;
+use sail_common_datafusion::extension::SessionExtensionAccessor;
+use sail_common_datafusion::lakesource::LakeSourceProcedureOperation;
 use sail_common_datafusion::literal::LiteralEvaluator;
+use sail_logical_plan::procedure::{ProcedureNode, ProcedureOptions};
 
 use crate::error::{PlanError, PlanResult};
 use crate::resolver::PlanResolver;
@@ -50,14 +54,31 @@ impl PlanResolver<'_> {
             )));
         }
 
-        let (table, procedure) = match procedure_name.to_ascii_lowercase().as_str() {
+        // Reject unknown named arguments up front, mirroring Spark's procedure
+        // argument binding (an unrecognized parameter is an error, never a
+        // silent no-op).
+        let accepted: &[&str] = match procedure_name.to_ascii_lowercase().as_str() {
+            "rollback_to_snapshot" => &["table", "snapshot_id"],
+            "set_current_snapshot" => &["table", "snapshot_id", "ref"],
+            "expire_snapshots" => &["table", "older_than", "retain_last", "snapshot_ids"],
+            other => {
+                return Err(PlanError::unsupported(format!(
+                    "unsupported system procedure: {other}"
+                )));
+            }
+        };
+        validate_named_arguments(&arguments, accepted)?;
+
+        let (table, procedure_name, operation) = match procedure_name.to_ascii_lowercase().as_str()
+        {
             "rollback_to_snapshot" => {
                 let (table, snapshot_id) = self
                     .resolve_table_and_snapshot_id(&arguments, state)
                     .await?;
                 (
                     table,
-                    CallProcedureOptions::RollbackToSnapshot { snapshot_id },
+                    "rollback_to_snapshot".to_string(),
+                    LakeSourceProcedureOperation::RollbackToSnapshot { snapshot_id },
                 )
             }
             "set_current_snapshot" => {
@@ -66,18 +87,21 @@ impl PlanResolver<'_> {
                     .await?;
                 (
                     table,
-                    CallProcedureOptions::SetCurrentSnapshot { snapshot_id, r#ref },
+                    "set_current_snapshot".to_string(),
+                    LakeSourceProcedureOperation::SetCurrentSnapshot { snapshot_id, r#ref },
                 )
             }
             "expire_snapshots" => {
-                let (table, older_than_ms, retain_last) = self
+                let (table, older_than_ms, retain_last, snapshot_ids) = self
                     .resolve_table_and_expire_args(&arguments, state)
                     .await?;
                 (
                     table,
-                    CallProcedureOptions::ExpireSnapshots {
+                    "expire_snapshots".to_string(),
+                    LakeSourceProcedureOperation::ExpireSnapshots {
                         older_than_ms,
                         retain_last,
+                        snapshot_ids,
                     },
                 )
             }
@@ -88,7 +112,58 @@ impl PlanResolver<'_> {
             }
         };
 
-        self.resolve_catalog_command(CatalogCommand::CallProcedure { table, procedure })
+        let catalog_manager = self.ctx.extension::<CatalogManager>()?;
+        let status = catalog_manager
+            .get_table_or_view(&table)
+            .await
+            .map_err(PlanError::from)?;
+        let (format, target_path, properties) = match status.kind {
+            TableKind::Table {
+                location,
+                format,
+                properties,
+                ..
+            } => {
+                let normalized_format = format.to_ascii_lowercase();
+                let location = location.ok_or_else(|| {
+                    PlanError::unsupported("CALL procedures require a table with a location")
+                })?;
+                (normalized_format, location, properties)
+            }
+            _ => {
+                return Err(PlanError::unsupported(
+                    "CALL procedures are only supported on tables, not views",
+                ));
+            }
+        };
+        if format != "iceberg" {
+            return Err(PlanError::unsupported(format!(
+                "CALL procedures are only supported for Iceberg tables, got '{format}'"
+            )));
+        }
+
+        let lakehouse_table = self
+            .resolve_lakehouse_table_context(
+                &table,
+                LakehouseOperation::Maintenance,
+                Some(&format),
+                vec![],
+            )
+            .await?;
+        let target_options = vec![OptionLayer::TablePropertyList { items: properties }];
+
+        let node = ProcedureNode::new(ProcedureOptions {
+            format,
+            procedure_name: vec!["system".to_string(), procedure_name],
+            operation,
+            target_table: Some(table),
+            target_path: Some(target_path),
+            target_options,
+            target_lakehouse_table: Some(lakehouse_table),
+        });
+        Ok(LogicalPlan::Extension(Extension {
+            node: Arc::new(node),
+        }))
     }
 
     /// Resolves the `<table>`, `snapshot_id` arguments for `rollback_to_snapshot`.
@@ -149,7 +224,7 @@ impl PlanResolver<'_> {
         &self,
         arguments: &[(Option<spec::Identifier>, spec::Expr)],
         state: &mut PlanResolverState,
-    ) -> PlanResult<(Vec<String>, Option<i64>, Option<i32>)> {
+    ) -> PlanResult<(Vec<String>, Option<i64>, Option<i32>, Vec<i64>)> {
         let table = self.resolve_named_arg(arguments, "table", 0, state).await?;
         let table = scalar_to_table_name_parts(&table)?;
         let older_than_ms = self
@@ -162,7 +237,13 @@ impl PlanResolver<'_> {
             .await?
             .map(|scalar| scalar_to_i32(&scalar))
             .transpose()?;
-        Ok((table, older_than_ms, retain_last))
+        let snapshot_ids = self
+            .resolve_optional_named_arg(arguments, "snapshot_ids", 3, state)
+            .await?
+            .map(|scalar| scalar_to_snapshot_id_list(&scalar))
+            .transpose()?
+            .unwrap_or_default();
+        Ok((table, older_than_ms, retain_last, snapshot_ids))
     }
 
     /// Resolves an argument by name if present (case-insensitive), otherwise by position
@@ -239,6 +320,50 @@ impl PlanResolver<'_> {
             .evaluate(&resolved)
             .map_err(|e| PlanError::invalid(format!("CALL argument must be a constant: {e}")))
     }
+}
+
+/// Rejects any named argument not in `accepted`, mirroring Spark's procedure
+/// argument binding: an unrecognized parameter is an error, never a silent no-op.
+fn validate_named_arguments(
+    arguments: &[(Option<spec::Identifier>, spec::Expr)],
+    accepted: &[&str],
+) -> PlanResult<()> {
+    for (name, _) in arguments {
+        let Some(name) = name else {
+            continue;
+        };
+        let name = String::from(name.clone());
+        if !accepted.iter().any(|a| a.eq_ignore_ascii_case(&name)) {
+            return Err(PlanError::invalid(format!(
+                "unexpected argument '{name}' for CALL procedure; accepted: {}",
+                accepted.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Extracts the `<snapshot_ids>` argument (an array of integer literals).
+fn scalar_to_snapshot_id_list(scalar: &ScalarValue) -> PlanResult<Vec<i64>> {
+    use datafusion::arrow::array::{Array, Int64Array};
+
+    let array = match scalar {
+        ScalarValue::List(array) => array.values().clone(),
+        ScalarValue::LargeList(array) => array.values().clone(),
+        _ => {
+            return Err(PlanError::invalid(format!(
+                "CALL snapshot_ids must be an array of integers, got '{scalar}'"
+            )));
+        }
+    };
+    let values = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+        PlanError::invalid(format!(
+            "CALL snapshot_ids must be an array of integers, got '{scalar}'"
+        ))
+    })?;
+    Ok((0..values.len())
+        .map(|i| values.value(i))
+        .collect::<Vec<_>>())
 }
 
 /// Splits a dotted table reference like `db.table` into parts.
@@ -339,4 +464,53 @@ fn parse_timestamp_ms(value: &str) -> PlanResult<i64> {
             ))
         })?;
     Ok(naive.and_utc().timestamp_millis())
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used)]
+mod tests {
+    use sail_common::spec;
+
+    use super::validate_named_arguments;
+
+    fn named(name: &str) -> (Option<spec::Identifier>, spec::Expr) {
+        (
+            Some(name.into()),
+            spec::Expr::Literal(spec::Literal::Int64 { value: Some(1) }),
+        )
+    }
+
+    fn unnamed() -> (Option<spec::Identifier>, spec::Expr) {
+        (
+            None,
+            spec::Expr::Literal(spec::Literal::Int64 { value: Some(1) }),
+        )
+    }
+
+    #[test]
+    fn accepts_known_named_arguments_case_insensitively() {
+        let args = vec![named("TABLE"), named("Snapshot_Id")];
+        validate_named_arguments(&args, &["table", "snapshot_id"]).unwrap();
+    }
+
+    #[test]
+    fn ignores_positional_arguments() {
+        let args = vec![unnamed(), unnamed()];
+        validate_named_arguments(&args, &["table"]).unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_named_arguments() {
+        // `expire_snapshots` does not support `snapshot_ids` in this port, so a
+        // caller passing it must get an error rather than a silent no-op.
+        let args = vec![named("table"), named("snapshot_ids")];
+        let error =
+            validate_named_arguments(&args, &["table", "older_than", "retain_last"]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected argument 'snapshot_ids'"),
+            "unexpected error: {error}"
+        );
+    }
 }

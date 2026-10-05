@@ -15,7 +15,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema};
-use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result, not_impl_err, plan_err};
 use datafusion::logical_expr::{LogicalPlan, TableSource};
@@ -37,8 +36,7 @@ use sail_common_datafusion::datasource::{
 };
 use sail_common_datafusion::lakesource::{
     LakeSource, LakeSourceAlterTableOperation, LakeSourceCreateTableColumn,
-    LakeSourceCreateTableInfo, LakeSourceCreateTableResult, LakeSourceMetadata,
-    LakeSourceProcedureOperation, RowLevelOperation,
+    LakeSourceCreateTableInfo, LakeSourceCreateTableResult, LakeSourceMetadata, RowLevelOperation,
 };
 use sail_common_datafusion::utils::items::ItemTaker;
 use sail_common_datafusion::variant::with_variant_extension_if_marked_storage;
@@ -52,7 +50,6 @@ use crate::logical::IcebergTableSource;
 use crate::operations::bootstrap::{
     NewTableMetadataStyle, bootstrap_empty_table_metadata, replace_empty_table_metadata,
 };
-use crate::operations::procedure::CallProcedureOutput;
 use crate::options::r#gen::{IcebergReadOptions, IcebergWriteOptions};
 use crate::physical_plan::IcebergWriterExecOptions;
 use crate::physical_plan::plan_builder::{IcebergPlanBuilder, IcebergTableConfig};
@@ -294,85 +291,6 @@ impl LakeSource for IcebergLakeSource {
                     .await
             }
             op => not_impl_err!("unsupported Iceberg ALTER TABLE operation: {op:?}"),
-        }
-    }
-
-    async fn call_procedure(
-        &self,
-        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
-        path: &str,
-        operation: LakeSourceProcedureOperation,
-        lakehouse_table: Option<LakehouseExecutionContext>,
-    ) -> Result<RecordBatch> {
-        use crate::operations::expire_snapshots_gc::expire_files_gc;
-        use crate::operations::procedure::{
-            apply_procedure_updates, compute_procedure_output, compute_procedure_updates,
-            procedure_requirements, validate_procedure_requirements,
-        };
-
-        // Catalog-coordinated commits (e.g. Iceberg REST / versioned catalog)
-        // require a session extension accessor the lake-source layer does not
-        // carry; reject them for now, mirroring ALTER TABLE on catalog-managed
-        // tables. The filesystem path below writes metadata files directly.
-        if let Some(context) = lakehouse_table.as_ref()
-            && context.commit != CommitAuthority::Filesystem
-        {
-            return not_impl_err!(
-                "CALL procedures for catalog-managed Iceberg tables are not yet supported: {}",
-                context.catalog_table().join(".")
-            );
-        }
-
-        let table_url = Self::parse_table_url(vec![path.to_string()]).await?;
-        let object_store = runtime_env
-            .object_store_registry
-            .get_store(&table_url)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let store_ctx = StoreContext::new(object_store.clone(), &table_url)?;
-
-        let latest_meta = find_latest_metadata_file(&object_store, &table_url).await?;
-        let bytes = load_metadata_file_bytes(&object_store, &latest_meta).await?;
-        let pre_commit =
-            TableMetadata::from_json(&bytes).map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        let updates = compute_procedure_updates(&operation, &pre_commit)?;
-        let requirements = procedure_requirements(&pre_commit);
-        let output = compute_procedure_output(&operation, &pre_commit)?;
-
-        let updates_for_commit = updates.clone();
-        let requirements_for_commit = requirements.clone();
-        retry_metadata_commit(
-            &store_ctx,
-            &object_store,
-            &table_url,
-            latest_meta,
-            true,
-            move |table_meta| {
-                validate_procedure_requirements(table_meta, &requirements_for_commit)?;
-                apply_procedure_updates(table_meta, &updates_for_commit)?;
-                Ok(())
-            },
-        )
-        .await?;
-
-        match &operation {
-            LakeSourceProcedureOperation::ExpireSnapshots { .. } => {
-                let post_meta = find_latest_metadata_file(&object_store, &table_url).await?;
-                let bytes = load_metadata_file_bytes(&object_store, &post_meta).await?;
-                let post_commit = TableMetadata::from_json(&bytes)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                let counts = expire_files_gc(&store_ctx, &pre_commit, &post_commit).await?;
-                Ok(CallProcedureOutput::ExpireSnapshots {
-                    deleted_data_files_count: counts.data_files as i64,
-                    deleted_position_delete_files_count: counts.position_delete_files as i64,
-                    deleted_equality_delete_files_count: counts.equality_delete_files as i64,
-                    deleted_manifest_files_count: counts.manifest_files as i64,
-                    deleted_manifest_lists_count: counts.manifest_lists as i64,
-                    deleted_statistics_files_count: counts.statistics_files as i64,
-                }
-                .to_record_batch()?)
-            }
-            _ => output.to_record_batch(),
         }
     }
 }
@@ -706,7 +624,7 @@ impl IcebergLakeSource {
 /// A catalog-coordinated commit (Iceberg REST / versioned catalog) must NOT use
 /// this helper: those goals publish through the catalog and are driven
 /// separately.
-async fn retry_metadata_commit<F>(
+pub(crate) async fn retry_metadata_commit<F>(
     store_ctx: &StoreContext,
     object_store: &Arc<dyn object_store::ObjectStore>,
     table_url: &Url,
