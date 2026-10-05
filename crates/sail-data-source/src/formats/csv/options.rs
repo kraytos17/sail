@@ -73,7 +73,13 @@ impl CsvReadOptions {
                     cause: None,
                 });
             }
-            (nv, _) if !nv.is_empty() => Some(regex::escape(nv)),
+            // A literal `nullValue` is exact-match (Spark semantics), while a
+            // user-supplied `nullRegex` keeps regex search semantics: anchor
+            // only the escaped literal. Both decoders match with `is_match`,
+            // so an unanchored literal would also null `"nullable"`.
+            // `\A…\z` (not `^…$`) so a multiline field ending in `\n` cannot
+            // false-match.
+            (nv, _) if !nv.is_empty() => Some(format!("\\A(?:{})\\z", regex::escape(nv))),
             (_, nr) if !nr.is_empty() => Some(nr.to_string()),
             _ => None,
         };
@@ -266,7 +272,9 @@ mod tests {
         assert_eq!(options.comment, Some(b'^'));
         assert_eq!(options.has_header, Some(true));
         assert_eq!(options.null_value, None);
-        assert_eq!(options.null_regex, Some("MEOW".to_string()));
+        // A literal `nullValue` is anchored to exact-match; only an explicit
+        // `nullRegex` keeps unanchored search semantics (asserted below).
+        assert_eq!(options.null_regex, Some("\\A(?:MEOW)\\z".to_string()));
         assert_eq!(options.terminator, Some(b'@'));
         // `inferSchema` defaults to `false` (Spark parity), which collapses
         // `schema_infer_max_rec` to `Some(0)` regardless of the user-supplied
@@ -312,6 +320,14 @@ mod tests {
             .map_err(datafusion_common::DataFusionError::from)?;
         assert_eq!(options.null_value, None);
         assert_eq!(options.null_regex, Some("MEOW".to_string()));
+
+        // Regex metacharacters in a literal `nullValue` stay literal.
+        let kv = option_list(&[("nullValue", "a.c")]);
+        let options = CsvReadOptions::resolve(&state, vec![kv])
+            .and_then(|o| o.into_table_options())
+            .map_err(datafusion_common::DataFusionError::from)?;
+        assert_eq!(options.null_value, None);
+        assert_eq!(options.null_regex, Some("\\A(?:a\\.c)\\z".to_string()));
 
         Ok(())
     }

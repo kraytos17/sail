@@ -474,6 +474,7 @@ impl<R: BufRead, D: Decoder> Iterator for DecoderBatchReader<R, D> {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::arrow::array::Array;
     use datafusion::arrow::csv::ReaderBuilder as ArrowReaderBuilder;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
@@ -514,6 +515,9 @@ mod tests {
         }
         if let Some(c) = o.comment {
             builder = builder.with_comment(c);
+        }
+        if let Some(regex) = &o.null_regex {
+            builder = builder.with_null_regex(regex.clone());
         }
         builder.build_decoder()
     }
@@ -602,6 +606,51 @@ mod tests {
                 assert_eq!(actual, expected, "chunk {chunk} batch size {batch_size}");
             }
         }
+    }
+
+    fn nulls_of(batches: &[RecordBatch]) -> Result<Vec<bool>, String> {
+        let mut out = Vec::new();
+        for batch in batches {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "expected a single Utf8 column".to_string())?;
+            out.extend((0..column.len()).map(|i| column.is_null(i)));
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn null_value_matches_exact_cells_only() -> Result<(), String> {
+        // `nullValue="null"` converts to an anchored pattern: only the exact
+        // cell nulls. A bare `nullRegex` keeps search semantics. (The
+        // trailing empty line yields no record.)
+        let input = b"c0\nnull\nnullable\nnullify\n\n";
+        let anchored = ProjectedCsvOptions {
+            null_regex: Some(regex::Regex::new("\\A(?:null)\\z").map_err(|e| e.to_string())?),
+            ..options(1, &[0])
+        };
+        assert_matches_arrow(input, anchored.clone());
+        let batches = run(
+            ProjectedCsvDecoder::try_new(anchored).map_err(|e| e.to_string())?,
+            input,
+            64,
+        )?;
+        assert_eq!(nulls_of(&batches)?, vec![true, false, false]);
+
+        let search = ProjectedCsvOptions {
+            null_regex: Some(regex::Regex::new("null").map_err(|e| e.to_string())?),
+            ..options(1, &[0])
+        };
+        assert_matches_arrow(input, search.clone());
+        let batches = run(
+            ProjectedCsvDecoder::try_new(search).map_err(|e| e.to_string())?,
+            input,
+            64,
+        )?;
+        assert_eq!(nulls_of(&batches)?, vec![true, true, true]);
+        Ok(())
     }
 
     #[test]

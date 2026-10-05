@@ -143,27 +143,7 @@ impl<'a> IcebergPlanBuilder<'a> {
         &self,
         input: Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let repartitioning = if self.table_config.partition_columns.is_empty() {
-            Partitioning::RoundRobinBatch(4)
-        } else {
-            let schema = input.schema();
-            let partition_source_columns = self.partition_source_columns()?;
-            let exprs: Vec<Arc<dyn PhysicalExpr>> = partition_source_columns
-                .iter()
-                .map(|name| {
-                    let idx = schema.index_of(name).map_err(|_| {
-                        datafusion::common::DataFusionError::Plan(format!(
-                            "Partition column '{}' not found in schema",
-                            name
-                        ))
-                    })?;
-                    Ok(Arc::new(Column::new(name, idx)) as Arc<dyn PhysicalExpr>)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Partitioning::Hash(exprs, 4)
-        };
-
-        Ok(Arc::new(RepartitionExec::try_new(input, repartitioning)?))
+        repartition_for_write(input, &self.partition_source_columns()?)
     }
 
     fn partition_source_columns(&self) -> Result<Vec<String>> {
@@ -241,4 +221,34 @@ impl<'a> IcebergPlanBuilder<'a> {
             .with_dynamic_partition_overwrite(self.dynamic_partition_overwrite),
         ))
     }
+}
+
+/// Repartition write input the way all Iceberg write paths do: round-robin
+/// for unpartitioned tables, hash on the (deduped) partition source columns
+/// otherwise, so each writer task owns a stable slice of partitions.
+pub(crate) fn repartition_for_write(
+    input: Arc<dyn ExecutionPlan>,
+    partition_source_columns: &[String],
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let repartitioning = if partition_source_columns.is_empty() {
+        Partitioning::RoundRobinBatch(4)
+    } else {
+        let schema = input.schema();
+        let mut seen = std::collections::HashSet::new();
+        let exprs: Vec<Arc<dyn PhysicalExpr>> = partition_source_columns
+            .iter()
+            .filter(|name| seen.insert((*name).clone()))
+            .map(|name| {
+                let idx = schema.index_of(name).map_err(|_| {
+                    datafusion::common::DataFusionError::Plan(format!(
+                        "Partition column '{name}' not found in schema",
+                    ))
+                })?;
+                Ok(Arc::new(Column::new(name, idx)) as Arc<dyn PhysicalExpr>)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Partitioning::Hash(exprs, 4)
+    };
+
+    Ok(Arc::new(RepartitionExec::try_new(input, repartitioning)?))
 }
