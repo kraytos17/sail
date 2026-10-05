@@ -404,6 +404,14 @@ pub fn iceberg_primitive_to_arrow(primitive: &PrimitiveType) -> Result<ArrowData
     Ok(arrow_type)
 }
 
+/// Check if a timezone string is a UTC alias (UTC, +00:00, Etc/UTC, Z, etc.).
+fn is_utc_timezone(tz: &str) -> bool {
+    matches!(
+        tz.trim(),
+        "UTC" | "+00:00" | "Etc/UTC" | "Z" | "GMT" | "Etc/GMT"
+    )
+}
+
 /// Convert Arrow data type to Iceberg primitive type
 pub fn arrow_primitive_to_iceberg(arrow_type: &ArrowDataType) -> Result<PrimitiveType> {
     let primitive_type = match arrow_type {
@@ -432,21 +440,21 @@ pub fn arrow_primitive_to_iceberg(arrow_type: &ArrowDataType) -> Result<Primitiv
         | ArrowDataType::Time64(TimeUnit::Microsecond) => PrimitiveType::Time,
         ArrowDataType::Timestamp(TimeUnit::Microsecond, None) => PrimitiveType::Timestamp,
         ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(tz)) => {
-            if tz.as_ref() == "UTC" || tz.as_ref() == "+00:00" {
+            if is_utc_timezone(tz.as_ref()) {
                 PrimitiveType::Timestamptz
             } else {
                 return plan_err!(
-                    "Unsupported timezone for Iceberg Timestamptz conversion: {tz}. Timezone must be UTC or +00:00"
+                    "Unsupported timezone for Iceberg Timestamptz conversion: {tz}. Timezone must be UTC, +00:00, Etc/UTC, Z, or GMT"
                 );
             }
         }
         ArrowDataType::Timestamp(TimeUnit::Nanosecond, None) => PrimitiveType::TimestampNs,
         ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(tz)) => {
-            if tz.as_ref() == "UTC" || tz.as_ref() == "+00:00" {
+            if is_utc_timezone(tz.as_ref()) {
                 PrimitiveType::TimestamptzNs
             } else {
                 return plan_err!(
-                    "Unsupported timezone for Iceberg TimestamptzNs conversion: {tz}. Timezone must be UTC or +00:00"
+                    "Unsupported timezone for Iceberg TimestamptzNs conversion: {tz}. Timezone must be UTC, +00:00, Etc/UTC, Z, or GMT"
                 );
             }
         }
@@ -616,6 +624,22 @@ mod tests {
                 PrimitiveType::Timestamptz,
             ),
             (
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("Etc/UTC".into())),
+                PrimitiveType::Timestamptz,
+            ),
+            (
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("Z".into())),
+                PrimitiveType::Timestamptz,
+            ),
+            (
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("GMT".into())),
+                PrimitiveType::Timestamptz,
+            ),
+            (
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("Etc/GMT".into())),
+                PrimitiveType::Timestamptz,
+            ),
+            (
                 ArrowDataType::Timestamp(TimeUnit::Nanosecond, None),
                 PrimitiveType::TimestampNs,
             ),
@@ -627,6 +651,14 @@ mod tests {
                 ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
                 PrimitiveType::TimestamptzNs,
             ),
+            (
+                ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some("Etc/UTC".into())),
+                PrimitiveType::TimestamptzNs,
+            ),
+            (
+                ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some("Z".into())),
+                PrimitiveType::TimestamptzNs,
+            ),
             (ArrowDataType::FixedSizeBinary(16), PrimitiveType::Fixed(16)),
             (ArrowDataType::FixedSizeBinary(10), PrimitiveType::Fixed(10)),
         ];
@@ -635,6 +667,37 @@ mod tests {
             let result = arrow_primitive_to_iceberg(&arrow_type)
                 .expect("Failed to convert arrow type to iceberg");
             assert_eq!(result, expected_iceberg_type);
+        }
+    }
+
+    #[test]
+    fn test_timestamptz_timezone_aliases_are_accepted_and_others_rejected() {
+        // UTC aliases (including `Etc/UTC`) map to Timestamptz/TimestamptzNs.
+        for alias in ["UTC", "+00:00", "Etc/UTC", "Z", "GMT", "Etc/GMT", " UTC "] {
+            let micro = ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(alias.into()));
+            assert_eq!(
+                arrow_primitive_to_iceberg(&micro).expect("microsecond alias should convert"),
+                PrimitiveType::Timestamptz,
+                "alias {alias:?} should map to Timestamptz"
+            );
+            let nano = ArrowDataType::Timestamp(TimeUnit::Nanosecond, Some(alias.into()));
+            assert_eq!(
+                arrow_primitive_to_iceberg(&nano).expect("nanosecond alias should convert"),
+                PrimitiveType::TimestamptzNs,
+                "alias {alias:?} should map to TimestamptzNs"
+            );
+        }
+
+        // Non-UTC timezones stay rejected with the widened error message.
+        for tz in ["America/New_York", "Europe/London"] {
+            let arrow_type = ArrowDataType::Timestamp(TimeUnit::Microsecond, Some(tz.into()));
+            let error = arrow_primitive_to_iceberg(&arrow_type)
+                .expect_err("non-UTC timezone should be rejected")
+                .to_string();
+            assert!(
+                error.contains("Etc/UTC"),
+                "error message should advertise the widened aliases: {error}"
+            );
         }
     }
 
