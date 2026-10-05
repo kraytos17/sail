@@ -73,6 +73,10 @@ pub enum CatalogCommand {
         database: Vec<String>,
         pattern: String,
     },
+    ShowTblProperties {
+        table: Vec<String>,
+        property_key: Option<String>,
+    },
     ShowFunctions {
         database: Vec<String>,
         pattern: Option<String>,
@@ -151,6 +155,7 @@ pub enum CatalogCommand {
     DescribeTable {
         table: Vec<String>,
         extended: bool,
+        column: Option<String>,
     },
     DescribeDatabase {
         database: Vec<String>,
@@ -182,6 +187,7 @@ impl CatalogCommand {
             CatalogCommand::GetTable { .. } => "GetTable",
             CatalogCommand::ShowTables { .. } => "ShowTables",
             CatalogCommand::ShowTableExtended { .. } => "ShowTableExtended",
+            CatalogCommand::ShowTblProperties { .. } => "ShowTblProperties",
             CatalogCommand::ShowFunctions { .. } => "ShowFunctions",
             CatalogCommand::ListTables { .. } => "ListTables",
             CatalogCommand::ListViews { .. } => "ListViews",
@@ -220,6 +226,9 @@ impl CatalogCommand {
             }
             CatalogCommand::ShowTableExtended { .. } => {
                 ArrowSerializer::default().schema::<ShowTableExtendedRow>()?
+            }
+            CatalogCommand::ShowTblProperties { .. } => {
+                ArrowSerializer::default().schema::<ShowTblPropertiesRow>()?
             }
             CatalogCommand::ShowFunctions { .. } => {
                 ArrowSerializer::default().schema::<ShowFunctionsRow>()?
@@ -400,6 +409,42 @@ impl CatalogCommand {
                     .collect::<CatalogResult<Vec<_>>>()?;
                 ArrowSerializer::default().build_record_batch(&rows)?
             }
+            CatalogCommand::ShowTblProperties {
+                table,
+                property_key,
+            } => {
+                let status = manager.get_table_or_view(&table).await?;
+                let properties = match &status.kind {
+                    sail_common_datafusion::catalog::TableKind::Table { properties, .. } => {
+                        properties
+                    }
+                    _ => {
+                        return Err(CatalogError::NotSupported(
+                            "SHOW TBLPROPERTIES is not supported for views".to_string(),
+                        ));
+                    }
+                };
+                let mut rows: Vec<ShowTblPropertiesRow> = match property_key {
+                    Some(key) => properties
+                        .iter()
+                        .find(|(k, _)| k == &key)
+                        .map(|(k, v)| ShowTblPropertiesRow {
+                            key: k.clone(),
+                            value: v.clone(),
+                        })
+                        .into_iter()
+                        .collect(),
+                    None => properties
+                        .iter()
+                        .map(|(k, v)| ShowTblPropertiesRow {
+                            key: k.clone(),
+                            value: v.clone(),
+                        })
+                        .collect(),
+                };
+                rows.sort_by(|a, b| a.key.cmp(&b.key));
+                ArrowSerializer::default().build_record_batch(&rows)?
+            }
             CatalogCommand::ShowFunctions {
                 database,
                 pattern,
@@ -522,14 +567,25 @@ impl CatalogCommand {
                 let rows = manager.get_table_or_view(&table).await?.kind.columns();
                 display.table_columns().to_record_batch(rows)?
             }
-            CatalogCommand::DescribeTable { table, extended } => {
+            CatalogCommand::DescribeTable {
+                table,
+                extended,
+                column,
+            } => {
                 let table_status = manager.get_table_or_view(&table).await?;
                 let formatter = service.plan_formatter();
                 let serializer = ArrowSerializer::default();
 
                 let mut rows: Vec<DescribeTableRow> = Vec::new();
 
-                for col in &table_status.kind.columns() {
+                if let Some(column_name) = column {
+                    let columns = table_status.kind.columns();
+                    let col = columns
+                        .iter()
+                        .find(|col| col.name == column_name)
+                        .ok_or_else(|| {
+                            CatalogError::NotFound(CatalogObject::Column, column_name)
+                        })?;
                     rows.push(DescribeTableRow {
                         col_name: col.name.clone(),
                         data_type: formatter
@@ -537,49 +593,59 @@ impl CatalogCommand {
                             .unwrap_or_else(|_| "invalid".to_string()),
                         comment: col.comment.clone(),
                     });
-                }
-
-                if extended {
-                    let partition_cols = table_status.kind.partition_columns();
-                    if !partition_cols.is_empty() {
+                } else {
+                    for col in &table_status.kind.columns() {
                         rows.push(DescribeTableRow {
-                            col_name: "# Partition Information".to_string(),
+                            col_name: col.name.clone(),
+                            data_type: formatter
+                                .data_type_to_simple_string(&col.data_type)
+                                .unwrap_or_else(|_| "invalid".to_string()),
+                            comment: col.comment.clone(),
+                        });
+                    }
+
+                    if extended {
+                        let partition_cols = table_status.kind.partition_columns();
+                        if !partition_cols.is_empty() {
+                            rows.push(DescribeTableRow {
+                                col_name: "# Partition Information".to_string(),
+                                data_type: String::new(),
+                                comment: None,
+                            });
+                            rows.push(DescribeTableRow {
+                                col_name: "# col_name".to_string(),
+                                data_type: "data_type".to_string(),
+                                comment: Some("comment".to_string()),
+                            });
+                            for col in &partition_cols {
+                                rows.push(DescribeTableRow {
+                                    col_name: col.name.clone(),
+                                    data_type: formatter
+                                        .data_type_to_simple_string(&col.data_type)
+                                        .unwrap_or_else(|_| "invalid".to_string()),
+                                    comment: col.comment.clone(),
+                                });
+                            }
+                        }
+
+                        rows.push(DescribeTableRow {
+                            col_name: String::new(),
                             data_type: String::new(),
                             comment: None,
                         });
                         rows.push(DescribeTableRow {
-                            col_name: "# col_name".to_string(),
-                            data_type: "data_type".to_string(),
-                            comment: Some("comment".to_string()),
-                        });
-                        for col in &partition_cols {
-                            rows.push(DescribeTableRow {
-                                col_name: col.name.clone(),
-                                data_type: formatter
-                                    .data_type_to_simple_string(&col.data_type)
-                                    .unwrap_or_else(|_| "invalid".to_string()),
-                                comment: col.comment.clone(),
-                            });
-                        }
-                    }
-
-                    rows.push(DescribeTableRow {
-                        col_name: String::new(),
-                        data_type: String::new(),
-                        comment: None,
-                    });
-                    rows.push(DescribeTableRow {
-                        col_name: "# Detailed Table Information".to_string(),
-                        data_type: String::new(),
-                        comment: None,
-                    });
-
-                    for (key, value) in table_status.describe_extended_metadata() {
-                        rows.push(DescribeTableRow {
-                            col_name: key,
-                            data_type: value,
+                            col_name: "# Detailed Table Information".to_string(),
+                            data_type: String::new(),
                             comment: None,
                         });
+
+                        for (key, value) in table_status.describe_extended_metadata() {
+                            rows.push(DescribeTableRow {
+                                col_name: key,
+                                data_type: value,
+                                comment: None,
+                            });
+                        }
                     }
                 }
 
@@ -1042,6 +1108,12 @@ struct DescribeTableRow {
 }
 
 #[derive(Serialize, Deserialize)]
+struct ShowTblPropertiesRow {
+    key: String,
+    value: String,
+}
+
+#[derive(Serialize, Deserialize)]
 struct DescribeDatabaseRow {
     info_name: String,
     info_value: String,
@@ -1363,31 +1435,42 @@ mod tests {
     }
 
     fn test_manager(alter_error: Option<&str>) -> CatalogManager {
-        test_manager_with_catalog_behavior(alter_error, true, false)
+        test_manager_with_catalog_behavior(alter_error, true, false, false)
     }
 
     fn test_manager_with_catalog_behavior(
         alter_error: Option<&str>,
         table_exists: bool,
         view_lookup_supported: bool,
+        as_view: bool,
     ) -> CatalogManager {
-        let table_status = TableStatus {
-            catalog: Some("test".to_string()),
-            database: vec!["default".to_string()],
-            name: "items".to_string(),
-            kind: TableKind::Table {
-                columns: vec![TableColumnStatus {
-                    name: "id".to_string(),
-                    data_type: datafusion::arrow::datatypes::DataType::Int32,
-                    nullable: false,
-                    comment: None,
-                    default: None,
-                    generated_always_as: None,
-                    identity: None,
-                    is_partition: false,
-                    is_bucket: false,
-                    is_cluster: false,
-                }],
+        let columns = vec![TableColumnStatus {
+            name: "id".to_string(),
+            data_type: datafusion::arrow::datatypes::DataType::Int32,
+            nullable: false,
+            comment: None,
+            default: None,
+            generated_always_as: None,
+            identity: None,
+            is_partition: false,
+            is_bucket: false,
+            is_cluster: false,
+        }];
+        // Intentionally unsorted: `SHOW TBLPROPERTIES` must return sorted rows.
+        let properties = vec![
+            ("provider".to_string(), "sail".to_string()),
+            ("owner".to_string(), "alice".to_string()),
+        ];
+        let kind = if as_view {
+            TableKind::View {
+                definition: "SELECT 1".to_string(),
+                columns,
+                comment: None,
+                properties,
+            }
+        } else {
+            TableKind::Table {
+                columns,
                 comment: None,
                 constraints: vec![],
                 location: Some("s3://bucket/items".to_string()),
@@ -1395,9 +1478,15 @@ mod tests {
                 partition_by: vec![],
                 sort_by: vec![],
                 bucket_by: None,
-                properties: vec![],
+                properties,
                 is_external: true,
-            },
+            }
+        };
+        let table_status = TableStatus {
+            catalog: Some("test".to_string()),
+            database: vec!["default".to_string()],
+            name: "items".to_string(),
+            kind,
         };
         let manager = CatalogManager::try_new(crate::manager::CatalogManagerOptions {
             catalogs: std::iter::once((
@@ -1431,7 +1520,7 @@ mod tests {
 
     #[tokio::test]
     async fn table_or_view_lookup_treats_unsupported_persistent_views_as_missing() {
-        let manager = test_manager_with_catalog_behavior(None, false, false);
+        let manager = test_manager_with_catalog_behavior(None, false, false, false);
 
         let result = manager.get_table_or_view(&["missing"]).await;
         assert!(
@@ -1489,6 +1578,135 @@ mod tests {
 
         assert!(
             matches!(error, CatalogError::External(message) if message.contains("catalog sync failed"))
+        );
+    }
+
+    fn string_column(batch: &datafusion::arrow::array::RecordBatch, index: usize) -> Vec<String> {
+        use datafusion::arrow::array::Array;
+        let column = batch.column(index);
+        if let Some(column) = column
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+        {
+            return (0..batch.num_rows())
+                .map(|i| column.value(i).to_string())
+                .collect();
+        }
+        let Some(column) = column
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::LargeStringArray>()
+        else {
+            unreachable!("expected Utf8 column at index {index}");
+        };
+        (0..batch.num_rows())
+            .map(|i| column.value(i).to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn show_tbl_properties_returns_sorted_rows() -> CatalogResult<()> {
+        let ctx = test_session_context();
+        let manager = test_manager(None);
+        let batch = CatalogCommand::ShowTblProperties {
+            table: vec!["items".to_string()],
+            property_key: None,
+        }
+        .execute(&ctx, &manager)
+        .await?;
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(string_column(&batch, 0), vec!["owner", "provider"]);
+        assert_eq!(string_column(&batch, 1), vec!["alice", "sail"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn show_tbl_properties_filters_by_key() -> CatalogResult<()> {
+        let ctx = test_session_context();
+        let manager = test_manager(None);
+        let batch = CatalogCommand::ShowTblProperties {
+            table: vec!["items".to_string()],
+            property_key: Some("owner".to_string()),
+        }
+        .execute(&ctx, &manager)
+        .await?;
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(string_column(&batch, 0), vec!["owner"]);
+        assert_eq!(string_column(&batch, 1), vec!["alice"]);
+
+        let batch = CatalogCommand::ShowTblProperties {
+            table: vec!["items".to_string()],
+            property_key: Some("missing".to_string()),
+        }
+        .execute(&ctx, &manager)
+        .await?;
+        assert_eq!(batch.num_rows(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn show_tbl_properties_rejects_views() {
+        let ctx = test_session_context();
+        let manager = test_manager_with_catalog_behavior(None, true, false, true);
+        let result = CatalogCommand::ShowTblProperties {
+            table: vec!["items".to_string()],
+            property_key: None,
+        }
+        .execute(&ctx, &manager)
+        .await;
+        assert!(
+            result.is_err(),
+            "expected view rejection, got success: {result:?}"
+        );
+        let Err(error) = result else {
+            unreachable!();
+        };
+        assert!(
+            matches!(error, CatalogError::NotSupported(ref message) if message.contains("views")),
+            "unexpected view error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_table_column_returns_single_row() -> CatalogResult<()> {
+        let ctx = test_session_context();
+        let manager = test_manager(None);
+        let batch = CatalogCommand::DescribeTable {
+            table: vec!["items".to_string()],
+            extended: false,
+            column: Some("id".to_string()),
+        }
+        .execute(&ctx, &manager)
+        .await?;
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(string_column(&batch, 0), vec!["id"]);
+        assert_eq!(string_column(&batch, 1), vec!["int"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn describe_table_missing_column_errors() {
+        let ctx = test_session_context();
+        let manager = test_manager(None);
+        let result = CatalogCommand::DescribeTable {
+            table: vec!["items".to_string()],
+            extended: false,
+            column: Some("missing".to_string()),
+        }
+        .execute(&ctx, &manager)
+        .await;
+        assert!(
+            result.is_err(),
+            "expected missing-column error, got success: {result:?}"
+        );
+        let Err(error) = result else {
+            unreachable!();
+        };
+        assert!(
+            matches!(
+                error,
+                CatalogError::NotFound(CatalogObject::Column, ref name) if name == "missing"
+            ),
+            "unexpected missing-column error: {error:?}"
         );
     }
 }

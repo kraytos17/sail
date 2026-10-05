@@ -129,7 +129,7 @@ pub fn parse_time(s: &str) -> SqlResult<TimeValue> {
 #[cfg(test)]
 mod tests {
     use sail_sql_parser::ast::query::Query;
-    use sail_sql_parser::ast::statement::Statement;
+    use sail_sql_parser::ast::statement::{DescribeItem, Statement};
     use sail_sql_parser::tree::TreeText;
 
     use crate::error::SqlResult;
@@ -145,6 +145,51 @@ mod tests {
                 Statement::Query(Query { .. }),
                 Statement::Query(Query { .. }),
             ]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_show_tblproperties() -> SqlResult<()> {
+        let tree = parse_one_statement("SHOW TBLPROPERTIES t")?;
+        assert!(matches!(
+            tree,
+            Statement::ShowTblProperties {
+                property_key: None,
+                ..
+            }
+        ));
+        let tree = parse_one_statement("SHOW TBLPROPERTIES t ('k')")?;
+        assert!(matches!(
+            tree,
+            Statement::ShowTblProperties {
+                property_key: Some(_),
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_describe_view_and_column() -> SqlResult<()> {
+        let tree = parse_one_statement("DESCRIBE VIEW v")?;
+        assert!(matches!(
+            tree,
+            Statement::Describe {
+                item: DescribeItem::View { .. },
+                ..
+            }
+        ));
+        let tree = parse_one_statement("DESCRIBE TABLE t c")?;
+        assert!(matches!(
+            tree,
+            Statement::Describe {
+                item: DescribeItem::Table {
+                    column: Some(_),
+                    ..
+                },
+                ..
+            }
         ));
         Ok(())
     }
@@ -166,6 +211,22 @@ mod tests {
         assert_eq!(
             parse_one_statement("SELECT U&\"a#2014b#+002014c\"   UESCAPE '#'")?.text(),
             "SELECT U&\"a#2014b#+002014c\" UESCAPE '#' "
+        );
+        assert_eq!(
+            parse_one_statement("SHOW TBLPROPERTIES t")?.text(),
+            "SHOW TBLPROPERTIES t "
+        );
+        assert_eq!(
+            parse_one_statement("SHOW TBLPROPERTIES t ('k')")?.text(),
+            "SHOW TBLPROPERTIES t ( 'k' ) "
+        );
+        assert_eq!(
+            parse_one_statement("DESCRIBE VIEW v")?.text(),
+            "DESCRIBE VIEW v "
+        );
+        assert_eq!(
+            parse_one_statement("DESCRIBE TABLE t c")?.text(),
+            "DESCRIBE TABLE t c "
         );
         Ok(())
     }

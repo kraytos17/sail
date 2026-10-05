@@ -157,6 +157,12 @@ pub enum Statement {
         table: (Either<From, In>, ObjectName),
         database: Option<(Either<From, In>, ObjectName)>,
     },
+    ShowTblProperties {
+        show: Show,
+        tblproperties: Tblproperties,
+        table: ObjectName,
+        property_key: Option<(LeftParenthesis, StringLiteral, RightParenthesis)>,
+    },
     CreateView {
         create: Create,
         or_replace: Option<(Or, Replace)>,
@@ -1108,6 +1114,11 @@ pub enum DescribeItem {
         #[parser(function = |(_, e), o| compose(e, o))]
         partition: Option<PartitionClause>,
         column: Option<ObjectName>,
+    },
+    View {
+        view: View,
+        extended: Option<Extended>,
+        name: ObjectName,
     },
     // We try `DESCRIBE QUERY` last since the `QUERY` keyword is optional.
     Query {
