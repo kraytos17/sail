@@ -1147,15 +1147,43 @@ impl CatalogProvider for IcebergRestCatalogProvider {
 
         let catalog_config = self.resolved_catalog_config().await?;
 
-        if mode.ignore_if_exists()
-            && let Ok(existing) = self.get_table(database, table).await
-        {
-            return Ok(existing);
-        }
+        // Resolve the existing table once: the same lookup drives `IF NOT EXISTS`
+        // short-circuiting and the `CREATE OR REPLACE` / `REPLACE` decision below.
+        let existing = match self.get_table(database, table).await {
+            Ok(status) => Some(status),
+            Err(CatalogError::NotFound(CatalogObject::Table, _)) => None,
+            Err(e) => return Err(e),
+        };
 
-        if mode.is_replace() {
-            return Err(CatalogError::NotSupported(
-                "Replace table is not supported yet".to_string(),
+        if let Some(existing) = existing {
+            if mode.ignore_if_exists() {
+                return Ok(existing);
+            }
+            // `CREATE OR REPLACE` / `REPLACE` must remove the existing catalog
+            // registration (metadata and data, purged) before recreating it, matching
+            // Spark semantics and the in-repo `MemoryCatalogProvider`.
+            if mode.is_replace() {
+                self.drop_table(
+                    database,
+                    table,
+                    DropTableOptions {
+                        if_exists: true,
+                        purge: true,
+                    },
+                )
+                .await?;
+            } else {
+                return Err(CatalogError::AlreadyExists(
+                    CatalogObject::Table,
+                    table.to_string(),
+                ));
+            }
+        } else if mode.replace_requires_existing() {
+            // Plain `REPLACE` requires an existing table; `CREATE OR REPLACE` on a
+            // missing table simply creates it.
+            return Err(CatalogError::NotFound(
+                CatalogObject::Table,
+                table.to_string(),
             ));
         }
 
@@ -2156,6 +2184,20 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path(path_str))
                 .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn mock_get_404(&self, path_str: &str, error_type: &str, message: &str) {
+            Mock::given(method("GET"))
+                .and(path(path_str))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "error": {
+                        "message": message,
+                        "type": error_type,
+                        "code": 404
+                    }
+                })))
                 .mount(&self.server)
                 .await;
         }
@@ -3580,6 +3622,110 @@ mod tests {
 
         let mut options = simple_create_table_options();
         options.is_write_precondition = false;
+        let status = ctx
+            .catalog
+            .create_table(&namespace, "table1", options)
+            .await
+            .unwrap();
+
+        assert_eq!(status.name, "table1");
+    }
+
+    #[tokio::test]
+    async fn create_or_replace_existing_table_drops_then_recreates() {
+        let ctx = TestContext::new(Some("test")).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        // The existing table is loaded, then purged, then recreated.
+        ctx.mock_get_json(
+            &ctx.path("/namespaces/db1/tables/table1"),
+            create_table_response_with_access_session_hints(),
+        )
+        .await;
+        Mock::given(method("DELETE"))
+            .and(path(ctx.path("/namespaces/db1/tables/table1")))
+            .and(query_param("purgeRequested", "true"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&ctx.server)
+            .await;
+        ctx.mock_post_json(
+            &ctx.path("/namespaces/db1/tables"),
+            create_table_response_with_access_session_hints(),
+        )
+        .await;
+
+        let mut options = simple_create_table_options();
+        options.mode = spec::CreateTableMode::CreateOrReplace;
+        let status = ctx
+            .catalog
+            .create_table(&namespace, "table1", options)
+            .await
+            .unwrap();
+
+        assert_eq!(status.name, "table1");
+    }
+
+    #[tokio::test]
+    async fn replace_missing_table_errors_without_creating() {
+        let ctx = TestContext::new(Some("test")).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        // The table does not exist. `REPLACE` must fail and must not create it.
+        ctx.mock_get_404(
+            &ctx.path("/namespaces/db1/tables/table1"),
+            "NoSuchTableException",
+            "table does not exist",
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path(ctx.path("/namespaces/db1/tables")))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&ctx.server)
+            .await;
+
+        let mut options = simple_create_table_options();
+        options.mode = spec::CreateTableMode::Replace;
+        let err = ctx
+            .catalog
+            .create_table(&namespace, "table1", options)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CatalogError::NotFound(CatalogObject::Table, _)
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_or_replace_missing_table_creates_without_dropping() {
+        let ctx = TestContext::new(Some("test")).await;
+        let namespace = Namespace::try_from(vec!["db1".to_string()]).unwrap();
+
+        // The table does not exist. `CREATE OR REPLACE` must create it and must
+        // not attempt a drop.
+        ctx.mock_get_404(
+            &ctx.path("/namespaces/db1/tables/table1"),
+            "NoSuchTableException",
+            "table does not exist",
+        )
+        .await;
+        ctx.mock_post_json(
+            &ctx.path("/namespaces/db1/tables"),
+            create_table_response_with_access_session_hints(),
+        )
+        .await;
+        Mock::given(method("DELETE"))
+            .and(path(ctx.path("/namespaces/db1/tables/table1")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&ctx.server)
+            .await;
+
+        let mut options = simple_create_table_options();
+        options.mode = spec::CreateTableMode::CreateOrReplace;
         let status = ctx
             .catalog
             .create_table(&namespace, "table1", options)
