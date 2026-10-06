@@ -1,6 +1,7 @@
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use sail_common_datafusion::array::serde::ArrowSerializer;
+use sail_common_datafusion::catalog::lakehouse::CommitAuthority;
 use sail_common_datafusion::catalog::{FunctionStatus, LakehouseOperation};
 use sail_common_datafusion::datasource::{DataSourceRegistry, is_lakehouse_format};
 use sail_common_datafusion::extension::SessionExtensionAccessor;
@@ -536,7 +537,6 @@ impl CatalogCommand {
                         ))
                     })?;
                     let runtime = ctx.runtime_env();
-                    let storage_operation = lake_source_alter_operation(&options);
                     let lakehouse_table = manager
                         .resolve_lakehouse_table_status(
                             &table,
@@ -545,6 +545,22 @@ impl CatalogCommand {
                         )
                         .await?
                         .execution;
+
+                    // Catalog-authority Iceberg (Iceberg REST) treats the catalog as the single
+                    // source of truth for ALTER TABLE: delegate to the catalog provider, which
+                    // issues the commit (rename / set+unset properties / add / drop columns) via
+                    // the REST `update_table`/`rename_table` endpoints. The storage-first +
+                    // catalog-sync flow below would otherwise re-apply the operation on storage
+                    // and fail, since `IcebergLakeSource::alter_table` rejects non-filesystem
+                    // commit authorities.
+                    if format.eq_ignore_ascii_case("iceberg")
+                        && lakehouse_table.commit == CommitAuthority::IcebergRestCommit
+                    {
+                        manager.alter_table(&table, options).await?;
+                        return Ok(display.bools().to_record_batch(vec![true])?);
+                    }
+
+                    let storage_operation = lake_source_alter_operation(&options)?;
                     lake_source
                         .alter_table(runtime, &location, storage_operation, Some(lakehouse_table))
                         .await
@@ -1043,40 +1059,47 @@ impl CreateTableColumnView for sail_common_datafusion::catalog::TableColumnStatu
     }
 }
 
-fn lake_source_alter_operation(options: &AlterTableOptions) -> LakeSourceAlterTableOperation {
+fn lake_source_alter_operation(
+    options: &AlterTableOptions,
+) -> CatalogResult<LakeSourceAlterTableOperation> {
     match options {
+        AlterTableOptions::RenameTable { .. }
+        | AlterTableOptions::AddColumns { .. }
+        | AlterTableOptions::DropColumns { .. } => Err(CatalogError::NotSupported(format!(
+            "ALTER TABLE operation is not supported at the storage layer: {options:?}"
+        ))),
         AlterTableOptions::SetTableProperties { properties } => {
-            LakeSourceAlterTableOperation::SetTableProperties {
+            Ok(LakeSourceAlterTableOperation::SetTableProperties {
                 changes: properties
                     .iter()
                     .map(|(key, value)| (key.clone(), Some(value.clone())))
                     .collect(),
                 if_exists: false,
-            }
+            })
         }
         AlterTableOptions::UnsetTableProperties { keys, if_exists } => {
-            LakeSourceAlterTableOperation::SetTableProperties {
+            Ok(LakeSourceAlterTableOperation::SetTableProperties {
                 changes: keys.iter().map(|key| (key.clone(), None)).collect(),
                 if_exists: *if_exists,
-            }
+            })
         }
         AlterTableOptions::AlterColumnType { name, data_type } => {
-            LakeSourceAlterTableOperation::AlterColumnType {
+            Ok(LakeSourceAlterTableOperation::AlterColumnType {
                 column_path: name.clone(),
                 data_type: data_type.clone(),
-            }
+            })
         }
         AlterTableOptions::AlterColumnDefault { name, default } => {
-            LakeSourceAlterTableOperation::AlterColumnDefault {
+            Ok(LakeSourceAlterTableOperation::AlterColumnDefault {
                 column_path: name.clone(),
                 default: default.clone(),
-            }
+            })
         }
         AlterTableOptions::AddCheckConstraint { name, expression } => {
-            LakeSourceAlterTableOperation::AddCheckConstraint {
+            Ok(LakeSourceAlterTableOperation::AddCheckConstraint {
                 name: name.clone(),
                 expression: expression.clone(),
-            }
+            })
         }
     }
 }

@@ -344,6 +344,17 @@ impl CatalogProvider for MemoryCatalogProvider {
         let mut db = self.databases.get_mut(database).ok_or_else(|| {
             CatalogError::NotFound(CatalogObject::Database, quote_namespace_if_needed(database))
         })?;
+        if let AlterTableOptions::RenameTable { new_name } = &options {
+            let new_table_name = new_name.last().cloned().ok_or_else(|| {
+                CatalogError::InvalidArgument("RENAME TO requires a valid table name".to_string())
+            })?;
+            let status = db
+                .tables
+                .remove(table)
+                .ok_or_else(|| CatalogError::NotFound(CatalogObject::Table, table.to_string()))?;
+            db.tables.insert(new_table_name, status);
+            return Ok(());
+        }
         let status = db
             .tables
             .get_mut(table)
@@ -354,6 +365,9 @@ impl CatalogProvider for MemoryCatalogProvider {
                 properties,
                 ..
             } => match options {
+                AlterTableOptions::RenameTable { .. } => {
+                    unreachable!("RENAME TABLE is handled above")
+                }
                 AlterTableOptions::SetTableProperties {
                     properties: new_props,
                 } => {
@@ -398,6 +412,12 @@ impl CatalogProvider for MemoryCatalogProvider {
                         ))
                     })
                 }
+                AlterTableOptions::AddColumns { .. } => Err(CatalogError::NotSupported(
+                    "ADD COLUMNS is not supported for memory tables".to_string(),
+                )),
+                AlterTableOptions::DropColumns { .. } => Err(CatalogError::NotSupported(
+                    "DROP COLUMNS is not supported for memory tables".to_string(),
+                )),
                 AlterTableOptions::AddCheckConstraint { .. } => Err(CatalogError::NotSupported(
                     "CHECK constraints are handled by lake sources".to_string(),
                 )),
