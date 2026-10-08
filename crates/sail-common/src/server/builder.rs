@@ -28,7 +28,10 @@ impl Default for ServerBuilderOptions {
             nodelay: true,
             keepalive: Some(std::time::Duration::from_mins(1)),
             http2_keepalive_interval: Some(std::time::Duration::from_mins(1)),
-            http2_keepalive_timeout: Some(std::time::Duration::from_secs(10)),
+            // Time to wait for a keepalive ACK from the client before closing the connection.
+            // A client busy processing data can take longer than the default 10 seconds to
+            // respond, so wait much longer to avoid killing long-running queries mid-stream.
+            http2_keepalive_timeout: Some(std::time::Duration::from_secs(60)),
             http2_adaptive_window: Some(true),
         }
     }
@@ -123,5 +126,23 @@ impl<'b> ServerBuilder<'b> {
             .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::ServerBuilderOptions;
+
+    #[test]
+    fn default_keepalive_timeout_tolerates_busy_clients() {
+        // A busy client can be slow to ACK a keepalive ping. The server must not close
+        // the connection while a long-running query is still streaming.
+        let options = ServerBuilderOptions::default();
+        assert_eq!(
+            options.http2_keepalive_timeout,
+            Some(Duration::from_secs(60))
+        );
     }
 }

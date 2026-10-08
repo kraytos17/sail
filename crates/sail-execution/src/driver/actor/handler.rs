@@ -321,9 +321,28 @@ impl DriverActor {
                     .options
                     .worker_launch_timeout
                     .min(self.options.task_launch_timeout);
+                debug!(
+                    "task {} is still pending assignment after {:?}; \
+                     {}; re-probing in {:?}",
+                    TaskKeyDisplay(&key),
+                    self.options.task_launch_timeout,
+                    self.worker_scaler.summary(),
+                    delay,
+                );
                 ctx.send_with_delay(DriverMessage::ProbePendingTask { key }, delay);
             } else {
                 let message = "task scheduling timeout".to_string();
+                warn!(
+                    "task {} was never assigned within {:?}: {}; \
+                     {} active worker(s), {} vacant task slot(s), {} region(s) queued. \
+                     The task will fail with `{message}`",
+                    TaskKeyDisplay(&key),
+                    self.options.task_launch_timeout,
+                    self.worker_scaler.summary(),
+                    self.task_assigner.active_worker_ids().len(),
+                    self.task_assigner.count_vacant_worker_slots(),
+                    self.task_assigner.count_queued_regions(),
+                );
                 let cause = CommonErrorCause::Execution(message.clone());
                 ctx.send(DriverMessage::UpdateTask {
                     key,
@@ -669,6 +688,24 @@ impl DriverActor {
             for key in &keys {
                 self.job_scheduler
                     .update_task(key, TaskState::Scheduled, None, None);
+            }
+            match worker_id {
+                Some(worker_id) => info!(
+                    "dispatching {} task(s) for job {job_id} stage {stage} to worker {worker_id}: {}",
+                    keys.len(),
+                    keys.iter()
+                        .map(|key| TaskKeyDisplay(key).to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+                None => info!(
+                    "dispatching {} task(s) for job {job_id} stage {stage} to driver: {}",
+                    keys.len(),
+                    keys.iter()
+                        .map(|key| TaskKeyDisplay(key).to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
             }
             let tasks = keys
                 .into_iter()

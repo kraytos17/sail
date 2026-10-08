@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use sail_common::telemetry::{TracingClientLayer, TracingClientService};
 use tokio::sync::{OnceCell, oneshot};
@@ -96,6 +97,13 @@ pub trait ClientBuilder: Sized {
 /// dropped silently.
 pub(crate) const CLIENT_MAX_HEADER_LIST_SIZE: u32 = 1024 * 1024;
 
+// Keepalive settings shared by the Tonic channel clients and the Hyper-based Flight
+// transport. Long-lived connections (driver <-> worker RPC and shuffle streams) must
+// survive periods where the peer is busy processing data without being dropped.
+pub(crate) const CLIENT_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+pub(crate) const CLIENT_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const CLIENT_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
 macro_rules! impl_client_builder {
     ($client_type:ty) => {
         #[tonic::async_trait]
@@ -103,6 +111,10 @@ macro_rules! impl_client_builder {
             async fn connect(options: &ClientOptions) -> ExecutionResult<Self> {
                 let channel = tonic::transport::Endpoint::new(options.to_url_string())?
                     .http2_max_header_list_size(CLIENT_MAX_HEADER_LIST_SIZE)
+                    .tcp_keepalive(Some(CLIENT_TCP_KEEPALIVE))
+                    .http2_keep_alive_interval(CLIENT_HTTP2_KEEPALIVE_INTERVAL)
+                    .keep_alive_timeout(CLIENT_HTTP2_KEEPALIVE_TIMEOUT)
+                    .keep_alive_while_idle(true)
                     .connect()
                     .await?;
                 let channel = ServiceBuilder::new()

@@ -2,7 +2,7 @@ use log::warn;
 
 use crate::driver::worker_scaler::state::{WorkerDemand, WorkerDemandState};
 use crate::driver::worker_scaler::{
-    WorkerDemandReason, WorkerLaunchRequest, WorkerRetryRequest, WorkerScaler,
+    WorkerDemandReason, WorkerLaunchRequest, WorkerRetryRequest, WorkerScaler, WorkerScalerSummary,
 };
 use crate::error::ExecutionResult;
 use crate::id::{WorkerDemandId, WorkerId};
@@ -100,14 +100,26 @@ impl WorkerScaler {
     }
 
     pub fn has_pending_worker_demands(&self) -> bool {
-        self.demands.values().any(|demand| {
-            matches!(
-                demand.state,
-                WorkerDemandState::Created { .. }
-                    | WorkerDemandState::Launching { .. }
-                    | WorkerDemandState::WaitingForRetry { .. }
-            )
-        })
+        self.summary().has_pending()
+    }
+
+    /// A compact, log-friendly snapshot of worker demand state for debugging
+    /// task scheduling stalls.
+    pub fn summary(&self) -> WorkerScalerSummary {
+        let mut summary = WorkerScalerSummary::default();
+        for demand in self.demands.values() {
+            summary.total += 1;
+            match demand.state {
+                WorkerDemandState::Created { .. } => summary.created += 1,
+                WorkerDemandState::Launching { .. } => summary.launching += 1,
+                WorkerDemandState::WaitingForRetry { .. } => summary.waiting_for_retry += 1,
+                WorkerDemandState::Exhausted => summary.exhausted += 1,
+            }
+            if matches!(demand.reason, WorkerDemandReason::Task) {
+                summary.task += 1;
+            }
+        }
+        summary
     }
 
     fn create_demands(

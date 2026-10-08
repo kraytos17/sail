@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 
 use indexmap::IndexSet;
-use log::{error, warn};
+use log::{debug, error, info, warn};
 
 use crate::driver::task_assigner::state::{TaskSlot, WorkerResource};
 use crate::driver::task_assigner::{TaskAssigner, TaskRegion};
 use crate::error::{ExecutionError, ExecutionResult};
-use crate::id::{JobId, TaskKey, WorkerId};
+use crate::id::{JobId, TaskKey, TaskKeyDisplay, WorkerId};
 use crate::job_graph::TaskPlacement;
 use crate::task::scheduling::{
     TaskAssignment, TaskAssignmentGetter, TaskSetAssignment, TaskStreamAssignment,
@@ -107,6 +107,29 @@ impl TaskAssigner {
                 self.options.worker_max_count, self.options.worker_task_slots,
             )));
         }
+        let driver_sets = region
+            .tasks
+            .iter()
+            .filter(|(placement, _)| matches!(placement, TaskPlacement::Driver))
+            .count();
+        let first_key = region
+            .tasks
+            .iter()
+            .flat_map(|(_, set)| set.tasks())
+            .next()
+            .map(|key| TaskKeyDisplay(key).to_string());
+        info!(
+            "enqueued task region: {} worker set(s), {} driver set(s), {} required worker slot(s), \
+             queue depth {}{}",
+            required_slots,
+            driver_sets,
+            required_slots,
+            self.task_queue.len() + 1,
+            match first_key {
+                Some(key) => format!(", first task {key}"),
+                None => String::new(),
+            }
+        );
         self.task_queue.push_back(region.clone());
         Ok(())
     }
@@ -121,7 +144,33 @@ impl TaskAssigner {
 
         while let Some(region) = self.task_queue.pop_front() {
             match assigner.try_assign_task_region(region) {
-                Ok(x) => assignments.extend(x),
+                Ok(x) => {
+                    for assignment in &x {
+                        match assignment.assignment {
+                            TaskAssignment::Driver => debug!(
+                                "assigned task set to driver: {} task(s), first {}",
+                                assignment.set.entries.len(),
+                                assignment
+                                    .set
+                                    .tasks()
+                                    .next()
+                                    .map(|key| TaskKeyDisplay(key).to_string())
+                                    .unwrap_or_default(),
+                            ),
+                            TaskAssignment::Worker { worker_id, slot } => debug!(
+                                "assigned task set to worker {worker_id} slot {slot}: {} task(s), first {}",
+                                assignment.set.entries.len(),
+                                assignment
+                                    .set
+                                    .tasks()
+                                    .next()
+                                    .map(|key| TaskKeyDisplay(key).to_string())
+                                    .unwrap_or_default(),
+                            ),
+                        }
+                    }
+                    assignments.extend(x);
+                }
                 Err(region) => {
                     // The region cannot be successfully assigned as a whole
                     // due to insufficient worker task slots.
@@ -131,6 +180,18 @@ impl TaskAssigner {
                     // This does result in head-of-line blocking, but we would
                     // like the regions to be assigned in the same order as they
                     // are enqueued.
+                    let required_slots = region
+                        .tasks
+                        .iter()
+                        .filter(|(placement, _)| matches!(placement, TaskPlacement::Worker))
+                        .count();
+                    debug!(
+                        "task region waits for capacity: {required_slots} required worker slot(s), \
+                         {} vacant slot(s) across {} active worker(s), queue depth {}",
+                        self.count_vacant_worker_slots(),
+                        self.active_worker_ids().len(),
+                        self.task_queue.len() + 1,
+                    );
                     self.task_queue.push_front(region);
                     break;
                 }
@@ -237,6 +298,24 @@ impl TaskAssigner {
                 matches!(worker, WorkerResource::Active { .. }).then_some(*worker_id)
             })
             .collect()
+    }
+
+    /// Counts the vacant task slots across all active workers for diagnostics.
+    pub fn count_vacant_worker_slots(&self) -> usize {
+        self.workers
+            .values()
+            .map(|worker| match worker {
+                WorkerResource::Active { task_slots, .. } => {
+                    task_slots.iter().filter(|x| x.is_vacant()).count()
+                }
+                WorkerResource::Inactive => 0,
+            })
+            .sum()
+    }
+
+    /// Counts the task regions still waiting for capacity for diagnostics.
+    pub fn count_queued_regions(&self) -> usize {
+        self.task_queue.len()
     }
 
     pub fn is_worker_idle(&self, worker_id: WorkerId) -> bool {

@@ -15,7 +15,10 @@ use tonic::codegen::http::{Request, Response, Uri};
 use tower::{Service, ServiceBuilder, ServiceExt};
 
 use crate::error::{ExecutionError, ExecutionResult};
-use crate::rpc::{CLIENT_MAX_HEADER_LIST_SIZE, ClientBuilder, ClientOptions};
+use crate::rpc::{
+    CLIENT_HTTP2_KEEPALIVE_INTERVAL, CLIENT_HTTP2_KEEPALIVE_TIMEOUT, CLIENT_MAX_HEADER_LIST_SIZE,
+    CLIENT_TCP_KEEPALIVE, ClientBuilder, ClientOptions,
+};
 
 #[cfg(test)]
 mod tests;
@@ -62,6 +65,7 @@ impl FlightTransport {
         let origin = options.to_url_string().parse()?;
         let mut http = HttpConnector::new();
         http.set_nodelay(true);
+        http.set_keepalive(Some(CLIENT_TCP_KEEPALIVE));
         let connector = if options.enable_tls {
             http.enforce_http(false);
             // Match Tonic's provider selection and native trust roots. Do not load certificates
@@ -122,6 +126,11 @@ impl FlightTransport {
             // may count as internal resets; the lifetime budget must not kill unrelated streams.
             .max_local_error_reset_streams(None)
             .adaptive_window(true)
+            // Match the keepalive policy of the Tonic channel clients so that the
+            // connection survives idle periods between shuffle waves.
+            .keep_alive_interval(CLIENT_HTTP2_KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(CLIENT_HTTP2_KEEPALIVE_TIMEOUT)
+            .keep_alive_while_idle(true)
             .handshake(io)
             .await?;
         // Hyper closes the connection after senders and active responses are released. Let the
