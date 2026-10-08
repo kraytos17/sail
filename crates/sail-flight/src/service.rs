@@ -35,10 +35,25 @@ pub struct SailFlightSqlService {
     config: Arc<PlanConfig>,
     metrics: Option<Arc<MetricRegistry>>,
     state: Arc<Mutex<SailFlightSqlState>>,
+    default_session_id: String,
 }
 
 impl SailFlightSqlService {
     pub fn new(session_manager: SessionManager) -> Self {
+        Self::with_default_session(session_manager, None)
+    }
+
+    /// Creates a service whose clients share the given backend session id.
+    ///
+    /// All Flight SQL clients of one service instance always share a single
+    /// session; this chooses WHICH one. When `None` (standalone mode), they
+    /// share [`Self::DEFAULT_SESSION_ID`]. The combined server injects the
+    /// multiplexer's canonical session so Spark Connect and Flight SQL
+    /// clients share ONE driver + worker fleet.
+    pub fn with_default_session(
+        session_manager: SessionManager,
+        default_session_id: Option<String>,
+    ) -> Self {
         let config = Arc::new(PlanConfig::default());
         let metrics = global_metrics().map(|m| m.registry);
         if metrics.is_some() {
@@ -49,6 +64,9 @@ impl SailFlightSqlService {
             config,
             metrics,
             state: Arc::new(Mutex::new(SailFlightSqlState::new())),
+            default_session_id: default_session_id
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| Self::DEFAULT_SESSION_ID.to_string()),
         }
     }
 
@@ -58,7 +76,7 @@ impl SailFlightSqlService {
     async fn get_session_context(&self) -> Result<SessionContext, Status> {
         self.session_manager
             .get_or_create_session_context(
-                Self::DEFAULT_SESSION_ID.to_string(),
+                self.default_session_id.clone(),
                 Self::DEFAULT_USER_ID.to_string(),
             )
             .await
@@ -122,7 +140,7 @@ impl FlightSqlService for SailFlightSqlService {
                 stream,
                 m.clone(),
                 MetricsRecordingContext {
-                    session_id: Self::DEFAULT_SESSION_ID.to_string(),
+                    session_id: self.default_session_id.clone(),
                     statement_type,
                 },
             ))
@@ -208,4 +226,82 @@ impl FlightSqlService for SailFlightSqlService {
     }
 
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::error::DataFusionError;
+    use datafusion::prelude::SessionContext;
+    use opentelemetry::InstrumentationScope;
+    use opentelemetry::logs::LoggerProvider;
+    use opentelemetry_sdk::logs::SdkLoggerProvider;
+    use sail_common::actor::ActorSystem;
+    use sail_common::config::AppConfig;
+    use sail_common::runtime::RuntimeHandle;
+    use sail_session::session_factory::{
+        ServerSessionInfo, ServerSessionJobRunnerFactory, SessionFactory,
+    };
+    use sail_session::session_manager::{
+        SessionManager, SessionManagerComponents, SessionManagerOptions,
+    };
+    use sail_telemetry::events::SystemEventReporter;
+
+    use super::SailFlightSqlService;
+
+    struct StubSessionFactory;
+
+    impl SessionFactory<ServerSessionInfo> for StubSessionFactory {
+        fn create(&mut self, _info: ServerSessionInfo) -> Result<SessionContext, DataFusionError> {
+            Ok(SessionContext::new())
+        }
+    }
+
+    fn test_session_manager() -> Result<(SessionManager, ActorSystem), Box<dyn std::error::Error>> {
+        // The checked-in defaults run in `local` mode, so no gateway or
+        // cluster is needed.
+        let config = Arc::new(AppConfig::load()?);
+        let handle = tokio::runtime::Handle::current();
+        let runtime = RuntimeHandle::new(handle.clone(), handle);
+        let mut system = ActorSystem::new();
+        let options = SessionManagerOptions::new(runtime.clone());
+        // No processors attached: `report` serializes and drops, touching no I/O.
+        let provider = SdkLoggerProvider::builder().build();
+        let scope = InstrumentationScope::builder("sail-flight-test").build();
+        let components = SessionManagerComponents {
+            session_factory: Box::new(StubSessionFactory),
+            job_runner_factory: Box::new(ServerSessionJobRunnerFactory::new(config, runtime)),
+            driver_gateway: None,
+            event_reporter: SystemEventReporter::new(provider.logger_with_scope(scope)),
+        };
+        let manager = SessionManager::try_new(options, components, &mut system)?;
+        Ok((manager, system))
+    }
+
+    #[tokio::test]
+    async fn with_default_session_stores_injected_id() -> Result<(), Box<dyn std::error::Error>> {
+        let (manager, mut system) = test_session_manager()?;
+        let service = SailFlightSqlService::with_default_session(
+            manager.clone(),
+            Some("canonical".to_string()),
+        );
+        assert_eq!(service.default_session_id, "canonical");
+        manager.shutdown().await?;
+        system.join().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn with_default_session_falls_back_on_none_or_blank()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for id in [None, Some(String::new()), Some("   ".to_string())] {
+            let (manager, mut system) = test_session_manager()?;
+            let service = SailFlightSqlService::with_default_session(manager.clone(), id);
+            assert_eq!(service.default_session_id, "flight-default");
+            manager.shutdown().await?;
+            system.join().await;
+        }
+        Ok(())
+    }
 }

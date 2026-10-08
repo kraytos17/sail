@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use chrono::Utc;
 use datafusion::prelude::SessionContext;
 use fastrace::Span;
@@ -39,24 +41,58 @@ impl SessionManagerActor {
         user_id: String,
         result: oneshot::Sender<SessionResult<SessionContext>>,
     ) -> ActorAction {
-        if let Some(session) = self.sessions.get_mut(&session_id) {
-            let context = match &mut session.state {
-                ServerSessionState::Running { context, .. } => Some(context.clone()),
-                ServerSessionState::Creating { waiters, .. } => {
-                    waiters.push(result);
-                    return ActorAction::Continue;
+        // Snapshot the existing entry (if any) so the map borrow ends before
+        // any mutation below. The actor is single-threaded, so the entry
+        // cannot change between the snapshot and the mutation.
+        enum ExistingSession {
+            Running(SessionContext),
+            Creating,
+            Terminal { was_failed: bool },
+        }
+        let existing = self
+            .sessions
+            .get(&session_id)
+            .map(|session| match &session.state {
+                ServerSessionState::Running { context, .. } => {
+                    ExistingSession::Running(context.clone())
                 }
-                ServerSessionState::Deleted | ServerSessionState::Failed => None,
-            };
-            if let Some(context) = context {
+                ServerSessionState::Creating { .. } => ExistingSession::Creating,
+                ServerSessionState::Deleted => ExistingSession::Terminal { was_failed: false },
+                ServerSessionState::Failed => ExistingSession::Terminal { was_failed: true },
+            });
+        match existing {
+            Some(ExistingSession::Running(context)) => {
                 self.schedule_idle_session_probe(ctx, session_id, &context);
                 let _ = result.send(Ok(context));
-            } else {
-                let _ = result.send(Err(SessionError::invalid(format!(
-                    "session {session_id} is not running"
-                ))));
+                return ActorAction::Continue;
             }
-            return ActorAction::Continue;
+            Some(ExistingSession::Creating) => {
+                if let Some(session) = self.sessions.get_mut(&session_id)
+                    && let ServerSessionState::Creating { waiters, .. } = &mut session.state
+                {
+                    waiters.push(result);
+                } else {
+                    // Unreachable single-threaded: the entry was Creating above.
+                    // Fail loudly rather than dropping the request.
+                    let _ = result.send(Err(SessionError::internal(format!(
+                        "session {session_id} creation is no longer pending"
+                    ))));
+                }
+                return ActorAction::Continue;
+            }
+            Some(ExistingSession::Terminal { was_failed }) => {
+                // A dead entry must not poison the ID: evict it and fall
+                // through to the creation path below.
+                self.sessions.shift_remove(&session_id);
+                if was_failed {
+                    warn!("recreating session {session_id} after failure");
+                } else {
+                    info!("recreating session {session_id} after deleted");
+                }
+            }
+            None => {
+                // Fall through to the creation path below.
+            }
         }
 
         // TODO: The session ID is used in various storage paths, so it is assumed to be unique
@@ -300,6 +336,18 @@ impl SessionManagerActor {
         session_id: String,
         result: oneshot::Sender<SessionResult<()>>,
     ) -> ActorAction {
+        // Idempotent delete: terminal states hold no driver or resources
+        // (released when they transitioned), so just free the ID. The borrow
+        // ends before the mutation; the actor is single-threaded.
+        let terminal = matches!(
+            self.sessions.get(&session_id).map(|session| &session.state),
+            Some(ServerSessionState::Deleted | ServerSessionState::Failed)
+        );
+        if terminal {
+            self.sessions.shift_remove(&session_id);
+            let _ = result.send(Ok(()));
+            return ActorAction::Continue;
+        }
         let session = self.sessions.get_mut(&session_id);
         let output = if let Some(session) = session {
             if let ServerSessionState::Running { context, driver_id } = &mut session.state {
@@ -327,6 +375,32 @@ impl SessionManagerActor {
             )))
         };
         let _ = result.send(output);
+        ActorAction::Continue
+    }
+
+    /// Reports how long the session has been idle, based on the session's
+    /// [`ActivityTracker`] (updated by every protocol that touches the
+    /// session via `get_or_create`). `None` means the session does not exist
+    /// or is not running, or its activity cannot be determined — callers
+    /// should treat that as "unknown" and avoid destructive actions.
+    pub(super) fn handle_session_idle_duration(
+        &mut self,
+        session_id: String,
+        result: oneshot::Sender<SessionResult<Option<Duration>>>,
+    ) -> ActorAction {
+        let idle = match self.sessions.get(&session_id) {
+            Some(session) => match &session.state {
+                ServerSessionState::Running { context, .. } => {
+                    match context.extension::<ActivityTracker>() {
+                        Ok(tracker) => Ok(tracker.active_at().ok().map(|at| at.elapsed())),
+                        Err(_) => Ok(None),
+                    }
+                }
+                _ => Ok(None),
+            },
+            None => Ok(None),
+        };
+        let _ = result.send(idle);
         ActorAction::Continue
     }
 

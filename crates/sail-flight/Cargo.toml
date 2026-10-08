@@ -33,3 +33,7 @@ uuid = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }
+
+[dev-dependencies]
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }

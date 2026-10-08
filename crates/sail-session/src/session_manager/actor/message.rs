@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::time::Duration;
 
 use datafusion::prelude::SessionContext;
 use sail_common::telemetry::{SpanAssociation, SpanAttribute};
@@ -32,6 +33,10 @@ pub enum SessionManagerMessage {
         session_id: String,
         result: oneshot::Sender<SessionResult<()>>,
     },
+    SessionIdleDuration {
+        session_id: String,
+        result: oneshot::Sender<SessionResult<Option<Duration>>>,
+    },
     SetSessionFailure {
         session_id: String,
     },
@@ -51,6 +56,7 @@ impl SpanAssociation for SessionManagerMessage {
             SessionManagerMessage::CompleteSessionCreation { .. } => "CompleteSessionCreation",
             SessionManagerMessage::ProbeIdleSession { .. } => "ProbeIdleSession",
             SessionManagerMessage::DeleteSession { .. } => "DeleteSession",
+            SessionManagerMessage::SessionIdleDuration { .. } => "SessionIdleDuration",
             SessionManagerMessage::SetSessionFailure { .. } => "SetSessionFailure",
             SessionManagerMessage::GetDriver { .. } => "GetDriver",
             SessionManagerMessage::Shutdown { .. } => "Shutdown",
@@ -78,6 +84,10 @@ impl SpanAssociation for SessionManagerMessage {
                 instant: _,
             }
             | SessionManagerMessage::DeleteSession {
+                session_id,
+                result: _,
+            }
+            | SessionManagerMessage::SessionIdleDuration {
                 session_id,
                 result: _,
             }
