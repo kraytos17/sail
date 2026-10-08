@@ -23,6 +23,8 @@ sail-spark-connect = { path = "../sail-spark-connect" }
 sail-session = { path = "../sail-session" }
 sail-mimalloc = { path = "../sail-mimalloc", optional = true }
 
+arrow-flight = { workspace = true }
+tonic = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
