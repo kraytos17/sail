@@ -102,7 +102,11 @@ pub(crate) const CLIENT_MAX_HEADER_LIST_SIZE: u32 = 1024 * 1024;
 // survive periods where the peer is busy processing data without being dropped.
 pub(crate) const CLIENT_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 pub(crate) const CLIENT_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
-pub(crate) const CLIENT_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+// The peer may be busy processing data (e.g. blocked on object-store reads) and cannot
+// ACK a keepalive ping within a short window. Wait as long as the server-side default
+// (`ServerBuilderOptions::http2_keepalive_timeout`) so a busy worker is not declared
+// lost and its in-flight tasks are not canceled mid-query.
+pub(crate) const CLIENT_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(60);
 
 macro_rules! impl_client_builder {
     ($client_type:ty) => {
